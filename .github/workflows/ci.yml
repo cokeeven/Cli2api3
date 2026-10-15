@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Import constraints
+        run: go test ./internal/app -run TestImportConstraints -count=1
+      - run: go test ./...
+      - run: go vet ./...
+      - name: Go race tests
+        run: go test -race ./...
+      - name: Validate bilingual changelog
+        run: |
+          python3 scripts/release-notes.py self-test
+          python3 scripts/release-notes.py validate
+      - name: Build updater release matrix
+        run: ./scripts/build-updater-assets.sh "$RUNNER_TEMP/updater-assets"
+
+  windows-host:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build Windows host binaries
+        shell: powershell
+        run: |
+          go build -o "$env:RUNNER_TEMP\qoder-api-proxy.exe" .\cmd\server
+          go build -o "$env:RUNNER_TEMP\cli2api-updater.exe" .\cmd\updater
+      - name: Test Windows updater core
+        shell: powershell
+        run: go test ./internal/updater ./internal/config
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $Failed = $false
+          foreach ($File in @("scripts\start.ps1", "deploy\install-updater.ps1")) {
+            $Tokens = $null
+            $Errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $File),
+              [ref]$Tokens,
+              [ref]$Errors
+            ) | Out-Null
+            if ($Errors.Count -gt 0) {
+              $Failed = $true
+              $Errors | ForEach-Object { Write-Error "$File`: $($_.Message)" }
+            }
+          }
+          if ($Failed) { exit 1 }
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+        working-directory: worker
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        working-directory: deploy
+        env:
+          PROXY_API_KEY: ci-placeholder-key
+        run: docker compose config --quiet
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build multi-platform container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+      - name: Scan git history for secrets
+        run: gitleaks detect --source . --verbose --redact

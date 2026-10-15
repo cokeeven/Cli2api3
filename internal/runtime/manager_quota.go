@@ -1,0 +1,161 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/providers"
+	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
+)
+
+// QuotaRefreshError reports an upstream quota refresh failure without
+// implying that the account itself is unhealthy or unavailable.
+type QuotaRefreshError struct{ Err error }
+
+func (e *QuotaRefreshError) Error() string { return e.Err.Error() }
+func (e *QuotaRefreshError) Unwrap() error { return e.Err }
+
+// Quota snapshots: pool MergeQuota then Store.SaveQuota. Worker JSON is Qoder-only;
+// in-process providers use AccountProber.Quota.
+
+func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prober providers.AccountProber) {
+	if prober == nil {
+		return
+	}
+	info, err := prober.Quota(ctx, accountID)
+	if err != nil || info == nil || !quotaInfoHasWindows(info) {
+		// An empty snapshot is "not fetched yet", not a zero balance. Saving it
+		// makes the account card render 0/0 and hides a later real reading.
+		return
+	}
+	unit := info.Unit
+	if unit == "" {
+		unit = "credits"
+	}
+	quota := &QuotaSnapshot{
+		Used:       info.Used,
+		Total:      info.Total,
+		Remaining:  info.Remaining,
+		Percentage: info.Percentage,
+		Unit:       unit,
+		Exceeded:   info.Exceeded,
+		FetchedAt:  info.FetchedAt,
+		Windows:    quotaWindowsFromInfo(info.Windows),
+	}
+	// Package-expiry detail is currently only produced by WorkBuddy's
+	// get-user-resource packs; keep other providers from leaking a stale or
+	// fabricated expiry into the snapshot.
+	if info.ProviderID == "workbuddy" {
+		quota.ExpiresAt = info.ExpiresAt
+		quota.ExpiringRemain = info.ExpiringRemain
+		quota.Packages = quotaPackagesFromInfo(info.Packages)
+	}
+	if info.ProviderID == "codex" {
+		quota.Plan = strings.TrimSpace(info.Plan)
+	}
+	m.persistQuota(ctx, accountID, quota)
+}
+
+func quotaPackagesFromInfo(packages []providers.QuotaPackage) []accounts.QuotaPackage {
+	if len(packages) == 0 {
+		return nil
+	}
+	out := make([]accounts.QuotaPackage, 0, len(packages))
+	for _, pkg := range packages {
+		unit := pkg.Unit
+		if unit == "" {
+			unit = "credits"
+		}
+		out = append(out, accounts.QuotaPackage{
+			ID: pkg.ID, Source: pkg.Source, Status: pkg.Status, ExpirySource: pkg.ExpirySource,
+			Remain:  pkg.Remain,
+			Used:    pkg.Used,
+			Size:    pkg.Size,
+			Unit:    unit,
+			EndsAt:  pkg.EndsAt,
+			EndTime: pkg.EndTime,
+		})
+	}
+	return out
+}
+
+func quotaInfoHasWindows(info *providers.QuotaInfo) bool {
+	if info == nil {
+		return false
+	}
+	if len(info.Windows) > 0 || len(info.Packages) > 0 {
+		return true
+	}
+	return info.Total > 0 || info.Used > 0 || info.Remaining > 0 || info.Percentage > 0 || info.Exceeded
+}
+
+func quotaWindowsFromInfo(windows []providers.QuotaWindow) []accounts.QuotaWindow {
+	if len(windows) == 0 {
+		return nil
+	}
+	out := make([]accounts.QuotaWindow, 0, len(windows))
+	for _, window := range windows {
+		unit := window.Unit
+		if unit == "" {
+			unit = "credits"
+		}
+		out = append(out, accounts.QuotaWindow{
+			ID:         window.ID,
+			Label:      window.Label,
+			Used:       window.Used,
+			Total:      window.Total,
+			Remaining:  window.Remaining,
+			Percentage: window.Percentage,
+			Unit:       unit,
+			ResetAt:    window.ResetAt,
+			Exceeded:   window.Exceeded,
+		})
+	}
+	return out
+}
+
+func (m *Manager) persistQuota(ctx context.Context, accountID string, quota *QuotaSnapshot) {
+	if quota == nil {
+		return
+	}
+	if m.forceReady(accountID) {
+		// Local/dev override: keep the account routable even when upstream
+		// still reports a hard zero balance. Marker file:
+		//   $QODER_DATA_DIR/force-ready/<accountID>
+		quota.Exceeded = false
+		if quota.Remaining <= 0 {
+			quota.Remaining = 1
+		}
+		if quota.Percentage >= 100 {
+			quota.Percentage = 99
+		}
+	}
+	m.pool.MergeQuota(accountID, quota)
+	if err := m.store.SaveQuota(ctx, accountID, quota); err != nil {
+		log.Printf("persist quota account=%s: %v", accountID, err)
+	}
+}
+
+func (m *Manager) fetchQuota(ctx context.Context, accountID, workerURL string, force bool) error {
+	if strings.TrimSpace(workerURL) == "" {
+		return fmt.Errorf("quota worker URL is empty")
+	}
+	client := qoder.WorkerClient{
+		HTTP:        &http.Client{Timeout: 5 * time.Second},
+		ProxyAPIKey: m.ProxyAPIKey(),
+	}
+	quota, err := client.Quota(ctx, workerURL, force)
+	if err != nil || quota == nil {
+		if err != nil {
+			return &QuotaRefreshError{Err: fmt.Errorf("fetch quota account=%s: %w", accountID, err)}
+		}
+		return &QuotaRefreshError{Err: fmt.Errorf("fetch quota account=%s: empty response", accountID)}
+	}
+	m.persistQuota(ctx, accountID, quota)
+	return nil
+}

@@ -1,0 +1,215 @@
+// Package workbuddy implements the WorkBuddy / CodeBuddy in-process provider.
+// Protocol constants live only in this package.
+package workbuddy
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+const (
+	CredentialFormat = "workbuddy-oauth-v1"
+
+	DomainCN     = "codebuddy.cn"
+	DomainGlobal = "workbuddy.ai"
+
+	ChatBaseCN     = "https://copilot.tencent.com"
+	ChatBaseGlobal = "https://www.workbuddy.ai"
+	BillingBaseCN  = "https://www.codebuddy.cn"
+
+	// UserAgent matches official @tencent-ai/codebuddy-code 2.139.0 in the
+	// dual-token form WorkBuddy chat still accepts. Origin/Referer stay
+	// region-specific and must never mix CN with Global.
+	CLIVersion = "2.139.0"
+	UserAgent  = "CLI/" + CLIVersion + " CodeBuddy/" + CLIVersion
+
+	// DesktopUserAgent is for /v3/config only. Live A/B showed the same
+	// Global account returns the IDE dropdown (incl. deepseek-v4.1-flash)
+	// with a desktop UA, but the CLI UA returns a different model set.
+	DesktopVersion   = "5.4.2"
+	DesktopUserAgent = "WorkBuddy/" + DesktopVersion
+
+	productTypeCLI     = "CLI"
+	agentIntentDefault = "craft"
+	agentTypeMain      = "main"
+
+	pathAuthState    = "/v2/plugin/auth/state"
+	pathAuthToken    = "/v2/plugin/auth/token"
+	pathAuthAccount  = "/v2/plugin/login/account"
+	pathTokenRefresh = "/v2/plugin/auth/token/refresh"
+	pathChat         = "/v2/chat/completions"
+	// CN still serves the console catalog to Bearer tokens. Global's
+	// /console/enterprises/personal/models is an OIDC page: unauthenticated
+	// 302 to Keycloak, authenticated 500 HTML. The plugin JSON catalog is
+	// /v2/enterprises/personal/models. The IDE model dropdown is not that
+	// catalog: desktop loads authenticated GET /v3/config (product config).
+	pathModelsCN      = "/console/enterprises/personal/models"
+	pathModelsGlobal  = "/v2/enterprises/personal/models"
+	pathProductConfig = "/v3/config"
+	pathUserResource  = "/v2/billing/meter/get-user-resource"
+	pathDailyCheckin  = "/v2/billing/meter/daily-checkin"
+
+	sessionDeadCode         = 12153
+	sessionDeadText         = "Offline user session not found"
+	missingSystemPromptCode = 11128
+	missingSystemPromptText = "first message is not system prompt"
+	toolCallSequenceCode    = 11148
+	toolCallSequenceText    = "tool calls and tool results do not match"
+
+	// rateLimitCode marks a usage limit whose response carries the absolute
+	// reset timestamp. Cooling down for the generic rate-limit fallback would
+	// retry a few seconds later and burn further quota.
+	rateLimitCode = 6004
+)
+
+// quotaResetLocation is the fixed zone WorkBuddy uses for the reset timestamp
+// in its CN usage-limit message ("... UTC+8 重置"). It is a var because
+// time.FixedZone returns a *time.Location, which cannot be a constant.
+var quotaResetLocation = time.FixedZone("UTC+8", 8*60*60)
+
+// Credential is the canonical storage payload shape.
+type Credential struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"`
+	Domain       string `json:"domain"`
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterprise_id"`
+	Nickname     string `json:"nickname"`
+	// DeviceToken is the per-account Turing Shield device fingerprint
+	// (X-Device-Token). Optional: empty means the header is skipped and the
+	// request falls back to upstream default device handling. Highest priority
+	// in the device-token resolution chain (per-account > global > file).
+	DeviceToken string `json:"device_token,omitempty"`
+}
+
+// DecodeCredential accepts both the canonical flat payload and the nested
+// {account, auth} export shape.
+func DecodeCredential(payload []byte) (Credential, error) {
+	var nested struct {
+		Account struct {
+			UID          string `json:"uid"`
+			EnterpriseID string `json:"enterpriseId"`
+			Nickname     string `json:"nickname"`
+		} `json:"account"`
+		Auth struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresAt    int64  `json:"expiresAt"`
+			Domain       string `json:"domain"`
+			DeviceToken  string `json:"deviceToken"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(payload, &nested); err == nil &&
+		(nested.Auth.AccessToken != "" || nested.Account.UID != "") {
+		return Credential{
+			AccessToken:  nested.Auth.AccessToken,
+			RefreshToken: nested.Auth.RefreshToken,
+			ExpiresAt:    nested.Auth.ExpiresAt,
+			Domain:       nested.Auth.Domain,
+			UID:          nested.Account.UID,
+			EnterpriseID: nested.Account.EnterpriseID,
+			Nickname:     nested.Account.Nickname,
+			DeviceToken:  nested.Auth.DeviceToken,
+		}, nil
+	}
+	var flat struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresAt    int64  `json:"expires_at"`
+		Domain       string `json:"domain"`
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterprise_id"`
+		Nickname     string `json:"nickname"`
+		DeviceToken  string `json:"device_token"`
+	}
+	if err := json.Unmarshal(payload, &flat); err == nil && flat.AccessToken != "" {
+		return Credential{
+			AccessToken:  flat.AccessToken,
+			RefreshToken: flat.RefreshToken,
+			ExpiresAt:    flat.ExpiresAt,
+			Domain:       flat.Domain,
+			UID:          flat.UID,
+			EnterpriseID: flat.EnterpriseID,
+			Nickname:     flat.Nickname,
+			DeviceToken:  flat.DeviceToken,
+		}, nil
+	}
+	// Also accept flat upstream-style camelCase keys.
+	var camel struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Domain       string `json:"domain"`
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+		DeviceToken  string `json:"deviceToken"`
+	}
+	if err := json.Unmarshal(payload, &camel); err == nil && camel.AccessToken != "" {
+		return Credential(camel), nil
+	}
+	return Credential{}, fmt.Errorf("workbuddy credential requires access_token")
+}
+
+func (c Credential) Encode() ([]byte, error) {
+	return json.Marshal(c)
+}
+
+func (c Credential) Ready() bool {
+	return strings.TrimSpace(c.AccessToken) != "" && strings.TrimSpace(c.UID) != ""
+}
+
+func (c Credential) ChatBase() string {
+	if c.IsGlobal() {
+		return ChatBaseGlobal
+	}
+	return ChatBaseCN
+}
+
+// productConfigPath is the IDE dropdown source (CloudProductManager /v3/config).
+func (c Credential) productConfigPath() string {
+	return pathProductConfig
+}
+
+func isCLIAgent(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "cli", "codebuddy", "workbuddy":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c Credential) BillingBase() string {
+	if c.IsGlobal() {
+		return ChatBaseGlobal
+	}
+	return BillingBaseCN
+}
+
+// ValidateCredential enforces the import contract: token plus uid are required
+// for an account to be ready. A missing uid is stored but never ready.
+func ValidateCredential(payload []byte) error {
+	credential, err := DecodeCredential(payload)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" {
+		return fmt.Errorf("workbuddy credential requires accessToken")
+	}
+	return nil
+}
+
+func (c Credential) IsGlobal() bool {
+	domain := strings.ToLower(strings.TrimSpace(c.Domain))
+	if domain == "" {
+		return false
+	}
+	if strings.Contains(domain, DomainCN) {
+		return false
+	}
+	return strings.Contains(domain, DomainGlobal) || strings.Contains(domain, "workbuddy")
+}

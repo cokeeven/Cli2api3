@@ -1,0 +1,163 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { parseNestedOpenAIChunks, pipeNestedSseToOpenAI } from "../src/sse.mjs";
+
+test("parses nested OpenAI content and reasoning deltas", () => {
+  const sse = [
+    `data: ${JSON.stringify({ body: JSON.stringify({ choices: [{ delta: { content: "Hel" } }] }) })}`,
+    `data: ${JSON.stringify({ body: JSON.stringify({ choices: [{ delta: { content: "lo" } }] }) })}`,
+    `data: ${JSON.stringify({ body: JSON.stringify({ choices: [{ delta: { reasoning_content: "think" } }] }) })}`,
+    "data: [DONE]",
+  ].join("\n");
+  const parsed = parseNestedOpenAIChunks(sse);
+  assert.equal(parsed.content, "Hello");
+  assert.equal(parsed.reasoning, "think");
+});
+
+test("accumulates streamed tool calls", () => {
+  const sse = [
+    `data: ${JSON.stringify({
+      body: JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "exec", arguments: "{" } }] } }],
+      }),
+    })}`,
+    `data: ${JSON.stringify({
+      body: JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "}" } }] }, finish_reason: "tool_calls" }],
+      }),
+    })}`,
+  ].join("\n");
+  const parsed = parseNestedOpenAIChunks(sse);
+  assert.equal(parsed.tool_calls.length, 1);
+  assert.equal(parsed.tool_calls[0].id, "call_1");
+  assert.equal(parsed.tool_calls[0].function.name, "exec");
+  assert.equal(parsed.tool_calls[0].function.arguments, "{}");
+  assert.equal(parsed.finish_reason, "tool_calls");
+});
+
+test("prefers concrete quota errors over empty content", () => {
+  const sse = [
+    "event: error",
+    `data: ${JSON.stringify({ error: { code: "insufficient_quota", message: "token-limit" } })}`,
+  ].join("\n");
+  const parsed = parseNestedOpenAIChunks(sse);
+  assert.equal(parsed.error?.code, "insufficient_quota");
+});
+
+test("emits a structured error event when upstream fails before the first event", async () => {
+  const upstream = {
+    body: new ReadableStream({
+      start(controller) {
+        controller.error(new Error("socket closed"));
+      },
+    }),
+  };
+  let output = "";
+  const res = {
+    write(chunk) {
+      output += chunk;
+    },
+  };
+
+  await assert.rejects(
+    pipeNestedSseToOpenAI(upstream, res, { model: "minimax-m3" }),
+    /upstream_stream_interrupted: socket closed/,
+  );
+  assert.match(output, /event: error/);
+  assert.match(output, /upstream_stream_interrupted/);
+});
+
+
+test("surfaces a structured provider SSE error", async () => {
+  const payload = JSON.stringify({ error: { code: "provider_error", message: "upstream rejected" } });
+  const upstream = {
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: error\ndata: " + payload + "\n\n"));
+        controller.close();
+      },
+    }),
+  };
+  let output = "";
+  const res = { write(chunk) { output += chunk; } };
+
+  await assert.rejects(
+    pipeNestedSseToOpenAI(upstream, res, { model: "minimax-m3" }),
+    /provider_error:.*upstream rejected/,
+  );
+  assert.match(output, /event: error/);
+  assert.match(output, /provider_error/);
+});
+
+test("reports a structured error when upstream ends without DONE", async () => {
+  const upstream = {
+    body: new ReadableStream({
+      start(controller) {
+        const body = JSON.stringify({ body: JSON.stringify({ choices: [{ delta: { content: "partial" } }] }) });
+        controller.enqueue(new TextEncoder().encode("data: " + body + "\n\n"));
+        controller.close();
+      },
+    }),
+  };
+  let output = "";
+  const res = { write(chunk) { output += chunk; } };
+
+  await assert.rejects(
+    pipeNestedSseToOpenAI(upstream, res, { model: "minimax-m3" }),
+    /upstream_stream_incomplete/,
+  );
+  assert.match(output, /upstream_stream_incomplete/);
+});
+
+
+test("accepts a completed choice when upstream omits DONE", async () => {
+  const upstream = {
+    body: new ReadableStream({
+      start(controller) {
+        const body = JSON.stringify({
+          body: JSON.stringify({
+            choices: [
+              { delta: { content: "complete" }, finish_reason: "stop" },
+            ],
+          }),
+        });
+        controller.enqueue(new TextEncoder().encode("data: " + body + "\n\n"));
+        controller.close();
+      },
+    }),
+  };
+  let output = "";
+  const res = { write(chunk) { output += chunk; } };
+
+  const result = await pipeNestedSseToOpenAI(upstream, res, { model: "qoder-extreme" });
+  assert.equal(result.content, "complete");
+  assert.match(output, /"finish_reason":"stop"/);
+  assert.match(output, /data: \[DONE\]/);
+  assert.doesNotMatch(output, /upstream_stream_incomplete/);
+});
+
+test("normalizes missing tool call indexes and ids", async () => {
+  const nested = (body) => "data: " + JSON.stringify({ body: JSON.stringify(body) }) + "\n";
+  const upstream = {
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(nested({ choices: [{ delta: { tool_calls: [
+          { function: { name: "tool_a", arguments: "{}" } },
+          { function: { name: "tool_b", arguments: "{}" } },
+        ] } }] }) + nested({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }) + "data: \"[DONE]\"\n"));
+        controller.close();
+      },
+    }),
+  };
+  let output = "";
+  const res = { write(chunk) { output += chunk; } };
+
+  await pipeNestedSseToOpenAI(upstream, res, { model: "minimax-m3" });
+  const lines = output.split("\n").filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"));
+  const toolChunk = lines.map((line) => JSON.parse(line.slice(6))).find((chunk) => chunk.choices?.[0]?.delta?.tool_calls);
+  const calls = toolChunk.choices[0].delta.tool_calls;
+  assert.deepEqual(calls.map((call) => call.index), [0, 1]);
+  assert.ok(calls[0].id);
+  assert.ok(calls[1].id);
+  assert.notEqual(calls[0].id, calls[1].id);
+});

@@ -1,0 +1,192 @@
+export type AccountQuotaWindow = {
+  id: string
+  label?: string
+  used?: number
+  total?: number
+  remaining?: number
+  percentage?: number
+  unit?: string
+  reset_at?: string
+  exceeded?: boolean
+}
+
+export type AccountQuotaPackage = {
+  id?: string
+  source?: string
+  status?: string
+  expiry_source?: string
+  remain?: number
+  used?: number
+  size?: number
+  unit?: string
+  ends_at?: number
+  end_time?: string
+}
+
+export type AccountQuota = {
+  used?: number
+  total?: number
+  remaining?: number
+  percentage?: number
+  unit?: string
+  exceeded?: boolean
+  windows?: AccountQuotaWindow[]
+  expires_at?: number
+  expiring_remain?: number
+  packages?: AccountQuotaPackage[]
+  has_add_on?: boolean
+  add_on_used?: number
+  add_on_total?: number
+  add_on_remaining?: number
+  add_on_unit?: string
+  add_on_available?: boolean
+  has_resource_package?: boolean
+  resource_package_used?: number
+  resource_package_total?: number
+  resource_package_remaining?: number
+  resource_package_unit?: string
+  resource_package_available?: boolean
+  fetched_at?: string
+  plan?: string
+}
+
+export type ModelInfo = {
+  id: string
+  display_name?: string
+  mapped_key?: string
+  route_display_name?: string
+  settings_key?: string
+  provider?: string
+  owned_by?: string
+  native_model?: string
+  region?: string
+  regions?: string[]
+  stale?: boolean
+  credits?: string
+  free?: boolean
+  context_length?: number
+  default_context_length?: number
+  context_custom?: boolean
+  context_editable?: boolean
+  catalog_context_length?: number
+  catalog_context_length_max?: number
+  supports_max_mode?: boolean
+  max_mode?: boolean
+  max_output_tokens?: number
+  prompt_max_tokens?: number
+  max_output_tokens_max?: number
+  prompt_max_tokens_max?: number
+  reasoning_options?: string[]
+  reasoning_default?: string
+  reasoning_effort?: string
+  reasoning_type?: string
+  can_disable_thinking?: boolean
+}
+
+export type CheckinRecord = {
+  id: string
+  account_id: string
+  status: string
+  message?: string
+  created_at: string
+}
+
+export type Overview = {
+  ok?: boolean
+  time?: string
+  proxy?: {
+    ok?: boolean
+    service?: string
+    provider?: string
+    providers?: string[]
+    cross_provider_model_pool?: boolean
+    port?: number | string
+    chat_url?: string
+  }
+  worker?: {
+    ok?: boolean
+    hot?: boolean
+    endpoint?: string
+    rewarmCount?: number
+    rewarm_count?: number
+    lastError?: string
+    last_error?: string
+    account_count?: number
+    ready_count?: number
+    hot_count?: number
+    cooling_count?: number
+    in_flight?: number
+  }
+  model_count?: number
+  routing?: {
+    strategy?: string
+    session_affinity?: {
+      ttl_seconds?: number
+      capacity?: number
+      bindings?: number
+      hits?: number
+      misses?: number
+      escapes?: number
+      rebindings?: number
+      last_escape_at?: string
+      last_escape_reason?: string
+      last_miss_reason?: string
+    }
+  }
+  auth?: {
+    has_user_blob?: boolean
+    has_pat?: boolean
+    user_blob_bytes?: number
+    machine_id?: string
+  }
+  login?: any
+  models?: ModelInfo[]
+  accounts?: Array<{
+    id: string
+    provider?: string
+    region?: string
+    name?: string
+    remote_uid?: string
+    auth_type?: string
+    enabled?: boolean
+    max_inflight?: number
+    priority?: number
+    drop_system_prompt?: boolean
+    workbuddy_auto_checkin?: boolean
+    workbuddy_checkin_time?: string
+    auto_checkin?: boolean
+    checkin_time?: string
+    proxy_url?: string
+    status?: string
+    cooldown_until?: string | null
+    url?: string
+    ready?: boolean
+    hot?: boolean
+    in_flight?: number
+    inFlight?: number
+    restarts?: number
+    runtime_state?: string
+    next_restart_at?: string
+    restart_backoff_level?: number
+    kind?: string
+    down_until?: string | null
+    model_cooldowns?: Record<string, string>
+    last_error?: string
+    lastError?: string
+    last_error_kind?: string
+    last_checkin_at?: string
+    last_checkin_msg?: string
+    last_checkin_status?: string
+    quota?: AccountQuota
+    created_at?: string
+    updated_at?: string
+  }>
+  access?: {
+    openai_base_url?: string
+    chat_completions?: string
+    messages?: string
+    responses?: string
+    models?: string
+    health?: string
+  }
+}

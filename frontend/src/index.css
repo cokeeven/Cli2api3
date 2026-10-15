@@ -1,0 +1,346 @@
+@import "tailwindcss";
+@import "@heroui/styles";
+
+@theme {
+  --font-sans: "Outfit", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+/* Softer field corners + visible borders: HeroUI inputs / textareas /
+   number-field groups / select triggers all read these vars. The stock
+   theme ships --field-border-width:0px and --field-border:transparent,
+   relying on a barely-visible shadow instead — fields look flat on both
+   light and dark surfaces, so draw a real border. */
+:root,
+.light,
+.default,
+[data-theme="light"],
+[data-theme="default"] {
+  --field-radius: 16px;
+  --field-border-width: 1px;
+  --field-border: oklch(80% 0.008 286.32);
+  --field-border-hover: oklch(70% 0.012 285.9);
+  --field-border-focus: oklch(62% 0.04 285.9);
+}
+
+.dark,
+[data-theme="dark"] {
+  --field-radius: 16px;
+  --field-border-width: 1px;
+  --field-border: oklch(38% 0.008 286.033);
+  --field-border-hover: oklch(47% 0.012 285.9);
+  --field-border-focus: oklch(58% 0.04 285.9);
+}
+
+/* Chrome accent is Charcoal Ink. Signal Cyan stays on the C tip / scan only.
+   Dark inverts the fill so an ink button does not vanish on Off-Black Night. */
+:root,
+.light,
+.default,
+[data-theme="light"],
+[data-theme="default"] {
+  --accent: #18181b;
+  --accent-foreground: #fcfcfc;
+  --focus: var(--accent);
+  --accent-soft: color-mix(in oklab, var(--accent) 28%, transparent);
+  --accent-soft-hover: color-mix(in oklab, var(--accent) 36%, transparent);
+}
+
+.dark,
+[data-theme="dark"] {
+  --accent: #fcfcfc;
+  --accent-foreground: #18181b;
+  --focus: var(--accent);
+  --accent-soft: color-mix(in oklab, var(--accent) 22%, transparent);
+  --accent-soft-hover: color-mix(in oklab, var(--accent) 30%, transparent);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+html {
+  background: var(--background);
+}
+
+body {
+  margin: 0;
+  overflow-x: hidden;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--foreground);
+}
+
+/* HeroUI 3.2.4 Tabs.Indicator crashes (SharedElementTransition). Selected
+   tabs and pagination current-page otherwise stay unfilled / gray. Glue both
+   to accent-soft so selection matches ToggleButton / Switch / Radio. */
+.tabs__tab[data-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
+  box-shadow: none;
+}
+
+.pagination__link[data-active="true"] {
+  --pagination-link-bg: var(--accent-soft);
+  --pagination-link-bg-hover: var(--accent-soft-hover);
+  --pagination-link-bg-pressed: var(--accent-soft-hover);
+  --pagination-link-fg: var(--accent-soft-foreground);
+}
+
+/* HeroUI default skeleton sits on surface-tertiary/70 and disappears on
+   white cards. Keep the shimmer, raise the fill so loading is visible. */
+.skeleton {
+  background: color-mix(in oklab, var(--foreground) 10%, var(--surface));
+}
+
+/* Brand loading: cyan scan along the same C rail as the static mark.
+   stroke-dashoffset is the path-length equivalent of a Meter width tween. */
+.brand-mark--loading .brand-mark__scan {
+  stroke-dasharray: 14 86;
+  animation: brand-mark-scan 1.35s linear infinite;
+}
+
+@keyframes brand-mark-scan {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark--loading .brand-mark__scan {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--muted);
+}
+
+.status-dot[data-state="ok"] {
+  background: var(--success);
+}
+
+.status-dot[data-state="warn"] {
+  background: var(--warning);
+}
+
+.status-dot[data-state="danger"] {
+  background: var(--danger);
+}
+
+.account-card .status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+}
+
+.account-meter {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 0.4rem;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "output"
+    "track";
+}
+
+.account-meter .meter__output,
+.account-meter .meter__track {
+  width: 100%;
+  min-width: 0;
+}
+
+.account-meter .meter__track {
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--separator);
+  overflow: hidden;
+}
+
+.account-meter .meter__fill {
+  border-radius: 999px;
+}
+
+.account-meter--window {
+  gap: 0.3rem;
+}
+
+.account-meter--window .meter__track {
+  height: 0.5rem;
+}
+
+/* HeroUI Tooltip.Trigger is inline-block; quota windows must each occupy a
+   full row on the account card instead of sitting side by side. */
+.account-quota-windows .tooltip__trigger {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.runtime-meter {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 0.15rem;
+  height: 0.5rem;
+  align-items: end;
+}
+
+.runtime-meter__seg {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--separator);
+  transform: scaleY(0.32);
+  transform-origin: center bottom;
+  opacity: 0.45;
+}
+
+.runtime-meter__seg[data-on="true"] {
+  transform: scaleY(1);
+  opacity: 1;
+}
+
+.runtime-meter__seg[data-tone="ok"] {
+  background: var(--success);
+}
+
+.runtime-meter__seg[data-tone="warn"] {
+  background: var(--warning);
+}
+
+.runtime-meter__seg[data-tone="danger"] {
+  background: var(--danger);
+}
+
+.runtime-meter__seg[data-tone="muted"] {
+  background: var(--muted);
+}
+
+.release-notes-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--surface-secondary);
+  padding: 0.75rem 1rem 0.85rem;
+}
+
+.release-notes-box {
+  max-height: min(22rem, 52vh);
+  margin-top: 0.5rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.15rem;
+}
+
+.release-notes-box--compact {
+  max-height: 10rem;
+  margin-top: 0;
+}
+
+.release-notes {
+  color: var(--foreground);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.release-notes h3,
+.release-notes h4 {
+  margin: 0 0 0.45rem;
+  color: var(--muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.release-notes h3 + ul,
+.release-notes h4 + ul,
+.release-notes h3 + p,
+.release-notes h4 + p {
+  margin-top: 0;
+}
+
+.release-notes ul {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding-left: 1.05rem;
+}
+
+.release-notes li {
+  overflow-wrap: anywhere;
+}
+
+.release-notes li::marker {
+  color: var(--muted);
+}
+
+.release-notes p {
+  margin: 0 0 0.5rem;
+  color: var(--muted);
+}
+
+.release-notes p:last-child,
+.release-notes ul:last-child {
+  margin-bottom: 0;
+}
+
+.release-notes code {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  padding: 0.05rem 0.28rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+.release-notes a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.release-notes strong {
+  font-weight: 600;
+}
+
+.release-notes__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

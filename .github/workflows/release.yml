@@ -1,0 +1,396 @@
+name: Release
+
+run-name: Release next ${{ inputs.bump || 'patch' }} from ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: SemVer component to increment from the latest published release
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.version.outputs.image }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      series: ${{ steps.version.outputs.series }}
+      sha: ${{ steps.version.outputs.sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Wait for main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for _ in {1..120}; do
+            run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=20")"
+            run_id="$(jq -r '.workflow_runs | sort_by(.created_at) | last | .id // empty' <<< "$run_json")"
+            status="$(jq -r '.workflow_runs | sort_by(.created_at) | last | .status // empty' <<< "$run_json")"
+            conclusion="$(jq -r '.workflow_runs | sort_by(.created_at) | last | .conclusion // empty' <<< "$run_json")"
+            url="$(jq -r '.workflow_runs | sort_by(.created_at) | last | .html_url // empty' <<< "$run_json")"
+            if [[ -z "$run_id" ]]; then
+              echo "Waiting for CI run on $GITHUB_SHA"
+            elif [[ "$status" == "completed" ]]; then
+              if [[ "$conclusion" != "success" ]]; then
+                echo "CI did not pass: $conclusion ($url)" >&2
+                exit 1
+              fi
+              echo "CI passed: $url"
+              exit 0
+            else
+              echo "Waiting for CI run $run_id: $status"
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for CI on $GITHUB_SHA" >&2
+          exit 1
+      - name: Calculate next version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release workflow must run from main, got $GITHUB_REF" >&2
+            exit 1
+          fi
+          case "$BUMP" in
+            patch|minor|major) ;;
+            *)
+              echo "Unsupported bump $BUMP" >&2
+              exit 1
+              ;;
+          esac
+
+          git fetch --tags --force
+          previous_tag="$({
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'
+          } | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print }' | sort -V | tail -n 1)"
+
+          if [[ -z "$previous_tag" ]]; then
+            major=0
+            minor=1
+            patch=0
+          else
+            version="${previous_tag#v}"
+            IFS=. read -r major minor patch <<< "$version"
+            case "$BUMP" in
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              patch)
+                patch=$((patch + 1))
+                ;;
+            esac
+            if ! git merge-base --is-ancestor "$previous_tag" "$GITHUB_SHA"; then
+              echo "$previous_tag is not an ancestor of $GITHUB_SHA" >&2
+              exit 1
+            fi
+            previous_sha="$(git rev-list -n 1 "$previous_tag")"
+            if [[ "$previous_sha" == "$GITHUB_SHA" ]]; then
+              echo "No commits exist after $previous_tag" >&2
+              exit 1
+            fi
+          fi
+
+          tag="v${major}.${minor}.${patch}"
+          version="${major}.${minor}.${patch}"
+          series="${major}.${minor}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          if git show-ref --tags --verify --quiet "refs/tags/$tag"; then
+            tag_sha="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "$tag already points to $tag_sha instead of $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "image=$image"
+            echo "previous_tag=$previous_tag"
+            echo "series=$series"
+            echo "sha=$GITHUB_SHA"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Preparing $tag from $GITHUB_SHA"
+      - name: Validate bilingual changelog
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-notes.py validate
+          python3 scripts/release-notes.py extract-for-release "$RELEASE_TAG" >/dev/null
+
+  assets:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build host updater assets
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.tag }}
+          APP_COMMIT: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: ./scripts/build-updater-assets.sh release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-assets-${{ needs.prepare.outputs.tag }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    needs: [prepare, assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: updater-assets-${{ needs.prepare.outputs.tag }}
+          path: release-assets
+      - name: Extract bilingual release notes
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-notes.py extract-for-release "$RELEASE_TAG" > release-notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.tag }}
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+      - name: Create or refresh draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "$RELEASE_TAG is already published" >&2
+              exit 1
+            fi
+            target_sha="$(gh release view "$RELEASE_TAG" --json targetCommitish --jq '.targetCommitish')"
+            if [[ "$target_sha" != "$RELEASE_SHA" ]]; then
+              echo "Retargeting $RELEASE_TAG draft from $target_sha to $RELEASE_SHA"
+            fi
+            gh release edit "$RELEASE_TAG" --target "$RELEASE_SHA" --notes-file release-notes.md
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --target "$RELEASE_SHA" \
+              --title "CLI2API $RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --draft
+          fi
+
+  image:
+    needs: [prepare, draft]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.prepare.outputs.image }}:candidate-${{ needs.prepare.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.tag }}
+            APP_COMMIT=${{ needs.prepare.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  promote:
+    needs: [prepare, draft, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote and verify immutable image tags
+        env:
+          CANDIDATE_IMAGE: ${{ needs.prepare.outputs.image }}:candidate-${{ needs.prepare.outputs.sha }}
+          RELEASE_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.tag }}
+          SEMVER_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$RELEASE_IMAGE" \
+            --tag "$SEMVER_IMAGE" \
+            "$CANDIDATE_IMAGE"
+          manifest="$(docker buildx imagetools inspect --raw "$RELEASE_IMAGE")"
+          jq -e '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")' <<< "$manifest" >/dev/null
+          jq -e '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")' <<< "$manifest" >/dev/null
+
+  publish:
+    needs: [prepare, draft, promote]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.tag }}
+          path: .
+      - name: Verify assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset_count="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          if [[ "$asset_count" -ne 7 ]]; then
+            echo "$RELEASE_TAG has $asset_count assets, expected 7" >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md --draft=false --latest
+          {
+            echo "## Published $RELEASE_TAG"
+            echo
+            echo "- Image: \`${{ needs.prepare.outputs.image }}:$RELEASE_TAG\`"
+            echo "- Updater assets: 6 binaries + SHA256 manifest"
+            echo "- Release notes: bilingual fragments from changelog/unreleased/"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  aliases:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update stable image aliases
+        env:
+          RELEASE_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.tag }}
+          SERIES_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.series }}
+          LATEST_IMAGE: ${{ needs.prepare.outputs.image }}:latest
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$SERIES_IMAGE" \
+            --tag "$LATEST_IMAGE" \
+            "$RELEASE_IMAGE"
+
+  changelog:
+    needs: [prepare, publish, aliases]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.prepare.outputs.tag }}
+          path: .
+      - name: Open changelog archive pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-notes.py consume "$RELEASE_VERSION" \
+            --date "$(date -u +%F)" \
+            --notes-file release-notes.md \
+            --release-sha "$RELEASE_SHA"
+          if git diff --quiet -- CHANGELOG.md changelog/unreleased; then
+            echo "CHANGELOG.md already contains $RELEASE_VERSION and shipped fragments are gone"
+            exit 0
+          fi
+          branch="docs/archive-changelog-${RELEASE_TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add -A -- CHANGELOG.md changelog/unreleased
+          git commit -m "docs: archive changelog for $RELEASE_TAG"
+          git push --force-with-lease origin "HEAD:refs/heads/$branch"
+          if [[ "$(gh pr list --head "$branch" --base main --json number --jq 'length')" == "0" ]]; then
+            gh pr create --head "$branch" --base main \
+              --title "docs: archive changelog for $RELEASE_TAG" \
+              --body "$(printf '%s\n' \
+                "Archive the notes published in ${RELEASE_TAG}." \
+                "" \
+                "This PR copies the GitHub Release body under \`## ${RELEASE_VERSION}\` and deletes only the \`changelog/unreleased/\` files that existed at \`${RELEASE_SHA}\`. Fragments added after the tag stay unpublished." \
+                "" \
+                "Merge this PR. Do not re-run \`release.yml\` to archive notes — a second run would mint the next patch." \
+                "" \
+                "If required checks do not start (the Actions token cannot retrigger workflows), push an empty commit to \`${branch}\` from a local checkout.")"
+          fi

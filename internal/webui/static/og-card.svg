@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" font-family="Outfit, 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif">
+  <defs>
+    <style>
+      .rail { stroke: #18181B; stroke-width: 11.4; stroke-linejoin: round; stroke-linecap: round; fill: none; }
+      .tip  { stroke: #22D3EE; stroke-width: 11.4; stroke-linejoin: round; stroke-linecap: round; fill: none; }
+      .word { font-weight: 600; letter-spacing: -0.035em; fill: #18181B; }
+      .sub  { font-weight: 400; fill: #71717A; }
+      .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-weight: 500; fill: #18181B; }
+      .chip { fill: #EFEFF0; }
+      .chip-text { fill: #18181B; font-weight: 500; }
+      .frame { fill: none; stroke: #DEDEE0; stroke-width: 1; }
+      .terminal-bg { fill: #FFFFFF; stroke: #DEDEE0; stroke-width: 1; }
+      .prompt { fill: #18181B; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="640" fill="#F5F5F5"/>
+  <rect x="32" y="32" width="1216" height="576" rx="24" class="frame"/>
+  <circle cx="1208" cy="64" r="4" fill="#18181B"/>
+
+  <g transform="translate(48, 80) scale(3.6)">
+    <path class="rail" pathLength="100" d="M 91.413 45.646 A 32.000 32.000 0 1 0 91.413 82.354"/>
+    <path class="tip" pathLength="100" d="M 96.889 68.454 A 32.000 32.000 0 0 1 91.413 82.354"/>
+  </g>
+
+  <text x="500" y="298" class="word" font-size="112">CLI2API</text>
+  <text x="500" y="356" class="sub" font-size="28">Qoder CLI → OpenAI-compatible API</text>
+
+  <g transform="translate(820, 230)">
+    <rect width="380" height="180" rx="16" class="terminal-bg"/>
+    <text x="24" y="56" class="mono" font-size="20">
+      <tspan class="prompt">$ </tspan>
+      <tspan>./cli2api serve</tspan>
+    </text>
+    <text x="24" y="96" class="mono" font-size="18" fill="#71717A">account: acc_8f2k (ready)</text>
+    <text x="24" y="124" class="mono" font-size="18" fill="#71717A">endpoint: :3010/v1</text>
+    <text x="24" y="156" class="mono" font-size="18" fill="#71717A">mode: streaming</text>
+  </g>
+
+  <g transform="translate(64, 552)">
+    <rect width="232" height="36" rx="18" class="chip"/>
+    <text x="16" y="24" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="16" class="chip-text">&gt; ./cli2api serve</text>
+  </g>
+</svg>

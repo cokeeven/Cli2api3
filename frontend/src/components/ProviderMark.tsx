@@ -1,0 +1,37 @@
+import { CommandMark } from '@/components/CommandMark'
+import { CodexMark } from '@/components/CodexMark'
+import { DevinMark } from '@/components/DevinMark'
+import { QoderMark } from '@/components/QoderMark'
+import { TraeMark } from '@/components/TraeMark'
+import { WorkBuddyMark } from '@/components/WorkBuddyMark'
+import { ZhipuMark } from '@/components/ZhipuMark'
+
+type Props = {
+  provider?: string
+  size?: number
+  className?: string
+}
+
+/** Brand mark for an account provider; unknown values fall back to Qoder. */
+export function ProviderMark({ provider, size = 16, className = '' }: Props) {
+  const id = String(provider || '').toLowerCase()
+  if (id === 'workbuddy') {
+    return <WorkBuddyMark size={size} className={className} />
+  }
+  if (id === 'trae') {
+    return <TraeMark size={size} className={className} />
+  }
+  if (id === 'devin') {
+    return <DevinMark size={size} className={className} />
+  }
+  if (id === 'command') {
+    return <CommandMark size={size} className={className} />
+  }
+  if (id === 'codex') {
+    return <CodexMark size={size} className={className} />
+  }
+  if (id === 'zhipu') {
+    return <ZhipuMark size={size} className={className} />
+  }
+  return <QoderMark size={size} className={className} />
+}

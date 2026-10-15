@@ -1,0 +1,1059 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/config"
+	"github.com/caigee-cmd/cli2api/internal/executor"
+	"github.com/caigee-cmd/cli2api/internal/providers"
+	"github.com/caigee-cmd/cli2api/internal/translate"
+)
+
+func TestClassifyCanceledErrorDoesNotBecomeAuth(t *testing.T) {
+	err := fmt.Errorf("load credential payload: %w", context.Canceled)
+	classified := classifyAPIError(err)
+	if classified.Kind == accounts.KindAuth {
+		t.Fatalf("canceled credential error classified as auth: %+v", classified)
+	}
+	if classified.Kind != accounts.KindCanceled || classified.Failover || classified.Cooldown != 0 || classified.Code != "request_canceled" {
+		t.Fatalf("canceled error classification = %+v", classified)
+	}
+}
+
+func TestCORSHeadersOnUnauthorizedChat(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("{}")))
+	req.Header.Set("Origin", "chrome-extension://abc")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST without key: got %d want 401 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("allow-origin=%q", got)
+	}
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, "X-Request-Id") {
+		t.Fatalf("expose-headers=%q", got)
+	}
+}
+
+func TestManagementRoutesRequireAPIKey(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	h := srv.Handler()
+
+	for _, path := range []string{
+		"/api/overview",
+		"/api/overview/summary",
+		"/api/models",
+		"/api/chat",
+		"/api/accounts",
+		"/api/logs/requests",
+		"/api/logs/runtime",
+		"/api/system/update",
+		"/api/system/settings",
+		"/api/keys",
+		"/api/system/console-key",
+	} {
+		method := http.MethodGet
+		if path == "/api/chat" {
+			method = http.MethodPost
+		}
+		req := httptest.NewRequest(method, path, bytes.NewReader([]byte("{}")))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s without key: got %d want 401 body=%s", method, path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestOpenAIEndpointsAllowCORSPreflightWithoutAPIKey(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret", QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	for _, path := range []string{
+		"/v1/models",
+		"/v1/chat/completions",
+		"/v1/messages",
+		"/v1/responses",
+	} {
+		req := httptest.NewRequest(http.MethodOptions, path, nil)
+		req.Header.Set("Origin", "chrome-extension://example")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		req.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS %s: got %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Access-Control-Allow-Origin") != "*" ||
+			rec.Header().Get("Access-Control-Allow-Methods") == "" ||
+			rec.Header().Get("Access-Control-Allow-Headers") == "" {
+			t.Fatalf("OPTIONS %s missing CORS headers: %v", path, rec.Header())
+		}
+	}
+
+	chat := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	chat.Header.Set("Origin", "chrome-extension://example")
+	chatRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(chatRec, chat)
+	if chatRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated chat: got %d want 401", chatRec.Code)
+	}
+	if chatRec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("unauthenticated chat missing CORS headers: %v", chatRec.Header())
+	}
+
+	for _, path := range []string{"/api/chat", "/api/keys", "/api/accounts"} {
+		management := httptest.NewRequest(http.MethodOptions, path, nil)
+		management.Header.Set("Origin", "chrome-extension://example")
+		managementRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(managementRec, management)
+		if managementRec.Code != http.StatusUnauthorized {
+			t.Fatalf("management OPTIONS %s: got %d want 401", path, managementRec.Code)
+		}
+	}
+}
+
+func TestOverviewSummaryReturnsLightweightSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: dir, DataDir: dir,
+	})
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/overview/summary", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var summary struct {
+		Proxy struct {
+			Service string `json:"service"`
+		} `json:"proxy"`
+		Worker struct {
+			AccountCount int `json:"account_count"`
+		} `json:"worker"`
+		Models   []map[string]any `json:"models"`
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Proxy.Service != "cli2api" || summary.Worker.AccountCount != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if summary.Models != nil || summary.Accounts != nil {
+		t.Fatalf("summary must not include detail collections: %+v", summary)
+	}
+}
+
+func TestCanonicalModelIDNormalizesWithoutAliases(t *testing.T) {
+	for input, want := range map[string]string{
+		"MiniMax-M3":   "minimax-m3",
+		"Qwen3.7-Plus": "qwen3.7-plus",
+		"qmodel":       "qmodel",
+		"GLM-5.2":      "glm-5.2",
+	} {
+		if got := accounts.CanonicalModelID(input); got != want {
+			t.Fatalf("CanonicalModelID(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if accounts.CanonicalModelID("glm-5.2") == accounts.CanonicalModelID("qwen3.7-plus") {
+		t.Fatal("GLM-5.2 and Qwen3.7-Plus must have independent context settings")
+	}
+}
+
+func TestModelContextSettingsApplyToChatDefaults(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	if err := srv.Manager.Store().SetModelContext(context.Background(), "minimax-m3", 500000); err != nil {
+		t.Fatal(err)
+	}
+	req := translate.ChatRequest{Model: "MiniMax-M3"}
+	if err := srv.applyModelContextDefaults(context.Background(), &req, "qoder"); err != nil {
+		t.Fatal(err)
+	}
+	if string(req.ContextLength) != "500000" || string(req.MaxInputTokens) != "500000" {
+		t.Fatalf("context=%s max_input=%s", req.ContextLength, req.MaxInputTokens)
+	}
+
+	explicit := translate.ChatRequest{
+		Model:          "minimax-m3",
+		ContextLength:  json.RawMessage("250000"),
+		MaxInputTokens: json.RawMessage("900000"),
+	}
+	if err := srv.applyModelContextDefaults(context.Background(), &explicit, "qoder"); err != nil {
+		t.Fatal(err)
+	}
+	if string(explicit.ContextLength) != "250000" || string(explicit.MaxInputTokens) != "900000" {
+		t.Fatalf("explicit values overwritten: context=%s max_input=%s", explicit.ContextLength, explicit.MaxInputTokens)
+	}
+}
+
+func TestModelContextSettingsAPI(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// App startup may probe the pool after this fake worker is registered.
+		// Handle background traffic separately from the catalog assertions.
+		if r.URL.Path == "/health" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ready": true, "hot": true})
+			return
+		}
+		if r.URL.Path == "/admin/quota" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path != "/admin/models" {
+			t.Errorf("worker path = %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
+			"id": "minimax-m3", "display_name": "MiniMax-M3", "mapped_key": "mmodel",
+		}}})
+	}))
+	defer worker.Close()
+	srv.Pool.Upsert(executor.Item{ID: "test", URL: worker.URL})
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/models/minimax-m3", bytes.NewBufferString(`{"context_length":500000}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH model context: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"context_length":500000`)) {
+		t.Fatalf("GET models: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTraeMaxModeSettingDoesNotChangeQoderContext(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	if err := srv.Manager.Store().SetModelContext(context.Background(), "glm-5.2", 250000); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/models/trae/glm-5.2", bytes.NewBufferString(`{"max_mode":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"max_mode":true`)) {
+		t.Fatalf("PATCH trae max mode: %d %s", rec.Code, rec.Body.String())
+	}
+
+	got, ok, err := srv.Manager.Store().GetModelContext(context.Background(), "glm-5.2")
+	if err != nil || !ok || got != 250000 {
+		t.Fatalf("qoder context mutated: %d %v %v", got, ok, err)
+	}
+	traeReq := translate.ChatRequest{Model: "glm-5.2"}
+	if err := srv.applyModelContextDefaults(context.Background(), &traeReq, "trae"); err != nil {
+		t.Fatal(err)
+	}
+	if len(traeReq.ContextLength) != 0 || len(traeReq.MaxInputTokens) != 0 {
+		t.Fatalf("trae request received qoder context defaults: %+v", traeReq)
+	}
+}
+
+func TestWorkBuddyReasoningSettingDoesNotChangeQoderContext(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	if err := srv.Manager.Store().SetModelContext(context.Background(), "glm-5.3", 250000); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPatch, "/api/models/workbuddy/glm-5.3", bytes.NewBufferString(`{"reasoning_effort":"xhigh"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"reasoning_effort":"xhigh"`)) {
+		t.Fatalf("PATCH workbuddy reasoning: %d %s", rec.Code, rec.Body.String())
+	}
+	got, ok, err := srv.Manager.Store().GetModelContext(context.Background(), "glm-5.3")
+	if err != nil || !ok || got != 250000 {
+		t.Fatalf("qoder context mutated: %d %v %v", got, ok, err)
+	}
+}
+
+func TestProviderModelSettingFailuresStayBadRequest(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/models/workbuddy/glm-5.3", bytes.NewBufferString(`{"max_mode":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"invalid_request"`)) {
+		t.Fatalf("workbuddy max PATCH: %d %s", rec.Code, rec.Body.String())
+	}
+
+	if err := srv.Manager.Store().Close(); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPatch, "/api/models/trae/glm-5.2", bytes.NewBufferString(`{"max_mode":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"model_setting_failed"`)) {
+		t.Fatalf("closed-store PATCH: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+type failingCatalog struct{}
+
+func (failingCatalog) Models(context.Context, string) ([]providers.ModelInfo, error) {
+	return nil, fmt.Errorf("models status=500: upstream html error page (internal server error)")
+}
+
+func TestModelsAPICatalogFailureUses503(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	srv.Pool.Upsert(executor.Item{ID: "wb-global", Provider: "workbuddy", Runtime: string(providers.RuntimeInProcess)})
+	srv.Providers.Register(providers.Adapter{ID: "workbuddy", Models: failingCatalog{}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/models?account=wb-global", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("catalog failure status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Code == http.StatusBadGateway {
+		t.Fatal("catalog failures must not use 502; reverse proxies replace that with HTML")
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"catalog_failed"`)) {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
+type countingCatalog struct {
+	hits   atomic.Int32
+	models []providers.ModelInfo
+}
+
+func (c *countingCatalog) Models(context.Context, string) ([]providers.ModelInfo, error) {
+	c.hits.Add(1)
+	return c.models, nil
+}
+
+// regionCatalog serves a distinct model list per account, so pool items of
+// different regions of one provider genuinely serve different models.
+type regionCatalog struct {
+	byAccount map[string][]providers.ModelInfo
+}
+
+func (c *regionCatalog) Models(_ context.Context, accountID string) ([]providers.ModelInfo, error) {
+	return c.byAccount[accountID], nil
+}
+
+func TestModelsAPICachesCatalogForFiveMinutes(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	catalog := &countingCatalog{models: []providers.ModelInfo{{
+		NativeModel: "glm-5.3", PublicModel: "glm-5.3", DisplayName: "GLM",
+	}}}
+	srv.Pool.Upsert(executor.Item{ID: "wb-cn", Provider: "workbuddy", Runtime: string(providers.RuntimeInProcess)})
+	srv.Providers.Register(providers.Adapter{ID: "workbuddy", Models: catalog})
+
+	getModels := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := getModels("/api/models?account=wb-cn")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first /api/models = %d %s", first.Code, first.Body.String())
+	}
+	second := getModels("/api/models?account=wb-cn")
+	if second.Code != http.StatusOK {
+		t.Fatalf("cached /api/models = %d %s", second.Code, second.Body.String())
+	}
+	if catalog.hits.Load() != 1 {
+		t.Fatalf("cached /api/models hits = %d, want 1", catalog.hits.Load())
+	}
+
+	overview := getModels("/api/overview")
+	if overview.Code != http.StatusOK {
+		t.Fatalf("/api/overview = %d %s", overview.Code, overview.Body.String())
+	}
+	if catalog.hits.Load() != 2 {
+		t.Fatalf("overview must not use /api/models cache, hits = %d", catalog.hits.Load())
+	}
+
+	refreshed := getModels("/api/models?account=wb-cn&refresh=1")
+	if refreshed.Code != http.StatusOK {
+		t.Fatalf("refresh /api/models = %d %s", refreshed.Code, refreshed.Body.String())
+	}
+	if catalog.hits.Load() != 3 {
+		t.Fatalf("refresh=1 hits = %d, want 3", catalog.hits.Load())
+	}
+}
+
+func TestLegacyDiagnosticRoutesAreRemoved(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+
+	for _, target := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/login/status"},
+		{http.MethodPost, "/api/login/device"},
+		{http.MethodPost, "/api/login/pat"},
+		{http.MethodPost, "/api/rewarm"},
+		{http.MethodGet, "/debug/auth-snapshot"},
+		{http.MethodGet, "/debug/endpoints"},
+	} {
+		req := httptest.NewRequest(target.method, target.path, bytes.NewReader([]byte("{}")))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s %s: got %d want 404 body=%s", target.method, target.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestSPAFallbackServesIndexForClientRoutes(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodGet, "/auth", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /auth: got %d want 200", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	if !bytes.Contains(body, []byte(`id="root"`)) && !bytes.Contains(body, []byte("CLI2API")) {
+		t.Fatalf("GET /auth did not serve SPA index: %s", string(body[:min(200, len(body))]))
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("GET /auth content-type=%q", ct)
+	}
+}
+
+func TestOverviewWithAPIKeyDoesNotLeakWorkerProxyFailureAs200Auth(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/overview with key: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("overview ok=%v", payload["ok"])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func TestSPAFallbackServesAccounts(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /accounts: got %d want 200", rec.Code)
+	}
+}
+
+func TestSPAFallbackServesLogin(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /login: got %d want 200", rec.Code)
+	}
+}
+
+func TestSPAFallbackServesLogs(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+	})
+	defer srv.Close()
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /logs: got %d want 200", rec.Code)
+	}
+}
+
+func TestAccountsAPICreatesAndListsDisabledAccount(t *testing.T) {
+	dataDir := t.TempDir()
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+		DataDir:     dataDir,
+	})
+	defer srv.Close()
+	body := bytes.NewBufferString(`{"name":"Work","enabled":false,"max_inflight":5,"drop_system_prompt":false}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/accounts: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/accounts: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Data []struct {
+			Name             string `json:"name"`
+			Enabled          bool   `json:"enabled"`
+			MaxInFlight      int    `json:"max_inflight"`
+			DropSystemPrompt bool   `json:"drop_system_prompt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 1 || payload.Data[0].Name != "Work" || payload.Data[0].Enabled || payload.Data[0].MaxInFlight != 5 || payload.Data[0].DropSystemPrompt {
+		t.Fatalf("accounts payload = %+v", payload.Data)
+	}
+}
+
+func TestAccountsAPIImportsNativeCredential(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+		DataDir:     t.TempDir(),
+	})
+	defer srv.Close()
+	body := bytes.NewBufferString(`{"format":"qoder-native-v1","name":"Imported","enabled":false,"user_blob":"Y2lwaGVy","machine_id":"machine-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/import", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/accounts/import: %d %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"auth_type":"native"`)) {
+		t.Fatalf("import response = %s", rec.Body.String())
+	}
+}
+
+func TestAccountsAPIUpdatesExportsAndDeletesAccount(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+		DataDir:     t.TempDir(),
+	})
+	defer srv.Close()
+	importBody := bytes.NewBufferString(`{"format":"qoder-native-v1","name":"Imported","enabled":false,"user_blob":"Y2lwaGVy","machine_id":"machine-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/import", importBody)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("import: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	patchBody := bytes.NewBufferString(`{"name":"Renamed","max_inflight":8}`)
+	req = httptest.NewRequest(http.MethodPatch, "/api/accounts/"+created.ID, patchBody)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"name":"Renamed"`)) {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts/"+created.ID+"/export", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"format":"qoder-native-v1"`)) || !bytes.Contains(rec.Body.Bytes(), []byte(`"user_blob":"Y2lwaGVy"`)) || !bytes.Contains(rec.Body.Bytes(), []byte(`"provider":"qoder"`)) || !bytes.Contains(rec.Body.Bytes(), []byte(`"region":"global"`)) {
+		t.Fatalf("export: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/accounts/"+created.ID, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestNamedAPIKeyCannotManageConsoleOrKeys(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	created, err := srv.Control.Keys.Create(context.Background(), accounts.CreateAPIKey{
+		Name: "ci", Providers: []string{"qoder"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/keys", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("named key GET /api/keys = %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("named key GET /api/overview = %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("named key GET /v1/models = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestNamedAPIKeyModelsListOnlyIncludesAllowedProviders(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	created, err := srv.Control.Keys.Create(context.Background(), accounts.CreateAPIKey{
+		Name: "ci", Providers: []string{"qoder"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Pool.Upsert(executor.Item{ID: "wb1", Provider: "workbuddy", Runtime: string(providers.RuntimeInProcess)})
+	srv.Providers.Register(providers.Adapter{ID: "workbuddy", Models: &countingCatalog{models: []providers.ModelInfo{{
+		NativeModel: "glm-5.2", PublicModel: "glm-5.2", DisplayName: "GLM",
+	}}}})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("named key GET /v1/models = %d %s", rec.Code, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"workbuddy"`)) || bytes.Contains(rec.Body.Bytes(), []byte(`"owned_by":"workbuddy"`)) {
+		t.Fatalf("qoder-only key must not list workbuddy models: %s", rec.Body.String())
+	}
+
+	console := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	console.Header.Set("Authorization", "Bearer secret")
+	consoleRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(consoleRec, console)
+	if consoleRec.Code != http.StatusOK {
+		t.Fatalf("console GET /v1/models = %d %s", consoleRec.Code, consoleRec.Body.String())
+	}
+	if !bytes.Contains(consoleRec.Body.Bytes(), []byte(`"workbuddy"`)) {
+		t.Fatalf("console key must still list workbuddy models: %s", consoleRec.Body.String())
+	}
+}
+
+func TestAPIKeysCRUDAndConsoleKeyPrefix(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/console-key", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"prefix"`)) {
+		t.Fatalf("console key: %d %s", rec.Code, rec.Body.String())
+	}
+
+	body := bytes.NewBufferString(`{"name":"CI","providers":["qoder"]}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/keys", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || !bytes.Contains(rec.Body.Bytes(), []byte(`"secret"`)) {
+		t.Fatalf("create key: %d %s", rec.Code, rec.Body.String())
+	}
+	var created accounts.APIKey
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPatch, "/api/keys/"+created.ID, bytes.NewBufferString(`{"name":"CI bot"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"name":"CI bot"`)) {
+		t.Fatalf("patch key: %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodDelete, "/api/keys/"+created.ID, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete key: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAccountRefreshRouteRequiresKeyAndReportsMissingAccount(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+		DataDir:     t.TempDir(),
+	})
+	defer srv.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/missing/refresh", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh without key: got %d want 401", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts/missing/refresh", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("refresh unknown account: got %d want 404 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAccountRefreshRouteRejectsGET(t *testing.T) {
+	srv := New(config.Config{
+		Host:        "127.0.0.1",
+		Port:        3010,
+		ProxyAPIKey: "secret",
+		QoderHome:   t.TempDir(),
+		DataDir:     t.TempDir(),
+	})
+	defer srv.Close()
+
+	body := bytes.NewBufferString(`{"name":"Refreshable","enabled":false}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create account: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// A disabled account has no pool item, so refresh fails closed instead of
+	// silently reporting a stale view.
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts/"+created.ID+"/refresh", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("refresh disabled account: got %d want 502 (%s)", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts/"+created.ID+"/refresh", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET refresh: got %d want 405", rec.Code)
+	}
+}
+
+func TestAccountCheckinRecordsRoute(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	account, err := srv.Manager.Store().Create(context.Background(), accounts.CreateAccount{
+		Name: "WorkBuddy", Provider: "workbuddy", Region: "cn", Enabled: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 3, 1, 0, 0, 0, time.UTC)
+	if err := srv.Manager.Store().RecordCheckin(context.Background(), account.ID, "success", "签到成功", at); err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/api/accounts/" + account.ID + "/checkins"
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("checkin records without key: got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("checkin records: got %d %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Data []accounts.CheckinRecord `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 1 || payload.Data[0].Status != "success" {
+		t.Fatalf("checkin records payload=%+v", payload.Data)
+	}
+}
+
+func TestNamedAPIKeyRegionScopedModelsList(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	srv.Pool.Upsert(executor.Item{ID: "wc1", Provider: "workbuddy", Region: "cn", Runtime: string(providers.RuntimeInProcess)})
+	srv.Pool.Upsert(executor.Item{ID: "wg1", Provider: "workbuddy", Region: "global", Runtime: string(providers.RuntimeInProcess)})
+	srv.Pool.Upsert(executor.Item{ID: "t1", Provider: "trae", Region: "cn", Runtime: string(providers.RuntimeInProcess)})
+	// The catalog fake returns different models per account so each region
+	// genuinely serves a distinct model set.
+	srv.Providers.Register(providers.Adapter{ID: "workbuddy", Models: &regionCatalog{
+		byAccount: map[string][]providers.ModelInfo{
+			"wc1": {{NativeModel: "glm-5.2", PublicModel: "glm-5.2", DisplayName: "GLM"}},
+			"wg1": {{NativeModel: "kimi-k3", PublicModel: "kimi-k3", DisplayName: "Kimi"}},
+		},
+	}})
+	srv.Providers.Register(providers.Adapter{ID: "trae", Models: &regionCatalog{
+		byAccount: map[string][]providers.ModelInfo{
+			"t1": {{NativeModel: "deepseek-v4", PublicModel: "deepseek-v4", DisplayName: "DS"}},
+		},
+	}})
+
+	fetch := func(secret string) string {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /v1/models = %d %s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+
+	// CN-only key: only models served by the cn account appear; the same
+	// public model id is not duplicated per region.
+	cnKey, err := srv.Control.Keys.Create(context.Background(), accounts.CreateAPIKey{
+		Name: "cn-only", Providers: []string{"workbuddy:cn"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cnBody := fetch(cnKey.Secret)
+	if !bytes.Contains([]byte(cnBody), []byte(`"id":"glm-5.2"`)) {
+		t.Fatalf("cn-only key must still see glm-5.2 served by the cn account: %s", cnBody)
+	}
+	if bytes.Contains([]byte(cnBody), []byte(`"deepseek-v4"`)) {
+		t.Fatalf("cn-only key must not see trae models: %s", cnBody)
+	}
+	if bytes.Count([]byte(cnBody), []byte(`"id":"glm-5.2"`)) != 1 {
+		t.Fatalf("model entries must dedup across regions: %s", cnBody)
+	}
+
+	// Global-only key: glm-5.2 exists in the pool but is only served by the
+	// cn account, so it disappears; kimi-k3 (served by global) stays.
+	globalKey, err := srv.Control.Keys.Create(context.Background(), accounts.CreateAPIKey{
+		Name: "global-only", Providers: []string{"workbuddy:global"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalBody := fetch(globalKey.Secret)
+	if bytes.Contains([]byte(globalBody), []byte(`"glm-5.2"`)) {
+		t.Fatalf("global-only key must not see models only served by cn accounts: %s", globalBody)
+	}
+	if !bytes.Contains([]byte(globalBody), []byte(`"id":"kimi-k3"`)) {
+		t.Fatalf("global-only key must see the model served by the global account: %s", globalBody)
+	}
+
+	// Legacy bare entry keeps every region.
+	bareKey, err := srv.Control.Keys.Create(context.Background(), accounts.CreateAPIKey{
+		Name: "bare", Providers: []string{"workbuddy"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bareBody := fetch(bareKey.Secret)
+	if !bytes.Contains([]byte(bareBody), []byte(`"id":"glm-5.2"`)) {
+		t.Fatalf("bare family entry must still list glm-5.2: %s", bareBody)
+	}
+	if bytes.Contains([]byte(bareBody), []byte(`"deepseek-v4"`)) {
+		t.Fatalf("bare workbuddy entry must not list trae models: %s", bareBody)
+	}
+}
+
+func TestAPIKeyRejectsMalformedRegionGrants(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+
+	for _, providers := range [][]string{
+		{"workbuddy:"},
+		{":cn"},
+		{"workbuddy:cn:x"},
+		{"unknown:cn"},
+		{"workbuddy:antarctica"},
+	} {
+		payload, _ := json.Marshal(map[string]any{"name": "bad", "providers": providers})
+		req := httptest.NewRequest(http.MethodPost, "/api/keys", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST /api/keys providers=%v = %d %s, want 400", providers, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Well-formed region entries are accepted.
+	payload, _ := json.Marshal(map[string]any{"name": "ok", "providers": []string{"workbuddy:cn", "qoder:global"}})
+	req := httptest.NewRequest(http.MethodPost, "/api/keys", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/keys with region grants = %d %s", rec.Code, rec.Body.String())
+	}
+}

@@ -1,0 +1,256 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/config"
+)
+
+func TestListRequestLogsFiltersAndPagination(t *testing.T) {
+	dir := t.TempDir()
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: dir, DataDir: dir,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	for i := 0; i < 5; i++ {
+		account := "acc_a"
+		model := "glm-5.3"
+		stream := false
+		if i%2 == 1 {
+			account = "acc_b"
+			model = "qwen3.7-plus"
+			stream = true
+		}
+		if err := srv.Recorder.Store().InsertRequestLog(ctx, accounts.RequestLog{
+			// Distinct eight-character prefixes keep the prefix-query assertion deterministic.
+			ID: fmt.Sprintf("req_%04d-fixture", i), CreatedAt: base.Add(time.Duration(i) * time.Minute),
+			Status: accounts.RequestStatusOK, RequestedModel: model, AccountID: account, Stream: stream,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.Ring.Append("[account=acc_b] warn line")
+	srv.Ring.Append("plain info")
+
+	h := srv.Handler()
+	get := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	page := get("/api/logs/requests?limit=2&offset=2")
+	if page.Code != http.StatusOK {
+		t.Fatalf("page status=%d body=%s", page.Code, page.Body.String())
+	}
+	var listed accounts.RequestLogList
+	if err := json.Unmarshal(page.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Total != 5 || listed.Limit != 2 || listed.Offset != 2 || len(listed.Items) != 2 {
+		t.Fatalf("page = %+v", listed)
+	}
+
+	filtered := get("/api/logs/requests?account=acc_b&model=qwen3.7-plus&stream=1&from=" + base.Format(time.RFC3339) + "&to=" + base.Add(4*time.Minute).Format(time.RFC3339))
+	if filtered.Code != http.StatusOK {
+		t.Fatalf("filter status=%d body=%s", filtered.Code, filtered.Body.String())
+	}
+	if err := json.Unmarshal(filtered.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Total != 2 {
+		t.Fatalf("filtered total=%d items=%+v", listed.Total, listed.Items)
+	}
+
+	exactID := listed.Items[0].ID
+	byID := get("/api/logs/requests?id=" + exactID)
+	if byID.Code != http.StatusOK {
+		t.Fatalf("id filter status=%d body=%s", byID.Code, byID.Body.String())
+	}
+	if err := json.Unmarshal(byID.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Total != 1 || listed.Items[0].ID != exactID {
+		t.Fatalf("id filter = %+v", listed)
+	}
+
+	prefix := get("/api/logs/requests?q=" + exactID[:8])
+	if prefix.Code != http.StatusOK {
+		t.Fatalf("id prefix status=%d body=%s", prefix.Code, prefix.Body.String())
+	}
+	if err := json.Unmarshal(prefix.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Total != 1 || listed.Items[0].ID != exactID {
+		t.Fatalf("id prefix = %+v", listed)
+	}
+
+	runtime := get("/api/logs/runtime?account=acc_b")
+	if runtime.Code != http.StatusOK {
+		t.Fatalf("runtime status=%d body=%s", runtime.Code, runtime.Body.String())
+	}
+	var snapshot struct {
+		Items []struct {
+			AccountID string `json:"account_id"`
+			Message   string `json:"message"`
+		} `json:"items"`
+		Count  int `json:"count"`
+		Total  int `json:"total"`
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
+	}
+	if err := json.Unmarshal(runtime.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Count != 1 || snapshot.Total != 1 || snapshot.Items[0].AccountID != "acc_b" {
+		t.Fatalf("runtime = %+v", snapshot)
+	}
+
+	srv.Ring.Append("line one")
+	srv.Ring.Append("line two")
+	srv.Ring.Append("line three")
+	paged := get("/api/logs/runtime?limit=2&offset=2")
+	if paged.Code != http.StatusOK {
+		t.Fatalf("runtime page status=%d body=%s", paged.Code, paged.Body.String())
+	}
+	if err := json.Unmarshal(paged.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Total != 5 || snapshot.Count != 2 || snapshot.Limit != 2 || snapshot.Offset != 2 || len(snapshot.Items) != 2 {
+		t.Fatalf("runtime page = %+v", snapshot)
+	}
+	if !strings.Contains(snapshot.Items[0].Message, "line one") || !strings.Contains(snapshot.Items[1].Message, "plain info") {
+		t.Fatalf("expected older runtime page, got %+v", snapshot.Items)
+	}
+}
+
+func TestRequestStatsWindow(t *testing.T) {
+	dir := t.TempDir()
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: dir, DataDir: dir,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-40 * time.Minute).Truncate(time.Second)
+	latency := 180
+	prompt, completion := 11, 22
+	if err := srv.Recorder.Store().InsertRequestLog(ctx, accounts.RequestLog{
+		ID: accounts.NewRequestID(), CreatedAt: base, Status: accounts.RequestStatusOK,
+		RequestedModel: "glm-5.3", AccountID: "acc_a", LatencyMs: &latency,
+		PromptTokens: &prompt, CompletionTokens: &completion,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Recorder.Store().InsertRequestLog(ctx, accounts.RequestLog{
+		ID: accounts.NewRequestID(), CreatedAt: base.Add(30 * time.Minute), Status: accounts.RequestStatusError,
+		RequestedModel: "qwen3.7-plus", AccountID: "acc_b", ErrorKind: accounts.KindUnavailable,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/stats?from="+base.Add(-10*time.Minute).Format(time.RFC3339)+"&to="+base.Add(50*time.Minute).Format(time.RFC3339), nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var stats accounts.RequestStats
+	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Totals.Requests != 2 || stats.Totals.OK != 1 || stats.Totals.Error != 1 {
+		t.Fatalf("stats = %+v", stats.Totals)
+	}
+	if stats.Tokens.Total != 33 {
+		t.Fatalf("tokens = %+v", stats.Tokens)
+	}
+	if len(stats.Errors) != 1 || stats.Errors[0].Key != accounts.KindUnavailable {
+		t.Fatalf("errors = %+v", stats.Errors)
+	}
+
+	second := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/logs/stats?from="+base.Add(-10*time.Minute).Format(time.RFC3339)+"&to="+base.Add(50*time.Minute).Format(time.RFC3339), nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	srv.Handler().ServeHTTP(second, req)
+	if second.Code != http.StatusOK {
+		t.Fatalf("cached status=%d body=%s", second.Code, second.Body.String())
+	}
+	cacheEntries := srv.consoleHandler().StatsCacheSize()
+	if cacheEntries != 1 {
+		t.Fatalf("stats cache entries=%d, want 1", cacheEntries)
+	}
+}
+
+func TestParseQueryTimeDateOnlyEndOfDay(t *testing.T) {
+	from := parseQueryTime("2026-08-28", false)
+	to := parseQueryTime("2026-08-28", true)
+	if from == nil || to == nil {
+		t.Fatal("expected parsed times")
+	}
+	if from.UTC().Format(time.RFC3339) != "2026-08-28T00:00:00Z" {
+		t.Fatalf("from=%s", from.UTC())
+	}
+	if to.UTC().Format(time.RFC3339Nano) != "2026-08-28T23:59:59.999999999Z" {
+		t.Fatalf("to=%s", to.UTC())
+	}
+}
+
+func TestGetRequestLogExposesUsageDetail(t *testing.T) {
+	dir := t.TempDir()
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: dir, DataDir: dir,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	id := accounts.NewRequestID()
+	created := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	if err := srv.Recorder.Store().InsertRequestLog(ctx, accounts.RequestLog{
+		ID: id, CreatedAt: created, Status: accounts.RequestStatusOK,
+		RequestedModel: "hy3", AccountID: "acc_wb", Provider: "workbuddy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	consumed := 0.75
+	if err := srv.Recorder.Store().InsertRequestUsageDetail(ctx, accounts.RequestUsageDetail{
+		RequestID: id, CreatedAt: created, Provider: "workbuddy", Credit: &consumed, Unit: "credits",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/requests/"+id, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		UsageDetail *accounts.RequestUsageDetail `json:"usage_detail"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.UsageDetail == nil || got.UsageDetail.Credit == nil || *got.UsageDetail.Credit != 0.75 ||
+		got.UsageDetail.Unit != "credits" || got.UsageDetail.Provider != "workbuddy" {
+		t.Fatalf("usage_detail = %+v", got.UsageDetail)
+	}
+}

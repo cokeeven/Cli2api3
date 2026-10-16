@@ -55,9 +55,12 @@ Use **Accounts** to add an account with its supported login method:
 | Trae Work | CN | Browser OAuth, `trae-oauth-v1` |
 | Devin (experimental) | Global | Browser OAuth, `devin-session-v1` |
 
-Qoder CN, WorkBuddy, and Trae still need live-account acceptance; Devin is not
-claimed production-ready. Qoder uses one isolated Node worker per account.
-Other providers use Go in-process adapters. All durable credentials stay in SQLite.
+Basic chat, streaming, tool calls and quota refresh have been verified with CN
+accounts for Qoder, WorkBuddy and Trae. Global accounts, interactive login,
+natural credential expiry and some campaign branches still need acceptance.
+Devin is experimental. Qoder login, catalog and quota use one isolated Node
+worker per account; its chat path and other providers use Go in-process clients.
+All durable credentials stay in SQLite.
 
 WorkBuddy daily check-in and token keepalive are per-account opt-in and disabled
 by default. Enable them only if you want those automatic account operations.
@@ -293,10 +296,11 @@ fails, and excludes preserved recovery sets from routine backup pruning.
 The application and its data live in separate places:
 `/data` is a named volume, and no upgrade path deletes or re-initialises it.
 
-The flow is implemented and covered by isolated tests (backup integrity,
-migration failure, failed start, rollback, rollback after new data, and
-database/config restore); live upgrade / rollback acceptance on a real host
-remains pending. Keep a separate database backup before upgrading.
+The flow is covered by isolated tests for backup integrity, migration failure,
+failed start, rollback after new data, and database/config restore. Managed
+upgrades, program rollback and data retention have also been verified on a real
+Windows host with Docker Desktop. This does not cover every host configuration;
+keep an independent database backup before upgrading.
 
 Keep `deploy/.env` private: Docker Desktop mode stores an updater token there.
 Do not remove `qoder-data` or run `docker compose down -v` unless you intend to

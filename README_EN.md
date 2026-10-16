@@ -2,121 +2,125 @@
 
 <h1><img src="./frontend/public/apple-touch-icon.svg" width="40" height="40" align="top" alt=""> ali2api3</h1>
 
-**Turn your own logins into a local OpenAI-compatible API**
+**One API for your Qoder, WorkBuddy and Trae accounts**
 
-Connect **Qoder (Global / CN)**, **WorkBuddy (Global / CN)**, **Trae CN Work**, and experimental **Devin** and **Command Code** accounts.
+A self-hosted AI gateway for personal accounts. Manage logins, models, usage and updates, then connect your preferred AI clients.
 
-Deploy with Docker, manage accounts in the web console, and connect clients through compatible APIs.
-
+[![CI](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml/badge.svg)](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/cokeeven/ali2api3)](https://github.com/cokeeven/ali2api3/releases/latest)
 [![License](https://img.shields.io/github/license/cokeeven/ali2api3)](LICENSE)
-[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-community-ff6a00)](https://linux.do)
 
-<sub>[中文](README.md) · [Issues](https://github.com/cokeeven/ali2api3/issues) · [LINUX DO](https://linux.do)</sub>
+[中文](README.md) · [Quick start](#quick-start) · [Deployment](deploy/README.md) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/cokeeven/ali2api3/issues)
 
-<img src="./docs/assets/readme/hero-en.svg" width="100%" alt="CLI2API — turn your own logins into a local OpenAI-compatible API">
+<img src="./docs/assets/readme/hero-en.svg" width="100%" alt="ali2api3 — one API for your Qoder, WorkBuddy and Trae accounts">
 
 </div>
 
-This repository is published as **ali2api3**, developed from [caigee-cmd/cli2api](https://github.com/caigee-cmd/cli2api), with its MIT license and copyright retained. Additions include per-key platform priorities and concurrency, account usage guardrails and credit-expiry analysis, WorkBuddy CN daily tasks, and confirmed check-in outcomes. The Go module retains the upstream name for package compatibility.
-
-Stable builds are published through this repository's GitHub Releases and `ghcr.io/cokeeven/ali2api3`. Account data, credentials, and local instance configuration are excluded from the public repository.
+ali2api3 connects accounts you already own to **OpenAI / Anthropic-compatible APIs**, with chat, streaming and tool calls. Use a single endpoint for clients and a web console to inspect account readiness, choose models, create client keys and manage updates.
 
 ## Features
 
-- **Compatible APIs**: Chat Completions, Responses, Anthropic Messages, and model listing, with streaming and function tools.
-- **Multi-account routing**: automatic selection, session affinity, concurrency limits, cooldowns, and failover.
-- **Web console**: manage accounts, models, client keys, and proxies; view quotas and request logs.
-- **Docker operations**: persistent account data; an optional host updater lets you download, confirm, and roll back updates from the console.
+| Capability | What it provides |
+|---|---|
+| Unified APIs | Chat Completions, Responses, Anthropic Messages and model listings; available features depend on the adapter and upstream model |
+| Account routing | Session affinity, concurrency limits, rate-limit cooldowns, account failover and per-client-key platform priorities |
+| Caller instructions | Preserve caller `system` / `developer` instructions and tool definitions by default, adapting message roles to upstream protocols |
+| Usage and guards | Inspect quota, usage and credit expiry; apply platform-supported token or credit guards while keeping actual usage separate from estimated liabilities |
+| Account maintenance | Login, credential refresh, model catalogs, check-ins and WorkBuddy CN task records, with optional automatic maintenance |
+| Managed updates | Download releases from this repository and confirm installation; drain requests and verify backups before upgrading, with program rollback keeping the current database by default |
 
-Qoder CN, WorkBuddy, and Trae adapters are implemented. WorkBuddy CN and Trae CN have partial live-account acceptance; the scope and remaining branches are described below. Devin and Command Code are experimental, not production-ready. Live upgrade and rollback acceptance is also pending.
+## Platforms
+
+| Platform | Adapter scope | Live verification |
+|---|---|---|
+| Qoder | CN and Global | Basic chat, streaming, tool calls and quota refresh verified with a CN account; Global awaits live-account acceptance |
+| WorkBuddy | CN and Global | Basic chat, streaming, tool calls and quota refresh verified with a CN account; Global and some campaign branches await acceptance |
+| Trae | CN | Basic chat, streaming, tool calls and quota refresh verified; interactive login and reauthentication after natural expiry still need acceptance |
+
+Verification covers a limited set of CN accounts and models, not every model, account type or campaign. Experimental Devin, Command Code and other adapters remain in the repository; current maintenance focuses on the three platforms above.
 
 ## Quick start
 
-You need Docker and an upstream account you control. Use Docker Desktop on macOS / Windows; Windows must use Linux containers.
+You need Docker, Docker Compose and an upstream account you control. Use Docker Desktop on Windows / macOS; Windows requires Linux containers.
 
 ```bash
 git clone https://github.com/cokeeven/ali2api3.git
 cd ali2api3
-docker compose -f deploy/docker-compose.yml up -d --build
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
 docker compose -f deploy/docker-compose.yml logs --tail=50
 ```
 
 1. Save the **administrator key** printed in the first-start logs.
-2. Open `http://127.0.0.1:3010`, sign in with that key, and add an account in **Accounts**.
-3. Create a client key in **API keys**, then choose a model and test it in **Access**.
+2. Open `http://127.0.0.1:3010`, sign in and add your accounts.
+3. Create a **client key** under API keys, then choose and test a model under Access.
 
-Edit a client key to configure **platform routing**: higher priorities run first, and each platform concurrency cap covers all models used by that key. Existing provider grants remain the authorization boundary. New sessions without routing preferences choose platforms uniformly at random; account selection then follows the account scheduling strategy. Existing sessions retain affinity, and temporary capacity overflow borrows another account on the same platform. Model limits and confirmed insufficient-credit rejections can advance to the next account serving the same model. Cross-provider failover defaults off; explicit provider model prefixes remain binding.
-
-The account menu's **Usage and guards** controls reserve credits, daily tokens, daily credits, and per-model daily tokens, and shows credit expiry and daily usage. All guards default off. Strict credit guards reject paid requests whose cost upper bound cannot be established; credit multipliers alone are not trusted quotes. The dialog also states which guards the selected platform can actually enforce: no supported platform reports a trusted absolute per-request credit cost, while token bounds exist only where the platform cannot exceed the client's limit (Trae and the Codex Responses path stay unknown). Actual usage, estimated reservations, and unknown charges remain distinct. Cancellation does not imply zero cost. Manual reconciliation only acknowledges that a specified fresh balance snapshot already includes an unknown liability; it does not invent per-request costs. Expiry preference applies within the selected platform and does not override session affinity.
-
-Docker Compose is the supported install and managed-update path; source runs are for development. See the [deployment guide](deploy/README.md).
-
-Update checks, updater downloads and container pulls support operator-configured fallback sources. Update HTTP requests also support a proxy fallback. No third-party accelerator is enabled by default; see [update network and mirrors](deploy/README.md#update-network-and-mirrors).
+The default image is `ghcr.io/cokeeven/ali2api3:latest`. See the [deployment guide](deploy/README.md) to pin a version, build from source or install the host updater.
 
 ## Connect a client
 
-In an OpenAI-compatible client, enter:
+Configure a client that supports the selected API protocol:
 
 ```text
 Base URL: http://127.0.0.1:3010/v1
-API Key:  <a client key created in API keys>
+API Key:  <client key created in the console>
+Model:    <model ID from Access or /v1/models>
 ```
 
-Get a model ID from **Access** or `/v1/models`. Routing is automatic and prefers the same account for later turns. Account pinning, session headers, and curl / PowerShell examples are in the [deployment guide](deploy/README.md).
+| Protocol | Endpoint |
+|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| Model listing | `GET /v1/models` |
+
+Clients execute tools and return their results. Compatibility does not guarantee full official API parity. Account pinning, session headers, platform prefixes and request examples are documented in the [deployment guide](deploy/README.md).
+
+## Console and accounts
+
+<p align="center">
+  <img src="./docs/assets/readme/console-window-en.svg" width="100%" alt="Console illustration: manage accounts, inspect readiness and quota, and retrieve client connection details">
+</p>
+
+- **Accounts and models**: manage login, enablement, credential refresh, proxies and model catalogs; inspect readiness and quota.
+- **Keys and routing**: administrator keys manage the console; client keys access `/v1/*`, with platform grants, priorities and concurrency settings.
+- **Maintenance and logs**: opt into check-ins and automatic maintenance; inspect task steps and request records. Rewards depend on actual upstream eligibility and readback confirmation.
+
+Cross-provider failover defaults off; explicit platform prefixes, permissions and region boundaries remain binding. Usage guards default off. Strict guards may reject requests without a trusted cost upper bound, and credit multipliers are not actual per-request costs. Console images are illustrations.
+
+## Updates and data protection
+
+Stable builds come from [this repository's Releases](https://github.com/cokeeven/ali2api3/releases) and `ghcr.io/cokeeven/ali2api3`. With the host updater installed, **download first, then confirm installation** in System settings. Managed updates support Docker Compose deployments; source runs and native Windows deployments do not directly use this update path.
+
+- Wait for in-flight requests, create a consistent SQLite snapshot and verify its integrity. Draining or verification failure stops the upgrade.
+- Keep application binaries separate from durable data. Program rollback preserves the current database by default; restoring an older database requires separate verification and preservation of newer data.
+- Configure independent fallback sources for release checks, updater assets and container images, plus a proxy for update HTTP traffic. Fallback images are pulled by their published digest.
+
+**Fallback sources require reachable addresses supplied by the operator; no third-party accelerator is enabled by default.** See [update network and mirrors](deploy/README.md#update-network-and-mirrors). Basic CN-account calls, upgrades, program rollback and data retention have been verified on a real Windows host; other host environments need their own acceptance. Keep independent backups of important data.
 
 ## How it works
 
 <p align="center">
-  <img src="./docs/assets/readme/architecture-en.svg" width="100%" alt="CLI2API architecture: OpenAI clients are routed by the Go control plane to one isolated runtime per account, then to the provider upstream">
+  <img src="./docs/assets/readme/architecture-en.svg" width="100%" alt="ali2api3 architecture: clients reach a Go gateway, Qoder login and quota use isolated account workers, while chat and other platforms use in-process adapters">
 </p>
 
-The Go gateway handles authentication, routing, and request logging. Each Qoder account has its own Node process and HOME; WorkBuddy, Trae, Devin, and Command Code use Go in-process adapters. No full CLI is started per request.
+The Go gateway handles authentication, routing, protocol adaptation and request logs; SQLite stores durable data. Qoder login, catalog and quota operations use isolated per-account Node workers, while chat uses the in-process Go COSY client. WorkBuddy and Trae use in-process Go adapters.
 
-## Console
+## Scope and limits
 
-<p align="center">
-  <img src="./docs/assets/readme/console-window-en.svg" width="100%" alt="CLI2API console Accounts page: each account shows its login method, ready state, and quota, with an Access panel offering the Base URL and a quick check">
-</p>
+- Bring your own accounts and quota. Model, image and tool capabilities depend on upstream support. WorkBuddy / Trae currently do not support images; file inputs are rejected.
+- Caller instructions are preserved by default, but hidden upstream instructions cannot be removed by a reverse proxy. Existing accounts retain their configured prompt policy.
+- Login callbacks, natural credential expiry, Global accounts and some check-in campaigns still require scenario-specific acceptance. Completion of every platform activity is not guaranteed.
+- Upstream changes can affect compatibility. Request logs do not store prompt or completion bodies by default.
 
-Accounts, models, access, and logs all live in one web console: readiness and quota are visible at a glance, and the Access page lets you copy the Base URL and run a quick check.
+## Documentation and contributing
 
-Account cards provide WorkBuddy, Qoder CN, and Qoder Global check-in actions and automatic check-in switches (off by default), with history under More → Check-in records; no separate check-in page is needed. Set each provider's default time under System → Automatic check-in, then choose inheritance or an override in Edit account. Default changes apply to inheriting accounts immediately. Existing WorkBuddy accounts retain their previous times until switched to inheritance. Inactive campaigns are skipped. Live acceptance is tracked separately for each provider and campaign branch. Trae CN distinguishes account completion from a device limit; only a claim confirmed by upstream readback reports a new reward. Repeated manual checks do not reuse an old success result.
+- [Deployment and operations](deploy/README.md) · [Changelog](CHANGELOG.md) · [Development and releases](docs/DEVELOPMENT.md)
+- [Architecture](docs/ARCHITECTURE_SUMMARY.md) · [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md)
+- [GitHub Issues](https://github.com/cokeeven/ali2api3/issues) · [LINUX DO community](https://linux.do)
 
-Personal WorkBuddy CN account cards provide **Run daily tasks** and **More → Daily task history**, with individual success, already completed, skipped and failed results. The pipeline covers check-in, daily activity, the Buddy prerequisite, growth acceptance and progress, travel, yesterday's missed-day makeup, streak redemption, existing lottery chances, gifts and compensation. Progress, claims, makeup and redemptions require upstream readback confirmation. Makeup uses existing cards only; each run draws at most five existing chances and defers remaining chances to bounded retries. Tasks requiring real desktop actions, subscriptions, donations or night activity across days are explicitly skipped. No paid conversations are generated. This pipeline excludes Global and enterprise accounts.
+The default console and API bind to `127.0.0.1:3010`. For public access, expose selected routes through an access-controlled reverse proxy and keep administration private. Protect keys, account exports and database backups.
 
-Daily task completion shows a brief result notice and no longer opens history automatically. Open **More → Daily task history** manually, or use **Logs → Check-in & daily tasks** for standalone check-ins, daily task runs and retries across providers. Filter by account, provider, operation, status, trigger and time, and open step details manually. New check-in steps are linked to their parent daily task run to avoid duplicate rows. Older standalone check-ins remain intact and use an unknown trigger when its origin cannot be established. Reading logs does not run upstream tasks.
+## Origins and license
 
-The **Automatic check-in & daily tasks** master switch in that tab applies to this instance only and defaults to on to preserve current behavior. Turning it off pauses automatic check-ins, daily tasks and retries without changing account options or enablement. Turning it on resumes the original settings. Manual actions, chats, login and token refresh remain available. Instances with separate databases have independent switches and logs.
-
-With the master switch on, enabled WorkBuddy CN accounts that opt into automatic check-in participate after 22:00 server local time. SQLite stores run history and check-in results atomically. Per-account leases prevent overlapping runs, and persisted successes survive restarts. Failed scheduled runs retry after 5/10 minutes, at most three attempts per local day, preserving each confirmed task. Accounts have independent 90-second deadlines and a concurrency limit of four. Each run submits at most 20 growth events, at least one second apart. Manual runs do not require automatic check-in to be enabled. Separate databases never share task history or execution leases. Copies of the same account still share upstream rewards and refresh-token effects, so live acceptance must run serially.
-
-Live acceptance on 2026-10-15 verified CN queries, growth progress and reward readback, and structured run persistence. Missed-day makeup, unlocked streak redemption, nonzero lottery chances, and travel departure/arrival claims have local regression coverage but still require eligible live-account acceptance. Passing tests does not mean every campaign branch has been exercised live or deployed.
-
-## Limitations
-
-- Bring your own accounts. CLI2API does not supply accounts, quotas, or an official API service.
-- Compatibility is not full API parity. Messages / Responses are stateless adapters, without server-side conversations or upstream-specific tool execution.
-- Image support depends on the upstream and model. WorkBuddy / Trae do not support images; file inputs are rejected. See the [deployment guide](deploy/README.md) for details.
-- Cross-provider routing for shared model IDs follows system settings, key grants, and region constraints; failover is not unrestricted.
-- Upstream changes can break compatibility. Request logs do not store prompt or completion bodies by default.
-
-## Documentation
-
-- [Deployment and operations: setup steps, environment variables, endpoints, managed updates](deploy/README.md)
-- [Changelog](CHANGELOG.md)
-
-## Security
-
-The default deployment exposes only `127.0.0.1:3010`; do not expose it directly to the public internet. Administrator keys manage the console; client keys only access `/v1/*`. Protect keys, credential exports, and database backups. Report security issues privately as described in [SECURITY.md](SECURITY.md).
-
-## Community & Contributing
-
-Chinese-language discussion is on [LINUX DO](https://linux.do). Bugs and feature requests go to GitHub [Issues](https://github.com/cokeeven/ali2api3/issues); documentation improvements and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Acknowledgements
-
-Thanks to open-source projects including `workbuddy2api`, `CLIProxyAPI`, and `sub2api` for ideas and inspiration.
-
-## License
-
-[MIT](LICENSE). Follow each upstream platform's terms when using its accounts.
+Developed from [caigee-cmd/cli2api](https://github.com/caigee-cmd/cli2api), retaining its [MIT license](LICENSE) and copyright notices. The Go module keeps the upstream import path for compatibility. Thanks to `workbuddy2api`, `CLIProxyAPI`, `sub2api` and other projects for ideas and inspiration. Follow each upstream platform's terms when using its accounts.

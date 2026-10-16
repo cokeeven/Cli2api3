@@ -2,121 +2,125 @@
 
 <h1><img src="./frontend/public/apple-touch-icon.svg" width="40" height="40" align="top" alt=""> ali2api3</h1>
 
-**把你自己的登录态，变成一个本机 OpenAI 兼容 API**
+**把 Qoder、WorkBuddy、Trae 接入同一个 API**
 
-接入 **Qoder（国际版 / 国内版）**、**WorkBuddy（国际版 / 国内版）**、**Trae 国内版 Work**，以及实验性的 **Devin** 和 **Command Code**。
+面向个人账号的自部署 AI 网关。统一管理登录、模型、用量与更新，连接你常用的 AI 客户端。
 
-用 Docker 部署，在 Web 控制台管理账号，再通过兼容 API 接入客户端。
-
+[![CI](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml/badge.svg)](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/cokeeven/ali2api3)](https://github.com/cokeeven/ali2api3/releases/latest)
 [![License](https://img.shields.io/github/license/cokeeven/ali2api3)](LICENSE)
-[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-community-ff6a00)](https://linux.do)
 
-<sub>[English](README_EN.md) · [问题反馈](https://github.com/cokeeven/ali2api3/issues) · [LINUX DO](https://linux.do)</sub>
+[English](README_EN.md) · [快速开始](#快速开始) · [部署文档](deploy/README.md) · [版本记录](CHANGELOG.md) · [问题反馈](https://github.com/cokeeven/ali2api3/issues)
 
-<img src="./docs/assets/readme/hero-zh.svg" width="100%" alt="CLI2API — 把你自己的登录态，变成一个本机运行的 OpenAI 兼容 API">
+<img src="./docs/assets/readme/hero-zh.svg" width="100%" alt="ali2api3 — 把 Qoder、WorkBuddy、Trae 接入同一个 API">
 
 </div>
 
-本仓库以 **ali2api3** 发布，基于 [caigee-cmd/cli2api](https://github.com/caigee-cmd/cli2api) 继续开发，保留上游 MIT 许可证及版权声明。新增功能包括按 Key 的平台优先级和并发限制、账号用量护栏与积分有效期分析、WorkBuddy 国内养号闭环，以及签到结果确认。Go module 名称仍沿用上游以保持包路径兼容。
+ali2api3 将你已有的上游账号接入 **OpenAI / Anthropic 兼容接口**，支持聊天、流式输出和工具调用。用一个地址连接客户端，在 Web 控制台查看账号状态、选择模型、创建接入密钥并管理服务更新。
 
-正式版本通过本仓库的 GitHub Release 和 `ghcr.io/cokeeven/ali2api3` 发布。公开仓库不包含账号数据、凭证或本机实例配置。
+## 核心能力
 
-## 功能
+| 能力 | 可以做什么 |
+|---|---|
+| 统一 API | 提供 Chat Completions、Responses、Anthropic Messages 和模型列表；具体能力由适配器与上游模型共同决定 |
+| 多账号调度 | 会话粘性、并发限制、限流冷却、账号故障切换，以及按客户端密钥设置的平台优先级 |
+| 调用方指令 | 默认保留调用方的 `system` / `developer` 指令和工具定义，按上游协议适配消息角色 |
+| 用量与护栏 | 查看额度、用量和积分有效期；按平台能力设置 Token 或积分护栏，明确区分实际用量与估算责任 |
+| 账号维护 | 登录与凭据刷新、模型目录、签到和 WorkBuddy 国内任务记录；自动维护可独立开关 |
+| 可控更新 | 从本仓库下载正式版本，确认后升级；升级前排空请求、校验备份，程序回退默认保留当前数据库 |
 
-- **兼容接口**：Chat Completions、Responses、Anthropic Messages 和模型列表，支持流式回复与函数工具调用。
-- **多账号调度**：自动选号、会话粘性、并发限制、冷却与故障切换。
-- **统一控制台**：管理账号、模型、客户端密钥、代理设置，查看额度和请求日志。
-- **Docker 运维**：持久化账号数据；可选安装宿主机更新器，在控制台下载更新、确认升级和回滚。
+## 平台范围
 
-Qoder 国内版、WorkBuddy、Trae 的适配代码已实现；WorkBuddy 国内版和 Trae 国内版已有部分真实账号验收，具体范围与待验收分支见下文；Devin 与 Command Code 为实验性接入，不承诺生产可用。托管更新的真实升级 / 回滚验收也尚未完成。
+| 平台 | 接入范围 | 真实验证范围 |
+|---|---|---|
+| Qoder | 国内版、国际版 | 国内账号的普通聊天、流式输出、工具调用和额度刷新已验证；国际版待真实账号验收 |
+| WorkBuddy | 国内版、国际版 | 国内账号的普通聊天、流式输出、工具调用和额度刷新已验证；国际版与部分活动分支待验收 |
+| Trae | 国内版 | 普通聊天、流式输出、工具调用和额度刷新已验证；登录交互与自然过期重登仍需验收 |
+
+上述验证使用有限的国内账号与模型，不代表所有模型、账号类型和平台活动均已覆盖。仓库保留 Devin、Command Code 等实验适配器，当前维护重点为上述三个平台。
 
 ## 快速开始
 
-需要 Docker 和一个你自己控制的上游账号。macOS / Windows 使用 Docker Desktop；Windows 需使用 Linux containers。
+准备 Docker、Docker Compose，以及你自己控制的上游账号。Windows / macOS 使用 Docker Desktop，Windows 需启用 Linux containers。
 
 ```bash
 git clone https://github.com/cokeeven/ali2api3.git
 cd ali2api3
-docker compose -f deploy/docker-compose.yml up -d --build
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
 docker compose -f deploy/docker-compose.yml logs --tail=50
 ```
 
 1. 保存首次启动日志中打印的**管理员密钥**。
-2. 打开 `http://127.0.0.1:3010`，用管理员密钥登录，在 **Accounts** 添加账号。
-3. 在 **API keys** 创建客户端密钥，在 **Access** 选择模型并测试。
+2. 打开 `http://127.0.0.1:3010`，登录控制台并添加账号。
+3. 在「API 密钥」创建**客户端密钥**，到「API 接入」查看模型并测试。
 
-客户端密钥的编辑窗口可单独设置**平台调度**：优先级越高越先使用，平台并发上限按该密钥在此平台的所有模型合计。原有平台授权范围仍决定能用哪些平台；没有调度配置的新会话随机选择平台，平台内使用账号调度策略。已有会话优先复用账号，临时满额只借用同平台的其他账号。模型限额或明确的积分不足拒绝会尝试同平台同模型的下一个账号；跨平台故障切换默认关闭，显式的平台模型前缀始终限制平台。
-
-账号菜单的**用量与护栏**可配置保留积分、每日 Token、每日积分和单模型每日 Token 限额，并查看临期积分包与逐日用量。所有护栏初始关闭。开启硬护栏后，无法证明请求成本上界的付费请求会被拒绝；积分倍率本身不作为可靠报价。弹窗同时标明所选平台实际支持哪些护栏：目前支持的平台都没有可信的单次请求积分成本；Token 上界只在平台不会超出客户端上限时存在（Trae 与 Codex 的 Responses 路径保持未知）。实际用量、估算预留和未知扣费分别显示，取消或中断不自动当作免费。人工对账只确认未知责任已被指定的新余额快照覆盖，不会生成虚假的请求积分成本。积分临期优先仅在已选平台的可用账号内生效，且不覆盖会话粘性。
-
-Docker Compose 是支持的安装与托管更新路径；源码运行用于开发。详细步骤见 [部署说明](deploy/README.md)。
-
-国内网络可配置版本检查、更新器附件和程序镜像的备用源，也可为更新 HTTP 请求配置代理；主源失败后按配置切换。默认不内置第三方加速地址，需填写可用源；配置方式见 [更新网络与备用源](deploy/README.md#update-network-and-mirrors)。
+默认使用正式镜像 `ghcr.io/cokeeven/ali2api3:latest`。需要固定版本、从源码构建或安装宿主更新器时，按 [部署文档](deploy/README.md) 操作。
 
 ## 接入客户端
 
-在支持 OpenAI 兼容 API 的客户端中填写：
+在支持对应兼容协议的客户端中填写：
 
 ```text
 Base URL: http://127.0.0.1:3010/v1
-API Key:  <在 API keys 页面创建的客户端密钥>
+API Key:  <控制台创建的客户端密钥>
+Model:    <API 接入页面或 /v1/models 返回的模型 ID>
 ```
 
-模型 ID 从 **Access** 页面或 `/v1/models` 获取。默认自动选择账号，同一对话优先复用原账号。固定账号、自定义会话标识及 curl / PowerShell 示例见 [部署说明](deploy/README.md)。
+| 协议 | 接口 |
+|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| 模型列表 | `GET /v1/models` |
+
+工具调用由客户端执行工具并回传结果；不同协议并不保证覆盖官方 API 的全部功能。固定账号、会话标识、平台前缀和请求示例见 [部署文档](deploy/README.md)。
+
+## 控制台与账号管理
+
+<p align="center">
+  <img src="./docs/assets/readme/console-window-zh.svg" width="100%" alt="控制台示意：管理账号、查看就绪状态与额度，并获取客户端接入信息">
+</p>
+
+- **账号与模型**：管理登录、启停、凭据刷新、代理和模型目录，查看账号就绪状态与额度。
+- **密钥与调度**：管理员密钥管理控制台，客户端密钥访问 `/v1/*`；每个客户端密钥可配置平台授权、优先级和并发限制。
+- **维护与日志**：按需启用签到和自动维护，查看签到、任务步骤与请求记录。活动奖励以平台实际资格和读回结果为准。
+
+跨平台故障切换默认关闭；显式平台前缀、权限和地域约束始终有效。用量护栏默认关闭；开启严格护栏后，无法确定可信成本上界的请求可能被拒绝，积分倍率不能代替实际成本。控制台图片为界面示意。
+
+## 更新与数据保护
+
+正式版本来自 [本仓库 Releases](https://github.com/cokeeven/ali2api3/releases) 与 `ghcr.io/cokeeven/ali2api3`。安装宿主更新器后，可在系统设置中**先下载、再确认升级**。当前托管更新适用于 Docker Compose 部署；源码或 Windows 原生运行不直接使用这条更新链路。
+
+- 升级前等待在途请求结束，创建 SQLite 一致快照并校验完整性；排空或校验失败时停止升级。
+- 程序与持久数据分离；默认程序回退保留当前数据库，旧库恢复需要独立验证与保全最新数据。
+- 版本检查、更新器附件和程序镜像分别支持配置备用源；更新 HTTP 请求可配置代理，备用镜像按发布摘要拉取。
+
+**备用源需要自行填写可用地址，默认不内置第三方加速站。** 配置方式见 [更新网络与备用源](deploy/README.md#update-network-and-mirrors)。国内账号基础调用，以及真实 Windows 宿主上的升级、程序回退和更新后数据保留已验证；其他主机环境仍需单独验收。重要数据请保留独立备份。
 
 ## 工作方式
 
 <p align="center">
-  <img src="./docs/assets/readme/architecture-zh.svg" width="100%" alt="CLI2API 架构：OpenAI 客户端经 Go 控制面路由到每账号独立运行时，再连接各 provider 上游">
+  <img src="./docs/assets/readme/architecture-zh.svg" width="100%" alt="ali2api3 架构：客户端连接 Go 网关，Qoder 登录与额度使用独立账号 worker，聊天与其他平台通过进程内适配器连接上游">
 </p>
 
-Go 网关统一鉴权、调度和记录请求。Qoder 每个账号使用独立 Node 进程与 HOME；WorkBuddy、Trae、Devin、Command Code 使用 Go 进程内适配器，不为每次请求启动完整 CLI。
+Go 网关负责鉴权、调度、协议适配和请求记录，SQLite 保存持久数据。Qoder 的登录、目录与额度使用每账号隔离的 Node worker，聊天走 Go 内的 COSY 客户端；WorkBuddy、Trae 使用 Go 进程内适配器。
 
-## 控制台
+## 使用边界
 
-<p align="center">
-  <img src="./docs/assets/readme/console-window-zh.svg" width="100%" alt="CLI2API 控制台 Accounts 页：每个账号显示登录方式、就绪状态与额度，右侧 Access 面板提供 Base URL 与快速验证">
-</p>
-
-账号、模型、接入和日志都在同一个 Web 控制台里管理：就绪状态和额度一目了然，Access 页可以直接复制 Base URL 并做一次快速验证。
-
-在「账号」卡片直接操作 WorkBuddy 与 Qoder 国内版、国际版的签到、自动签到开关（默认关闭），并从「更多 → 签到记录」查看历史，不另设签到中心。在「系统 → 自动签到」配置各供应商默认时间，「编辑账号」可选择跟随默认或自定义；修改默认时间会立即影响未覆盖的账号。已有 WorkBuddy 账号保留原时间，可在编辑账号时切回跟随默认。活动关闭时只记录跳过，各平台和活动分支的真实验收范围分别记录。Trae 国内签到区分账号已签与设备受限；只有本次领取且上游回查确认，才报告新增奖励，重复点击不会复用旧成功结果。
-
-WorkBuddy 国内个人账号卡片提供「立即养号」和「更多 → 养号记录」，逐项显示成功、已完成、跳过或失败。流程包含签到、每日活跃、Buddy 前置任务、成长任务接取与进度推进、猫猫旅行、昨日漏签补签、连登兑换、现有机会抽奖、礼包及补偿。进度、领奖、补签和兑换须读回上游状态确认；补签只使用已有补签卡，抽奖每轮最多五次，剩余机会留待有限补跑。需要真实桌面操作、公众号关注、捐赠及夜猫子跨天活动的任务明确跳过，不生成付费对话；本流程不支持国际版和企业账号。
-
-养号结束仅显示简短结果提示，不再自动打开记录。可手动使用账号「更多 → 养号记录」，或在「日志 → 签到与养号」汇总查看所有平台的独立签到、养号与补跑，按账号、平台、操作、状态、触发方式和时间筛选，点击详情查看步骤。新记录会把养号中的签到关联到所属执行，避免重复展示；旧独立签到记录保留，无法确认的触发方式显示「未知」。查询日志不会触发上游任务。
-
-「日志 → 签到与养号」中的「全平台自动签到与养号」是当前实例的自动任务总开关，默认开启以保留现有行为。关闭会暂停自动签到、养号及补跑，保留各账号原有选项及启用状态；重新开启后按原有设置恢复。手动签到、养号以及聊天、登录、令牌刷新不受影响。不同数据库实例的开关和日志各自独立。
-
-总开关开启时，开启自动签到的已启用 WorkBuddy 国内账号，每晚服务器本地时间 22:00 后参与养号。运行记录和签到结果保存在同一 SQLite 数据库中；执行租约防止同账号并行运行，成功记录用于重启去重。失败按 5／10 分钟间隔补跑，每个自然日最多自动尝试三次，按任务跳过当日已确认完成的步骤；每账号独立限时 90 秒，最多并行四个账号，每轮最多上报 20 个成长事件，事件之间至少间隔一秒。手动执行不受自动签到开关限制。数据库彼此独立的实例不会共享记录或执行租约；复制同一账号无法隔离上游奖励或刷新令牌的副作用，真实验收必须串行。
-
-2026-10-15 国内个人账号已通过查询接口、成长推进及领奖读回、结构化运行记录落库的真实验收。昨日补签、已解锁连登兑换、非零抽奖次数及旅行出发／到站领奖已有本地回归测试，仍待满足这些条件的真实账号验收；测试通过不代表所有活动分支均已实测或已部署。
-
-## 使用限制
-
-- 只连接你自己的账号，不提供账号、额度或官方 API 服务。
-- 兼容接口不等于完整复刻官方 API。Messages / Responses 为无状态适配，不保存服务端会话，也不执行上游专属工具。
-- 图片能力取决于上游和模型；WorkBuddy / Trae 不支持图片，文件输入会明确拒绝。具体范围见 [部署说明](deploy/README.md)。
-- 跨上游同名模型调度受系统开关、账号权限和地域约束；不是任意账号之间都能切换。
+- 自备账号与额度；模型、图片和工具能力取决于上游。WorkBuddy / Trae 当前不支持图片，文件输入会明确拒绝。
+- 调用方指令默认保留，但上游服务内部的隐藏指令不可由反代侧删除。已有账号的提示词设置以各自配置为准。
+- 登录回调、凭据自然过期、国际账号及部分签到活动仍需按场景验收；不承诺全部平台活动自动完成。
 - 上游协议变化可能影响兼容性；请求日志默认不保存提示词或回复正文。
 
-## 文档
+## 文档与贡献
 
-- [部署与运维：启动步骤、环境变量、接口、托管更新](deploy/README.md)
-- [变更记录](CHANGELOG.md)
+- [部署与运维](deploy/README.md) · [变更记录](CHANGELOG.md) · [开发与发布](docs/DEVELOPMENT.md)
+- [架构说明](docs/ARCHITECTURE_SUMMARY.md) · [贡献指南](CONTRIBUTING.md) · [安全报告](SECURITY.md)
+- [GitHub Issues](https://github.com/cokeeven/ali2api3/issues) · [LINUX DO 社区](https://linux.do)
 
-## 安全
+默认管理与 API 入口绑定 `127.0.0.1:3010`。公网接入应通过有访问控制的反向代理按路由开放，管理接口保持私有。请保护密钥、账号导出文件和数据库备份。
 
-默认只向本机开放 `127.0.0.1:3010`，不要直接暴露到公网。管理员密钥可操作控制台；客户端密钥仅用于 `/v1/*`。请妥善保管密钥、账号导出文件和数据库备份，发现问题按 [SECURITY.md](SECURITY.md) 私下报告。
+## 来源与许可证
 
-## 社区与贡献
-
-中文讨论见 [LINUX DO](https://linux.do)。缺陷和功能请求请走 GitHub [Issue](https://github.com/cokeeven/ali2api3/issues)；文档改进与 Pull Request 见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 致谢
-
-感谢 `workbuddy2api`、`CLIProxyAPI`、`sub2api` 等开源项目提供的思路与启发。
-
-## 许可证
-
-[MIT](LICENSE)。使用上游账号时，请遵守对应平台的服务条款。
+基于 [caigee-cmd/cli2api](https://github.com/caigee-cmd/cli2api) 继续开发，保留上游 [MIT 许可证](LICENSE) 与版权声明；Go module 沿用原路径以保持兼容。感谢 `workbuddy2api`、`CLIProxyAPI`、`sub2api` 等项目提供的思路与启发。使用上游账号时请遵守对应平台的服务条款。

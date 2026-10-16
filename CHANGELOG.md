@@ -3,6 +3,16 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.3 - 2026-10-16
+
+### English
+
+- Claim a prepared installation atomically and ignore late preparation results after installation starts, preventing duplicate confirmation requests from starting multiple backups or upgrades.
+
+### 中文
+
+- 原子锁定已准备好的安装任务，安装开始后忽略迟到的准备结果，防止重复确认启动多份备份或升级任务。
+
 ## 0.1.2 - 2026-10-16
 
 ### English

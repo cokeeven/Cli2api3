@@ -1,6 +1,6 @@
 ---
 id: cli2api-architecture-summary
-title: CLI2API Architecture Summary
+title: Cli2api3 Architecture Summary
 scope: [backend, runtime, providers, routing, console]
 status: canonical
 read-when: 需要快速理解后端分层、请求路径、运行时和 provider 扩展边界时
@@ -9,14 +9,14 @@ related: [AGENTS.md, CONTRIBUTING.md, docs/DESIGN.md, docs/REFACTORING.md, docs/
 last-updated: 2026-09-24
 ---
 
-# CLI2API 架构摘要
+# Cli2api3 架构摘要
 
 本文是给贡献者和 AI 使用的快速入口，不替代代码、测试和本地详细资料。
 行为以当前代码和测试为准；包边界以 `AGENTS.md` 与 `docs/REFACTORING.md` 为准。
 
 ## 产品边界
 
-CLI2API 是一个面向个人部署的 Go + Node 网关：
+Cli2api3 是一个面向个人部署的 Go + Node 网关：
 
 - 对外提供 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Models 兼容接口。
 - 管理多个上游账号，并按 provider、region、model、pin、会话粘性和冷却状态选号。

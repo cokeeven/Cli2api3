@@ -57,7 +57,7 @@ export function LoginPage() {
             <div className="flex items-center gap-3">
               <BrandMark size={36} />
               <div>
-                <div className="font-semibold tracking-[-0.015em]">CLI2API</div>
+                <div className="font-semibold tracking-[-0.015em]">Cli2api3</div>
                 <div className="text-xs text-muted">{t('controlPlane')}</div>
               </div>
             </div>

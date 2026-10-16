@@ -30,7 +30,7 @@ $StderrLog = Join-Path $InstallDir "stderr.log"
 $SocketPlaceholder = Join-Path $InstallDir "socket-placeholder"
 $ImageRepository = "ghcr.io/cokeeven/ali2api3"
 $ListenAddress = "127.0.0.1:3011"
-$GitHubRepository = "cokeeven/ali2api3"
+$GitHubRepository = "cokeeven/Cli2api3"
 
 function Require-Command {
     param([string]$Name)

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="cw-title-en cw-desc-en" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', system-ui, sans-serif">
-  <title id="cw-title-en">CLI2API console — Accounts page</title>
+  <title id="cw-title-en">Cli2api3 console — Accounts page</title>
   <desc id="cw-desc-en">Warm ivory console: sidebar with Overview, Models, Access, Accounts, Logs, and System; the Accounts page shows three ready accounts with quota bars, and the Access panel shows Base URL and API key.</desc>
 
   <rect width="1200" height="760" rx="20" fill="#F5F5F5" stroke="#DEDEE0"/>
@@ -19,7 +19,7 @@
     <path fill="none" stroke="#18181B" stroke-width="11.4" stroke-linecap="round" stroke-linejoin="round" d="M 91.413 45.646 A 32.000 32.000 0 1 0 91.413 82.354"/>
     <path fill="none" stroke="#22D3EE" stroke-width="11.4" stroke-linecap="round" stroke-linejoin="round" d="M 96.889 68.454 A 32.000 32.000 0 0 1 91.413 82.354"/>
   </g>
-  <text x="62" y="98" font-size="18" font-weight="700" letter-spacing="-0.3" fill="#18181B">CLI2API</text>
+  <text x="62" y="98" font-size="18" font-weight="700" letter-spacing="-0.3" fill="#18181B">Cli2api3</text>
 
   <text x="24" y="158" font-size="18" fill="#71717A">Overview</text>
   <text x="24" y="200" font-size="18" fill="#71717A">Models</text>

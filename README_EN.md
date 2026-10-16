@@ -1,22 +1,22 @@
 <div align="center">
 
-<h1><img src="./frontend/public/apple-touch-icon.svg" width="40" height="40" align="top" alt=""> ali2api3</h1>
+<h1><img src="./frontend/public/apple-touch-icon.svg" width="40" height="40" align="top" alt=""> Cli2api3</h1>
 
 **One API for your Qoder, WorkBuddy and Trae accounts**
 
 A self-hosted AI gateway for personal accounts. Manage logins, models, usage and updates, then connect your preferred AI clients.
 
-[![CI](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml/badge.svg)](https://github.com/cokeeven/ali2api3/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/cokeeven/ali2api3)](https://github.com/cokeeven/ali2api3/releases/latest)
-[![License](https://img.shields.io/github/license/cokeeven/ali2api3)](LICENSE)
+[![CI](https://github.com/cokeeven/Cli2api3/actions/workflows/ci.yml/badge.svg)](https://github.com/cokeeven/Cli2api3/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/cokeeven/Cli2api3)](https://github.com/cokeeven/Cli2api3/releases/latest)
+[![License](https://img.shields.io/github/license/cokeeven/Cli2api3)](LICENSE)
 
-[中文](README.md) · [Quick start](#quick-start) · [Deployment](deploy/README.md) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/cokeeven/ali2api3/issues)
+[中文](README.md) · [Quick start](#quick-start) · [Deployment](deploy/README.md) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/cokeeven/Cli2api3/issues)
 
-<img src="./docs/assets/readme/hero-en.svg" width="100%" alt="ali2api3 — one API for your Qoder, WorkBuddy and Trae accounts">
+<img src="./docs/assets/readme/hero-en.svg" width="100%" alt="Cli2api3 — one API for your Qoder, WorkBuddy and Trae accounts">
 
 </div>
 
-ali2api3 connects accounts you already own to **OpenAI / Anthropic-compatible APIs**, with chat, streaming and tool calls. Use a single endpoint for clients and a web console to inspect account readiness, choose models, create client keys and manage updates.
+Cli2api3 connects accounts you already own to **OpenAI / Anthropic-compatible APIs**, with chat, streaming and tool calls. Use a single endpoint for clients and a web console to inspect account readiness, choose models, create client keys and manage updates.
 
 ## Features
 
@@ -44,8 +44,8 @@ Verification covers a limited set of CN accounts and models, not every model, ac
 You need Docker, Docker Compose and an upstream account you control. Use Docker Desktop on Windows / macOS; Windows requires Linux containers.
 
 ```bash
-git clone https://github.com/cokeeven/ali2api3.git
-cd ali2api3
+git clone https://github.com/cokeeven/Cli2api3.git
+cd Cli2api3
 docker compose -f deploy/docker-compose.yml pull
 docker compose -f deploy/docker-compose.yml up -d
 docker compose -f deploy/docker-compose.yml logs --tail=50
@@ -56,6 +56,8 @@ docker compose -f deploy/docker-compose.yml logs --tail=50
 3. Create a **client key** under API keys, then choose and test a model under Access.
 
 The default image is `ghcr.io/cokeeven/ali2api3:latest`. See the [deployment guide](deploy/README.md) to pin a version, build from source or install the host updater.
+
+The project is now **Cli2api3**. The image repository keeps its existing `ali2api3` name so deployed updaters continue to find releases.
 
 ## Connect a client
 
@@ -90,7 +92,7 @@ Cross-provider failover defaults off; explicit platform prefixes, permissions an
 
 ## Updates and data protection
 
-Stable builds come from [this repository's Releases](https://github.com/cokeeven/ali2api3/releases) and `ghcr.io/cokeeven/ali2api3`. With the host updater installed, **download first, then confirm installation** in System settings. Managed updates support Docker Compose deployments; source runs and native Windows deployments do not directly use this update path.
+Stable builds come from [this repository's Releases](https://github.com/cokeeven/Cli2api3/releases) and `ghcr.io/cokeeven/ali2api3`. With the host updater installed, **download first, then confirm installation** in System settings. Managed updates support Docker Compose deployments; source runs and native Windows deployments do not directly use this update path.
 
 - Wait for in-flight requests, create a consistent SQLite snapshot and verify its integrity. Draining or verification failure stops the upgrade.
 - Keep application binaries separate from durable data. Program rollback preserves the current database by default; restoring an older database requires separate verification and preservation of newer data.
@@ -101,7 +103,7 @@ Stable builds come from [this repository's Releases](https://github.com/cokeeven
 ## How it works
 
 <p align="center">
-  <img src="./docs/assets/readme/architecture-en.svg" width="100%" alt="ali2api3 architecture: clients reach a Go gateway, Qoder login and quota use isolated account workers, while chat and other platforms use in-process adapters">
+  <img src="./docs/assets/readme/architecture-en.svg" width="100%" alt="Cli2api3 architecture: clients reach a Go gateway, Qoder login and quota use isolated account workers, while chat and other platforms use in-process adapters">
 </p>
 
 The Go gateway handles authentication, routing, protocol adaptation and request logs; SQLite stores durable data. Qoder login, catalog and quota operations use isolated per-account Node workers, while chat uses the in-process Go COSY client. WorkBuddy and Trae use in-process Go adapters.
@@ -117,7 +119,7 @@ The Go gateway handles authentication, routing, protocol adaptation and request 
 
 - [Deployment and operations](deploy/README.md) · [Changelog](CHANGELOG.md) · [Development and releases](docs/DEVELOPMENT.md)
 - [Architecture](docs/ARCHITECTURE_SUMMARY.md) · [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md)
-- [GitHub Issues](https://github.com/cokeeven/ali2api3/issues) · [LINUX DO community](https://linux.do)
+- [GitHub Issues](https://github.com/cokeeven/Cli2api3/issues) · [LINUX DO community](https://linux.do)
 
 The default console and API bind to `127.0.0.1:3010`. For public access, expose selected routes through an access-controlled reverse proxy and keep administration private. Protect keys, account exports and database backups.
 

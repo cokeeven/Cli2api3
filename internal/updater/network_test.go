@@ -39,7 +39,7 @@ func TestHostBinaryUsesVerifiedMirrorAndNeverLeaksGitHubToken(t *testing.T) {
 		if r.Header.Get("Authorization") != "" {
 			t.Error("token leaked to mirror")
 		}
-		if !strings.HasPrefix(r.URL.Path, "/https://github.com/cokeeven/ali2api3/releases/download/v0.1.9/") {
+		if !strings.HasPrefix(r.URL.Path, "/https://github.com/cokeeven/Cli2api3/releases/download/v0.1.9/") {
 			t.Errorf("mirror path = %s", r.URL.Path)
 		}
 		if strings.HasSuffix(r.URL.Path, "checksums.txt") {

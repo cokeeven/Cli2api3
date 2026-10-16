@@ -1,7 +1,7 @@
 {
-  "name": "CLI2API",
-  "short_name": "CLI2API",
-  "description": "Qoder CLI → OpenAI-compatible API. Self-hosted gateway.",
+  "name": "Cli2api3",
+  "short_name": "Cli2api3",
+  "description": "Self-hosted AI gateway for Qoder, WorkBuddy and Trae with OpenAI / Anthropic-compatible APIs.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

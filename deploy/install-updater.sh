@@ -7,7 +7,7 @@ COMPOSE_FILE="${ROOT_DIR}/deploy/docker-compose.yml"
 CONTAINER_NAME="qoder-api-proxy"
 SERVICE_NAME="qoder-api-proxy"
 IMAGE_REPOSITORY="ghcr.io/cokeeven/ali2api3"
-GITHUB_REPOSITORY="cokeeven/ali2api3"
+GITHUB_REPOSITORY="cokeeven/Cli2api3"
 
 require_commands() {
   for command in "$@"; do

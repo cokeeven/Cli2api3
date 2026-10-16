@@ -205,8 +205,8 @@ only source hostnames, counts, and whether a proxy is configured.
 
 | Field | Format and behavior |
 |---|---|
-| `api_mirrors` | GitHub-compatible API base URLs. A base is followed by `/repos/cokeeven/ali2api3/releases?...`; it must support pagination. |
-| `download_mirrors` | Download proxy prefixes. A prefix is followed by `/https://github.com/cokeeven/ali2api3/releases/download/<version>/<asset>`. |
+| `api_mirrors` | GitHub-compatible API base URLs. A base is followed by `/repos/cokeeven/Cli2api3/releases?...`; it must support pagination. |
+| `download_mirrors` | Download proxy prefixes. A prefix is followed by `/https://github.com/cokeeven/Cli2api3/releases/download/<version>/<asset>`. |
 | `image_mirrors` | Complete mirrored repositories, e.g. `registry.example/owner/ali2api3`, without scheme, tag or digest. The registry must retain the **same multi-platform manifest digest** as GHCR. Docker Hub `registry-mirrors` alone does not accelerate GHCR. |
 | `proxy_url` | HTTP(S) or SOCKS5/SOCKS5H proxy for update metadata and attachments. Direct/environment networking is tried first, then this proxy. Both application and host must reach this address; their loopback addresses are different. |
 | `request_timeout_seconds` | Per HTTP metadata request, default 8, range 1–30. Version checks are bounded to 90 seconds overall. |

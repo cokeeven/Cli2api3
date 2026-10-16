@@ -104,7 +104,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <div className={`flex items-center gap-3 ${compact ? 'justify-center' : 'px-2'}`}>
       <BrandMark size={32} />
-      {!compact && <div><div className="text-[14px] font-semibold tracking-[-0.015em]">CLI2API</div><div className="text-[11px] text-muted">{t('controlPlane')}</div></div>}
+      {!compact && <div><div className="text-[14px] font-semibold tracking-[-0.015em]">Cli2api3</div><div className="text-[11px] text-muted">{t('controlPlane')}</div></div>}
     </div>
   )
 }

@@ -1,6 +1,6 @@
 ---
 id: cli2api-console-design
-title: CLI2API 前端设计规范
+title: Cli2api3 前端设计规范
 scope: [frontend, console, design-system, heroui, tailwind]
 status: canonical
 read-when: 改控制台 UI / 颜色 / 圆角 / 组件选型 / 图标 / 文案 / favicon 时
@@ -9,7 +9,7 @@ related: [docs/ARCHITECTURE_SUMMARY.md, AGENTS.md]
 last-updated: 2026-09-19
 ---
 
-# CLI2API 前端设计规范
+# Cli2api3 前端设计规范
 
 本项目是纯已登录控制台应用（登录页 + 内部页面），基于 React、Vite、**HeroUI v3**、Tailwind v4 和 Phosphor 图标。前端视觉以 [HeroUI](https://www.heroui.com/docs/react/components) 的默认主题、语义 token 和复合原语为准。不要为单个功能发明第二套颜色、圆角、字体或控件高度。
 
@@ -239,13 +239,13 @@ HeroUI 3.2.4 的 `Tabs.Indicator` 会因 `SharedElementTransition` 崩溃，不�
 
 ## Favicon 套件与品牌资产
 
-CLI2API 的浏览器图标、PWA 清单和社交卡走极简 line-icon 路线，与控制台同一套冷锌灰 + 墨色 chrome；青只点在 C 下唇。
+Cli2api3 的浏览器图标、PWA 清单和社交卡走极简 line-icon 路线，与控制台同一套冷锌灰 + 墨色 chrome；青只点在 C 下唇。
 
 ### Mark 母题
 
 单轨开口 C + Signal Cyan 下唇（被点亮，像停靠的包）。形状含义：
 
-- **C 轨** = CLI2API 本身（一条轨，不是内外双环）
+- **C 轨** = Cli2api3 本身（一条轨，不是内外双环）
 - **开口** = 终端 / 命令行入口
 - **青尖** = 数据流通；加载时同一条轨上扫过 `#c-scan`
 

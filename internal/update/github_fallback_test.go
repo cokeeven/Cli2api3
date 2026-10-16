@@ -31,13 +31,13 @@ func TestReleaseFallbackDiscardsPartialPrimaryAndDoesNotLeakToken(t *testing.T) 
 		if r.Header.Get("Authorization") != "" {
 			t.Error("GitHub token leaked to mirror")
 		}
-		if r.URL.Path != "/api/repos/cokeeven/ali2api3/releases" {
+		if r.URL.Path != "/api/repos/cokeeven/Cli2api3/releases" {
 			t.Errorf("mirror path = %s", r.URL.Path)
 		}
 		fmt.Fprint(w, `[{"tag_name":"v0.1.9"}]`)
 	}))
 	defer mirror.Close()
-	source := NewGitHubReleaseSource("cokeeven/ali2api3", "private-token", networkConfigFile(t, fmt.Sprintf(`{"api_mirrors":[%q]}`, mirror.URL+"/api")))
+	source := NewGitHubReleaseSource("cokeeven/Cli2api3", "private-token", networkConfigFile(t, fmt.Sprintf(`{"api_mirrors":[%q]}`, mirror.URL+"/api")))
 	source.client.Transport = fallbackTransport(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "api.github.com" {
 			if r.Header.Get("Authorization") != "Bearer private-token" {
@@ -68,7 +68,7 @@ func TestReleaseInvalidPrimaryJSONFallsBackAndCancellationStops(t *testing.T) {
 	defer mirror.Close()
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `<html>gateway</html>`) }))
 	defer primary.Close()
-	source := NewGitHubReleaseSource("cokeeven/ali2api3", "", networkConfigFile(t, fmt.Sprintf(`{"api_mirrors":[%q]}`, mirror.URL)))
+	source := NewGitHubReleaseSource("cokeeven/Cli2api3", "", networkConfigFile(t, fmt.Sprintf(`{"api_mirrors":[%q]}`, mirror.URL)))
 	source.baseURL = primary.URL
 	if _, err := source.ListReleases(context.Background()); err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestReleaseInvalidPrimaryJSONFallsBackAndCancellationStops(t *testing.T) {
 }
 
 func TestReleaseRedirectDoesNotLeakTokenToSubdomain(t *testing.T) {
-	source := NewGitHubReleaseSource("cokeeven/ali2api3", "private-token")
+	source := NewGitHubReleaseSource("cokeeven/Cli2api3", "private-token")
 	source.client.Transport = fallbackTransport(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "api.github.com" {
 			return &http.Response{StatusCode: 302, Header: http.Header{"Location": {"https://downloads.api.github.com/leak"}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
@@ -99,7 +99,7 @@ func TestReleaseTimeoutFallsBackWithinBound(t *testing.T) {
 	defer primary.Close()
 	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) }))
 	defer mirror.Close()
-	source := NewGitHubReleaseSource("cokeeven/ali2api3", "", networkConfigFile(t, fmt.Sprintf(`{"request_timeout_seconds":1,"api_mirrors":[%q]}`, mirror.URL)))
+	source := NewGitHubReleaseSource("cokeeven/Cli2api3", "", networkConfigFile(t, fmt.Sprintf(`{"request_timeout_seconds":1,"api_mirrors":[%q]}`, mirror.URL)))
 	source.baseURL = primary.URL
 	start := time.Now()
 	if _, err := source.ListReleases(context.Background()); err != nil {

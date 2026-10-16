@@ -23,14 +23,14 @@
     <path class="tip" pathLength="100" d="M 96.889 68.454 A 32.000 32.000 0 0 1 91.413 82.354"/>
   </g>
 
-  <text x="500" y="298" class="word" font-size="112">CLI2API</text>
-  <text x="500" y="356" class="sub" font-size="28">Qoder CLI → OpenAI-compatible API</text>
+  <text x="500" y="298" class="word" font-size="112">Cli2api3</text>
+  <text x="500" y="356" class="sub" font-size="28">Qoder · WorkBuddy · Trae</text>
 
-  <g transform="translate(820, 230)">
+  <g transform="translate(820, 398)">
     <rect width="380" height="180" rx="16" class="terminal-bg"/>
     <text x="24" y="56" class="mono" font-size="20">
-      <tspan class="prompt">$ </tspan>
-      <tspan>./cli2api serve</tspan>
+      <tspan class="prompt">POST </tspan>
+      <tspan>/v1/chat/completions</tspan>
     </text>
     <text x="24" y="96" class="mono" font-size="18" fill="#71717A">account: acc_8f2k (ready)</text>
     <text x="24" y="124" class="mono" font-size="18" fill="#71717A">endpoint: :3010/v1</text>
@@ -38,7 +38,7 @@
   </g>
 
   <g transform="translate(64, 552)">
-    <rect width="232" height="36" rx="18" class="chip"/>
-    <text x="16" y="24" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="16" class="chip-text">&gt; ./cli2api serve</text>
+    <rect width="270" height="36" rx="18" class="chip"/>
+    <text x="16" y="24" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="16" class="chip-text">POST /v1/chat/completions</text>
   </g>
 </svg>

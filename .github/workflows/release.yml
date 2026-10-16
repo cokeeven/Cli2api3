@@ -129,7 +129,8 @@ jobs:
           tag="v${major}.${minor}.${patch}"
           version="${major}.${minor}.${patch}"
           series="${major}.${minor}"
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # Keep the existing package so deployed updaters can still pull releases.
+          image="ghcr.io/cokeeven/ali2api3"
 
           if git show-ref --tags --verify --quiet "refs/tags/$tag"; then
             tag_sha="$(git rev-list -n 1 "$tag")"
@@ -227,7 +228,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" release-assets/* \
               --target "$RELEASE_SHA" \
-              --title "CLI2API $RELEASE_TAG" \
+              --title "Cli2api3 $RELEASE_TAG" \
               --notes-file release-notes.md \
               --draft
           fi

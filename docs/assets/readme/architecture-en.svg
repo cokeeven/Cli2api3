@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-labelledby="arch-title-en arch-desc-en" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', system-ui, sans-serif">
-  <title id="arch-title-en">ali2api3 architecture — Go gateway, Qoder account workers and in-process chat adapters</title>
+  <title id="arch-title-en">Cli2api3 architecture — Go gateway, Qoder account workers and in-process chat adapters</title>
   <desc id="arch-desc-en">Clients connect through a Go gateway. Qoder login, catalog and quota use isolated per-account Node workers; chat, WorkBuddy and Trae use in-process Go adapters.</desc>
 
   <rect width="1200" height="500" rx="26" fill="#060607"/>
@@ -19,7 +19,7 @@
 
   <!-- 2. gateway (highlighted) -->
   <rect x="260" y="188" width="460" height="78" rx="12" fill="#FCFCFC" fill-opacity="0.08" stroke="#FCFCFC" stroke-width="1.5"/>
-  <text x="490" y="222" text-anchor="middle" font-size="21" font-weight="600" fill="#FCFCFC">ali2api3 · Go API + SQLite</text>
+  <text x="490" y="222" text-anchor="middle" font-size="21" font-weight="600" fill="#FCFCFC">Cli2api3 · Go API + SQLite</text>
   <text x="490" y="249" text-anchor="middle" font-size="18" fill="#71717A">scheduling · concurrency · cooldown · failover</text>
 
   <!-- branch gateway -> workers -->

@@ -101,7 +101,7 @@ func NewExecutor(config ExecutorConfig) *Executor {
 		config.HealthTimeout = 120 * time.Second
 	}
 	if strings.TrimSpace(config.GitHubRepo) == "" {
-		config.GitHubRepo = "cokeeven/ali2api3"
+		config.GitHubRepo = "cokeeven/Cli2api3"
 	}
 	return &Executor{
 		config:   config,

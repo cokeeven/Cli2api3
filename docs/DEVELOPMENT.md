@@ -101,7 +101,7 @@ If required checks do not start on the bot PR (the default Actions token cannot 
 If this checkout cannot switch to `main` because another worktree already has it, merge with the GitHub API instead of `git checkout main`:
 
 ```bash
-gh api -X PUT repos/cokeeven/ali2api3/pulls/<n>/merge -f merge_method=merge
+gh api -X PUT repos/cokeeven/Cli2api3/pulls/<n>/merge -f merge_method=merge
 ```
 
 Expected artifacts for a published tag:

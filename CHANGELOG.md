@@ -3,6 +3,82 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.1 - 2026-10-16
+
+### English
+
+- Add atomic live chat admission for shared account limits and per-key platform limits, held through stream completion, cancellation, and cleanup. Configure platform priorities separately from existing key grants; new sessions without preferences choose platforms uniformly, and cross-provider failover defaults off.
+- Preserve session affinity during temporary capacity overflow and migrate it after confirmed quota failures. Retry only permitted accounts serving the same canonical model, without replaying an already emitted response.
+- Add opt-in account credit/token guards with transactional reservations, per-attempt settlement, conservative unknown-charge recovery, fresh-snapshot reconciliation, and credit-package expiry analysis. WorkBuddy resource queries paginate and distinguish deduction expiry from billing-cycle boundaries.
+- Restore the maintenance runtime required by a clean checkout, including durable daily task reports, bounded retries and cancellation of automatic work; scope the runtime ignore rule to the repository root.
+- Allow an explicit `release: publish` commit on main to request the existing verified release pipeline when maintaining through the GitHub API; ordinary commits do not publish releases.
+- Allow the Windows updater installer to target an existing deployment's Compose file, environment file, container, and installation directory.
+- Keep quota-exhausted accounts routable for free models. Qoder prices some catalog models at zero (`limited_time_free` tag or a zero `price_factor`), and requests for them spend no credits, but the routing pool filtered every quota-exceeded account unconditionally — leaving those accounts' free models with no account at all. The pool now records which catalog entries the provider prices at zero alongside the cached model list, and the quota filter exempts a request whose model is on that list. Pricing-unknown models are not assumed free, and the exemption is scoped per model, so exhausted accounts stay out of paid routes.
+- Keep API key creation and editing dialogs scrollable after expanding platform priority and concurrency settings, with the action buttons remaining accessible.
+- Preserve caller system/developer instructions by default for new accounts, including WorkBuddy; distinguish the explicit caller-instruction compatibility switch from platform-native prompts. Existing account settings remain unchanged.
+- Stop treating an unverified account as ready: in-process accounts start out of routing until a probe verifies the credential, and a login, import, or re-enable now re-probes immediately so readiness and the model catalog return as soon as the account is valid.
+- Bound model-catalog refreshes process-wide: concurrent callers share one concurrency limit, each account is fetched at most once at a time, and a failed fetch backs off instead of being retried on every request.
+- State which usage guards a platform can actually enforce, and explain an unknown-cost refusal: no supported platform reports a trusted per-request credit cost (a price multiplier is not a bound), so credit guards refuse a paid request instead of pricing it at zero.
+- Point every update source at this repository (`cokeeven/ali2api3`, `ghcr.io/cokeeven/ali2api3`) and report version state accurately: a development build, a failed check, and a repository with no published release no longer display as "up to date".
+- Protect data across upgrades with verified snapshots and schema metadata; version rollback keeps the current database. Reject historical database restore without a selected verified snapshot; preserve WAL/journal files during explicit host failure recovery and retain recovery sets outside routine pruning.
+- Drain requests on both update paths and stop the update if draining times out; serialize admission with drain observation.
+- Update `undici` to 6.29.1 in the Qoder worker, clearing the reported advisories while keeping the proxy and worker behaviour unchanged.
+- Resolve canceled login waits; prevent stale account probes from overriding a restarted account, and re-probe after browser login completes.
+- Assemble Qoder non-streaming tool-call argument fragments, map Trae caller developer instructions to its system role, and emit the OpenAI tool-call finish reason for completed Trae tool calls.
+- Update the frontend's `source-map-js` dependency to 1.2.2 to address its reported indexed-source-map advisory.
+- Daily task completion now shows a brief result notice instead of opening history automatically. Account history remains available manually.
+- Add a Check-in & daily tasks log tab across providers, with account, provider, operation, status, trigger and time filters, pagination and step details. Linked check-in steps stay within their parent run.
+- Add an instance-wide master switch for automatic check-ins, daily tasks and retries. It preserves account configuration and enablement; manual actions, chat, login and token refresh remain available.
+- Send the catalog's gateway model key on Qoder chat. The model catalog publishes a friendly public ID (`qwen3.8-flash`) alongside a distinct gateway key (`qfmodel`). The worker resolved the public ID through the per-account catalog before sending, but the in-process COSY client filled `model_config.key` with whatever the caller asked for. On an account whose gateway routes only the mapped key, that request was never answered — the gateway held it open and the client waited out its own timeout with no error and no bytes in return. The pool now records the public-ID-to-gateway-key mapping from the catalog, and the chat request carries the mapped key. An account whose catalog reports no distinct key keeps its public spelling.
+- Fix Qoder chat rejecting multi-turn tool use with `400 InvalidParameter: messages with role "tool" must be a response to a preceeding message with "tool_calls"`. The upstream gateway only pairs a `role:"tool"` message with the assistant turn ahead of it when that assistant message's `content` is a string; OpenAI clients send `"content": null` for a pure tool-call turn, which left the call unregistered. The in-process client now rewrites a nil content on a tool-call turn to an empty string, which the gateway accepts. Call ids, tool results, and all other content shapes pass through untouched.
+- Confirm Trae CN daily check-in from explicit upstream state and business codes; rejected or incomplete responses no longer become successful or already-claimed rewards. Manual checks revalidate older local success records, and repeated checks distinguish already claimed from a new reward.
+- Keep the Windows managed updater available on hosts that deny scheduled-task registration by using a hidden current-user Startup entry with the same authenticated loopback service.
+- Report WorkBuddy daily-task failures and skipped rewards accurately, including per-task batch acceptance results; preserve confirmed steps when retrying.
+- Persist task history and check-in results atomically, with per-account execution leases, restart deduplication, bounded retries and independent account timeouts.
+- Move daily-task actions into the account cards and add bilingual run history with step results, replacing the injected floating button.
+- Extend cooldowns on the first repeated failure, including on Windows clocks with coarse time resolution.
+- Correct CN growth endpoint contracts and add verified task progress, Buddy prerequisites, missed-day makeup, streak redemption and bounded lottery settlement; exclude Global and enterprise accounts before refresh.
+- Show the current console port on the login page instead of the default port.
+- Enable manual WorkBuddy maintenance from runtime login readiness instead of the legacy auth type; explain disabled actions without changing account data.
+- Preserve caller developer instructions in WorkBuddy's legacy chat protocol by translating the role to system without changing caller text or adding client identity instructions.
+
+### 中文
+
+- 新增聊天实时并发原子预留，同时约束所有密钥共享的账号上限和单个密钥的平台上限，流式结束、取消及清理时释放。平台优先级与现有授权围栏分开配置；未配置偏好的新会话按平台均匀随机，跨供应商故障切换默认关闭。
+- 临时并发满额借用账号时保留原会话粘性，明确到量后成功切号才迁移绑定。仅重试授权范围内提供相同标准模型的账号，已输出的响应不重放。
+- 新增默认关闭的账号积分与 Token 护栏，事务预留、逐次尝试结算、未知扣费保守恢复、新鲜余额快照人工对账及积分包临期分析。WorkBuddy 积分查询支持分页，区分抵扣截止与计费周期边界。
+- 补齐干净检出所需的维护运行时，包括日常任务持久化报告、有限重试和自动任务取消；将运行目录忽略规则限定到仓库根目录。
+- 支持通过 GitHub API 维护时，以 main 上明确的 `release: publish` 提交请求现有校验发布流程；普通提交不会发布版本。
+- Windows 更新器安装脚本支持指定已有部署的 Compose、环境文件、容器及安装目录。
+- 额度耗尽的账号现在仍可路由到免费模型。Qoder 目录中部分模型单价为零（`limited_time_free` 标签或 `price_factor` 为零），请求不消耗积分，但路由池原先无条件排除所有额度耗尽的账号，导致这些账号的免费模型无账号可用。路由池现在在缓存模型列表的同时记录上游报价为零的模型，额度过滤对命中该名单的请求予以豁免。未报价的模型不视为免费；豁免按请求模型限定，额度耗尽的账号依旧不会出现在付费模型的路由上。
+- 修复创建和编辑 API 密钥时，展开平台优先级与并发设置后无法向下滚动的问题，确保操作按钮始终可访问。
+- 新账号默认保留调用方的 system/developer 指令，包括 WorkBuddy；明确区分“丢弃调用方指令”兼容选项与平台原生提示词，已有账号保留原设置。
+- 未验证的账号不再被视为可用：进程内账号在探测通过前不参与调度；登录、导入或重新启用后会立即重新探测，账号可用时状态与模型目录同步恢复。
+- 模型目录刷新改为进程级并发上限：并发调用共享同一限制，同一账号同时最多刷新一次，失败后进入退避，不再随请求反复重试。
+- 明确标示各平台实际可执行的护栏，并解释“成本未知”的拒绝：目前没有平台提供可信的单次请求积分成本（价格倍率不是成本上限），因此积分护栏会拒绝付费请求，而不是按 0 计费。
+- 所有更新来源统一指向本仓库（`cokeeven/ali2api3`、`ghcr.io/cokeeven/ali2api3`），并准确区分版本状态：开发版、检查失败和仓库尚无发布都不再显示为“已是最新版本”。
+- 升级前校验快照及数据库结构记录，版本回退保留当前数据库；未选择并验证历史快照时拒绝旧库恢复。宿主显式失败恢复会先保留主库及 WAL/journal 文件，恢复副本不参与日常备份清理。
+- 两条升级路径都等待在途请求结束，超时则停止更新；请求进入与排空检查使用同一同步机制。
+- 将 Qoder worker 的 `undici` 升级到 6.29.1，消除已报告的安全告警，代理与 worker 行为保持不变。
+- 取消登录时结束等待；防止旧探测结果覆盖重启后的账号状态，并在浏览器登录完成后重新探测。
+- 拼接 Qoder 非流式工具调用的分段参数，将 Trae 调用方 developer 指令转换为其 system 角色，并为 Trae 已完成的工具调用返回 OpenAI 工具调用结束标记。
+- 将前端 `source-map-js` 依赖更新到 1.2.2，修复已报告的索引 source map 安全问题。
+- 养号结束改为简短结果提示，不再自动弹出历史窗口；仍可手动查看账号记录。
+- 日志页新增全平台「签到与养号」，支持账号、平台、操作、状态、触发方式和时间筛选、分页与步骤详情；关联的签到步骤保留在所属养号记录内。
+- 新增当前实例自动签到、养号及补跑总开关，保留账号原有配置和启用状态；手动操作、聊天、登录与令牌刷新不受影响。
+- Qoder 聊天请求现在发送目录里的网关模型键。模型目录同时给出一个易读的公网 ID（`qwen3.8-flash`）和一个不同的网关键（`qfmodel`）。Worker 发送前会用账号目录把公网 ID 解析一遍，但进程内 COSY 客户端此前直接把调用方传入的名字填进 `model_config.key`。在只按映射键路由的账号上，这个请求不会得到任何响应——网关把它挂着，客户端一直等到自己的超时，既没有错误也没有数据。路由池现在记录目录给出的「公网 ID → 网关键」映射，聊天请求携带映射后的键。目录未给出不同键的账号保持公网 ID 原样。
+- 修复 Qoder 多轮工具调用被上游以 `400 InvalidParameter: messages with role "tool" must be a response to a preceeding message with "tool_calls"` 拒绝的问题。上游网关只在前一条 assistant 消息的 `content` 为字符串时，才把它携带的 `tool_calls` 登记为可配对；OpenAI 客户端对纯工具调用轮次发送的正是 `"content": null`，导致调用未登记、后续 `role:"tool"` 消息被拒。进程内直连客户端现在会把工具调用轮次的 null content 改写为空字符串（网关接受该形状）；工具调用 id、工具结果与其他内容形状均原样保留。
+- Trae 国内版签到依据明确的上游状态和业务码确认，拒绝或缺字段的响应不再误报成功或已领取。手动签到重新核对旧的本地成功记录，重复操作区分今日已签与本次新增奖励。
+- Windows 主机拒绝注册计划任务时，使用隐藏的当前用户启动项运行更新器，继续保留带鉴权的本机回环服务。
+- 准确展示 WorkBuddy 养号任务失败与奖励跳过状态，逐项核对批量接取结果，补跑时保留已确认完成的步骤。
+- 原子保存养号历史和签到结果，加入账号执行租约、重启去重、有限重试与独立账号超时。
+- 将养号操作整合到账号卡片，新增双语运行历史及步骤结果，替代注入式悬浮按钮。
+- 首次重复失败即延长冷却时间，并兼容 Windows 时钟精度下的退避校验。
+- 修正国内成长接口契约，接入须读回确认的任务推进、Buddy 前置、昨日补签、连登兑换和有限抽奖结算，在刷新前排除国际版和企业账号。
+- 登录页显示当前控制台端口，不再固定显示默认端口。
+- 按运行时登录就绪状态启用 WorkBuddy 手动养号，不再依赖旧认证类型，并说明按钮禁用原因，不修改账号数据。
+- 将调用方 developer 角色转换为 WorkBuddy 旧聊天协议支持的 system 角色，保留原始指令内容，不添加客户端身份提示词。
+
 ## 0.1.0 - 2026-10-16
 
 ### English

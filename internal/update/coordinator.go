@@ -75,8 +75,7 @@ type Job struct {
 	// newest data still exists.
 	PreservedDatabasePath string `json:"preserved_database_path,omitempty"`
 	// DrainTimedOut reports that in-flight requests did not finish within the
-	// pre-upgrade drain window. The snapshot is still consistent, but the
-	// service was busy when it was taken.
+	// pre-upgrade drain window. No snapshot or replacement is attempted.
 	DrainTimedOut bool   `json:"drain_timed_out,omitempty"`
 	Error         string `json:"error,omitempty"`
 	StartedAt     string `json:"started_at,omitempty"`
@@ -219,12 +218,17 @@ func (c *Coordinator) HandleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := job.JobID
-	if !c.Running.Load() {
+	c.mu.Lock()
+	if !c.Running.Load() || c.Job == nil || c.Job.JobID != jobID || c.Job.State != "ready_to_apply" {
+		c.mu.Unlock()
 		writeErr(w, http.StatusConflict, "update_not_ready", "The update preparation has expired")
 		return
 	}
+	// Claim installation while holding the state lock: multiple callers may
+	// have observed the same ready host status before any of them got here.
+	c.Job.State = "backing_up"
 	c.Maintenance.Store(true)
-	c.Mutate(jobID, func(job *Job) { job.State = "backing_up" })
+	c.mu.Unlock()
 	go c.applyPrepared(jobID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID})
 }
@@ -593,22 +597,36 @@ func (c *Coordinator) monitorPrepared(jobID, agentJobID string) {
 		if err == nil && (status.JobID == "" || status.JobID == agentJobID) {
 			switch status.State {
 			case "ready_to_apply":
-				c.Mutate(jobID, func(job *Job) { job.State = "ready_to_apply" })
+				c.setPreparedState(jobID, "ready_to_apply", "")
 				return
 			case "failed":
-				c.Finish(jobID, "failed", status.Error, true)
-				c.Running.Store(false)
+				c.setPreparedState(jobID, "failed", status.Error)
 				return
 			case "idle":
-				c.Finish(jobID, "failed", "Update cancelled", true)
-				c.Running.Store(false)
+				c.setPreparedState(jobID, "failed", "Update cancelled")
 				return
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
-	c.Finish(jobID, "failed", "Image preparation timed out", true)
-	c.Running.Store(false)
+	c.setPreparedState(jobID, "failed", "Image preparation timed out")
+}
+
+// A delayed preparation response may arrive after the console has already
+// confirmed installation. Only preparation owns these state transitions.
+func (c *Coordinator) setPreparedState(jobID, state, message string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Job == nil || c.Job.JobID != jobID || (c.Job.State != "preparing_image" && c.Job.State != "ready_to_apply") {
+		return false
+	}
+	c.Job.State = state
+	c.Job.Error = message
+	if state != "ready_to_apply" {
+		c.Job.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		c.Running.Store(false)
+	}
+	return true
 }
 
 func (c *Coordinator) adoptPrepared(status AgentStatus) *Job {

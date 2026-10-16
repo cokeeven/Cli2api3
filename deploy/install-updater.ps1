@@ -255,6 +255,11 @@ if ($ExistingTask) {
 try {
     # A previous installation may use the current-user Startup fallback.
     # Stop only this installation's executable before replacing its binary.
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | ForEach-Object {
+        if ($_.CommandLine -and $_.CommandLine.IndexOf((' -File "' + $Runner + '"'), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            Stop-Process -Id $_.ProcessId -ErrorAction Stop
+        }
+    }
     Get-Process -Name "cli2api-updater" -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.Path -and [string]::Equals($_.Path, $Binary, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Process -Id $_.Id -ErrorAction Stop
@@ -290,8 +295,15 @@ Set-StrictMode -Version Latest
     "--image-repository", "$ImageRepository",
     "--health-url", "http://127.0.0.1:3010/health"
 )
-& "$Binary" `$UpdaterArguments 1>> "$StdoutLog" 2>> "$StderrLog"
-exit `$LASTEXITCODE
+while (`$true) {
+    # Apply may replace the mapped executable and exit to restart the host.
+    # Supervise it independently of Task Scheduler, including Startup installs.
+    if (Test-Path -LiteralPath "$Binary.new") {
+        Move-Item -LiteralPath "$Binary.new" -Destination "$Binary" -Force
+    }
+    & "$Binary" `$UpdaterArguments 1>> "$StdoutLog" 2>> "$StderrLog"
+    Start-Sleep -Seconds 2
+}
 "@
 [System.IO.File]::WriteAllText($Runner, $RunnerContent, $Encoding)
 

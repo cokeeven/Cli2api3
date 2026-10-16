@@ -28,7 +28,8 @@ jobs:
   prepare:
     # Explicit release commits support maintainers using the GitHub Git API.
     # Ordinary pushes must never publish a version.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release: publish')
+    if: >-
+      github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release: publish')
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.version.outputs.image }}

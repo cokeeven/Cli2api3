@@ -3,6 +3,18 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.2 - 2026-10-16
+
+### English
+
+- Supervise the Windows updater after a self-update so custom task names and Startup installations restart the verified binary without depending on the default scheduled task.
+- Keep the Windows managed updater available on hosts that deny scheduled-task registration by using a hidden current-user Startup entry with the same authenticated loopback service.
+
+### 中文
+
+- Windows 更新器自更新后由运行脚本重新启动已验证的程序，兼容自定义任务名称及启动项安装，不依赖默认计划任务。
+- Windows 主机拒绝注册计划任务时，使用隐藏的当前用户启动项运行更新器，继续保留带鉴权的本机回环服务。
+
 ## 0.1.1 - 2026-10-16
 
 ### English

@@ -293,6 +293,7 @@ func TestManagerCreatesDisablesAndDeletesAccount(t *testing.T) {
 	defer store.Close()
 	starter := &fakeStarter{}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: dataDir, BasePort: 32200}, store, starter)
+	defer manager.Close()
 
 	account, err := manager.Create(ctx, accounts.CreateAccount{Name: "New", Enabled: true})
 	if err != nil {
@@ -332,6 +333,7 @@ func TestManagerSyncsCredentialWrittenByQoderCLI(t *testing.T) {
 	defer store.Close()
 	starter := &fakeStarter{}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: dataDir}, store, starter)
+	defer manager.Close()
 	account, err := manager.Create(ctx, accounts.CreateAccount{Name: "OAuth", Enabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -443,6 +445,7 @@ func TestManagerRefreshesHealthAndPersistsUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: worker.URL})
 	if err := manager.RefreshAll(ctx, false); err != nil {
 		t.Fatal(err)
@@ -532,6 +535,7 @@ func TestManagerRefreshFetchesQuotaWithoutAffectingHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir(), ProxyAPIKey: "proxy-key"}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: worker.URL})
 	if err := manager.RefreshAll(ctx, false); err != nil {
 		t.Fatal(err)
@@ -588,6 +592,7 @@ func TestManagerRefreshCachesAccountCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: worker.URL})
 	if err := manager.RefreshAll(ctx, false); err != nil {
 		t.Fatal(err)
@@ -632,6 +637,7 @@ func TestManagerQuotaFailureLeavesAccountReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: worker.URL})
 	if err := manager.RefreshAll(ctx, false); err != nil {
 		t.Fatalf("quota outage must not fail refresh: %v", err)
@@ -677,6 +683,7 @@ func TestManagerRefreshCanForceQuotaBypass(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: worker.URL})
 	if err := manager.RefreshAll(ctx, true); err != nil {
 		t.Fatal(err)
@@ -886,6 +893,7 @@ func TestManagerEscalatesConsecutiveRestartBackoffSeparately(t *testing.T) {
 
 func TestManagerRestartDelayIsBounded(t *testing.T) {
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{RestartDelay: 2 * time.Second, RestartMaxDelay: 5 * time.Second}, nil, &fakeStarter{})
+	defer manager.Close()
 	if got := manager.TestRestartDelay(1); got != 2*time.Second {
 		t.Fatalf("level 1 delay = %v", got)
 	}
@@ -990,6 +998,7 @@ func TestManagerPersistsSchedulerCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
 	manager.Pool().Upsert(executor.Item{ID: account.ID, URL: "http://127.0.0.1:1"})
 	manager.Pool().MarkClassified(account.ID, executor.Classified{Kind: accounts.KindRateLimit, Message: "429", Cooldown: time.Minute, Failover: true})
 	// The observer persists asynchronously through a single drainer

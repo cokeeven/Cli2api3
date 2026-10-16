@@ -210,6 +210,10 @@ if (-not (Test-Path $EnvFile)) {
     Copy-Item $EnvExample $EnvFile
 }
 New-Item -ItemType Directory -Force -Path $InstallDir, $SocketPlaceholder | Out-Null
+$NetworkConfig = Join-Path $SocketPlaceholder "network.json"
+if (-not (Test-Path -LiteralPath $NetworkConfig)) {
+    Copy-Item -LiteralPath (Join-Path $RootDir "deploy\update-network.example.json") -Destination $NetworkConfig
+}
 
 $Token = Read-EnvValue $EnvFile "UPDATE_AGENT_TOKEN"
 if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -293,6 +297,7 @@ Set-StrictMode -Version Latest
     "--service", "$ServiceName",
     "--container", "$ContainerName",
     "--image-repository", "$ImageRepository",
+    "--network-config", "$(Join-Path $SocketPlaceholder 'network.json')",
     "--health-url", "http://127.0.0.1:3010/health"
 )
 while (`$true) {

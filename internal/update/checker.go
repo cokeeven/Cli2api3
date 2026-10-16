@@ -2,6 +2,7 @@ package update
 
 import (
 	"context"
+	"github.com/caigee-cmd/cli2api/internal/updatenet"
 	"sync"
 	"time"
 )
@@ -11,14 +12,15 @@ type ReleaseSource interface {
 }
 
 type Info struct {
-	CurrentVersion   string    `json:"current_version"`
-	NextVersion      string    `json:"next_version,omitempty"`
-	SkippedVersions  []string  `json:"skipped_versions,omitempty"`
-	RollbackVersions []Release `json:"rollback_versions,omitempty"`
-	RecentReleases   []Release `json:"recent_releases,omitempty"`
-	HasUpdate        bool      `json:"has_update"`
-	Managed          bool      `json:"managed"`
-	Cached           bool      `json:"cached"`
+	Network          *updatenet.Status `json:"network,omitempty"`
+	CurrentVersion   string            `json:"current_version"`
+	NextVersion      string            `json:"next_version,omitempty"`
+	SkippedVersions  []string          `json:"skipped_versions,omitempty"`
+	RollbackVersions []Release         `json:"rollback_versions,omitempty"`
+	RecentReleases   []Release         `json:"recent_releases,omitempty"`
+	HasUpdate        bool              `json:"has_update"`
+	Managed          bool              `json:"managed"`
+	Cached           bool              `json:"cached"`
 	// PublishedReleases counts the stable releases this repository has
 	// published. Zero means the source is reachable but no release exists
 	// yet, which the console must show as "no release published" instead of
@@ -73,6 +75,10 @@ func (c *Checker) Check(ctx context.Context, force bool) (Info, error) {
 		return Info{}, err
 	}
 	info := Info{CurrentVersion: currentVersion, Managed: true}
+	if source, ok := c.source.(interface{ NetworkStatus() updatenet.Status }); ok {
+		status := source.NetworkStatus()
+		info.Network = &status
+	}
 	info.PublishedReleases = CountStableReleases(releases)
 	if next, ok := SelectNextRelease(currentVersion, releases); ok {
 		info.HasUpdate = true

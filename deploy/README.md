@@ -176,6 +176,55 @@ upstream-specific tools. Qoder supports images where the model allows them;
 experimental Devin accepts base64 data-URL images. WorkBuddy / Trae do not
 support images. File inputs are rejected.
 
+<a id="update-network-and-mirrors"></a>
+
+## Update network and mirrors / 更新网络与备用源
+
+The application and host updater read the same `network.json`, mounted read-only
+at `/run/cli2api-updater/network.json` in the application. Installers create it
+from [update-network.example.json](update-network.example.json) only when absent:
+
+| Host | Configuration location |
+|---|---|
+| Windows | `<InstallDir>\socket-placeholder\network.json` |
+| Linux | `/var/lib/cli2api-updater/shared/network.json` |
+| macOS | `~/Library/Application Support/cli2api-updater/shared/network.json` |
+
+Edit the existing file without deleting its directory; changes apply on the next
+forced version check or download, without restarting. Upgrade older installers
+once so both processes see the shared directory. Custom deployments can use
+`UPDATE_NETWORK_CONFIG` for the application and `--network-config` for the host.
+Keep a credential-bearing proxy configuration private; the console displays
+only source hostnames, counts, and whether a proxy is configured.
+
+配置文件与账号数据库独立。三个备用源列表默认为空，**没有地址就不会自动获得国内加速**。
+填写实际可用且可信任的地址后，主源失败或超时会依次尝试备用线路：
+
+| Field | Format and behavior |
+|---|---|
+| `api_mirrors` | GitHub-compatible API base URLs. A base is followed by `/repos/cokeeven/ali2api3/releases?...`; it must support pagination. |
+| `download_mirrors` | Download proxy prefixes. A prefix is followed by `/https://github.com/cokeeven/ali2api3/releases/download/<version>/<asset>`. |
+| `image_mirrors` | Complete mirrored repositories, e.g. `registry.example/owner/ali2api3`, without scheme, tag or digest. The registry must retain the **same multi-platform manifest digest** as GHCR. Docker Hub `registry-mirrors` alone does not accelerate GHCR. |
+| `proxy_url` | HTTP(S) or SOCKS5/SOCKS5H proxy for update metadata and attachments. Direct/environment networking is tried first, then this proxy. Both application and host must reach this address; their loopback addresses are different. |
+| `request_timeout_seconds` | Per HTTP metadata request, default 8, range 1–30. Version checks are bounded to 90 seconds overall. |
+| `download_timeout_seconds` | Per asset source/route, default 120, range 1–300. |
+| `pull_timeout_seconds` | Per Docker pull, default 180, range 1–300. |
+
+Each list accepts at most three entries. HTTPS is required for HTTP mirrors,
+except loopback test servers. GitHub tokens are never sent to mirror hosts or
+cross-origin redirects. Sources are operator-selected trust roots: checksums
+protect content consistency but are not independent signatures if both metadata
+and content come from the same mirror.
+
+镜像备用拉取先读取该版本的 `cli2api-image-digest.json`，检查版本和仓库，再按
+`镜像仓库@sha256:...` 拉取，成功后才标记为正式镜像。未发布摘要的旧版本只能走原源；
+不会降级成只按标签信任备用仓库。更新器二进制保留 SHA-256 校验，失败停止安装。
+所有下载失败均不重建当前服务，不覆盖持久数据。
+
+`proxy_url` 不会修改 Docker Desktop/Engine 的守护进程代理；程序镜像可通过上述
+`image_mirrors` 切源，或在 Docker 自身配置代理。系统设置显示已配置数量和实际使用来源；
+“尚未配置备用源”表示当前只有原源可用，并不代表已保证国内网络连通。
+
 ## 6. Managed updates (optional)
 
 Start `qoder-api-proxy` once before installing the optional host updater.

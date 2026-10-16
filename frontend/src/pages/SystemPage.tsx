@@ -341,6 +341,17 @@ export function SystemPage() {
           </div>
 
           <div className="px-5 py-5">
+            {info?.network ? (
+              <div className="mb-4 space-y-1 text-xs leading-5 text-muted" role="status">
+                <p>{t('updateNetworkSources', { api: info.network.api_mirrors, downloads: info.agent.network?.download_mirrors ?? 0, images: info.agent.network?.image_mirrors ?? 0 })}</p>
+                <p>{t('updateNetworkCurrent', { source: info.network.source || 'GitHub', route: info.network.fallback ? t('updateNetworkFallback') : t('updateNetworkPrimary') })}</p>
+                {info.agent.network?.image_source ? <p>{t('updateNetworkImage', { source: info.agent.network.image_source })}</p> : null}
+                {info.agent.network?.download_source ? <p>{t('updateNetworkDownload', { source: info.agent.network.download_source })}</p> : null}
+                {info.network.proxy || info.agent.network?.proxy ? <p>{t('updateNetworkProxyConfigured')}</p> : null}
+                {info.agent.network?.error ? <p className="text-danger">{info.agent.network.error}</p> : null}
+                {!info.network.api_mirrors && !info.agent.network?.download_mirrors && !info.agent.network?.image_mirrors && !info.network.proxy && !info.agent.network?.proxy ? <p>{t('updateNetworkUnconfigured')}</p> : null}
+              </div>
+            ) : null}
             <div className="grid overflow-hidden rounded-lg border border-separator sm:grid-cols-[1fr_auto_1fr]">
               <div className="p-4">
                 <div className="text-xs font-medium text-muted">{t('currentVersion')}</div>

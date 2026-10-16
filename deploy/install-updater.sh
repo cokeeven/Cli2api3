@@ -161,7 +161,7 @@ install_linux() {
   fi
   require_commands docker systemctl install mktemp awk curl stat chown
   ensure_env_file
-  set_env_value CLI2API_UPDATER_SOCKET_DIR /run/cli2api-updater
+  set_env_value CLI2API_UPDATER_SOCKET_DIR /var/lib/cli2api-updater/shared
   set_env_value UPDATE_AGENT_URL ""
   set_env_value UPDATE_AGENT_TOKEN ""
 
@@ -194,7 +194,10 @@ install_linux() {
   fi
   rm -rf "${temp_dir}"
 
-  install -d -m 0750 /run/cli2api-updater
+  install -d -m 0750 /var/lib/cli2api-updater/shared
+  if [[ ! -f /var/lib/cli2api-updater/shared/network.json ]]; then
+    install -m 0600 "${ROOT_DIR}/deploy/update-network.example.json" /var/lib/cli2api-updater/shared/network.json
+  fi
   install -d -m 0700 /var/lib/cli2api-updater
   cat > /etc/systemd/system/cli2api-updater.service <<UNIT
 [Unit]
@@ -208,7 +211,8 @@ User=root
 Group=root
 UMask=0077
 ExecStart=/usr/local/bin/cli2api-updater \\
-  --socket /run/cli2api-updater/updater.sock \\
+  --socket /var/lib/cli2api-updater/shared/updater.sock \\
+  --network-config /var/lib/cli2api-updater/shared/network.json \\
   --status-file /var/lib/cli2api-updater/status.json \\
   --compose-file "${COMPOSE_FILE}" \\
   --env-file "${ENV_FILE}" \\
@@ -247,7 +251,6 @@ install_macos() {
   if [[ -z "${token}" ]]; then
     token="$(openssl rand -hex 32)"
   fi
-  set_env_value CLI2API_UPDATER_SOCKET_DIR /tmp/cli2api-updater
   set_env_value UPDATE_AGENT_URL http://host.docker.internal:3011
   set_env_value UPDATE_AGENT_TOKEN "${token}"
 
@@ -264,6 +267,12 @@ install_macos() {
   path_value="$(dirname "$(command -v docker)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
   mkdir -p "${install_dir}" "${support_dir}" "${log_dir}" "$(dirname "${plist}")"
+  mkdir -p "${support_dir}/shared"
+  if [[ ! -f "${support_dir}/shared/network.json" ]]; then
+    cp "${ROOT_DIR}/deploy/update-network.example.json" "${support_dir}/shared/network.json"
+    chmod 0600 "${support_dir}/shared/network.json"
+  fi
+  set_env_value CLI2API_UPDATER_SOCKET_DIR "${support_dir}/shared"
   if install_released_updater "${binary}" darwin; then
     :
   else
@@ -295,6 +304,7 @@ install_macos() {
     printf ' %q' --service "${SERVICE_NAME}"
     printf ' %q' --container "${CONTAINER_NAME}"
     printf ' %q' --image-repository "${IMAGE_REPOSITORY}"
+    printf ' %q' --network-config "${support_dir}/shared/network.json"
     printf ' %q' --health-url http://127.0.0.1:3010/health
     printf '\n'
   } > "${wrapper}"

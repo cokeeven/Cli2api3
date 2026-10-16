@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/caigee-cmd/cli2api/internal/updatenet"
 	"net"
 	"net/http"
 	"strings"
@@ -33,15 +34,16 @@ type ApplyResponse struct {
 }
 
 type AgentStatus struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	Available       bool   `json:"available"`
-	StagedUpdate    bool   `json:"staged_update"`
-	Version         string `json:"version,omitempty"`
-	State           string `json:"state"`
-	JobID           string `json:"job_id,omitempty"`
-	CurrentVersion  string `json:"current_version,omitempty"`
-	TargetVersion   string `json:"target_version,omitempty"`
-	BackupPath      string `json:"backup_path,omitempty"`
+	Network         *updatenet.Status `json:"network,omitempty"`
+	ProtocolVersion int               `json:"protocol_version"`
+	Available       bool              `json:"available"`
+	StagedUpdate    bool              `json:"staged_update"`
+	Version         string            `json:"version,omitempty"`
+	State           string            `json:"state"`
+	JobID           string            `json:"job_id,omitempty"`
+	CurrentVersion  string            `json:"current_version,omitempty"`
+	TargetVersion   string            `json:"target_version,omitempty"`
+	BackupPath      string            `json:"backup_path,omitempty"`
 	// PreservedDatabasePath is where an explicit rollback stored the
 	// post-upgrade database before restoring the snapshot, so the operator can
 	// see that the newest data still exists.

@@ -19,6 +19,7 @@ import (
 
 	"github.com/caigee-cmd/cli2api/internal/buildinfo"
 	control "github.com/caigee-cmd/cli2api/internal/update"
+	"github.com/caigee-cmd/cli2api/internal/updatenet"
 )
 
 type ApplyRequest = control.ApplyRequest
@@ -167,6 +168,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status.Available = true
 	status.StagedUpdate = true
 	status.Version = buildinfo.Version
+	status.Network = s.networkSnapshot(status.Network)
 	writeJSON(w, http.StatusOK, status)
 }
 
@@ -365,6 +367,7 @@ func (s *Service) updateState(jobID, state, message string, finished bool) {
 	}
 	s.status.State = state
 	s.status.Error = message
+	s.status.Network = s.networkSnapshot(s.status.Network)
 	// An explicit rollback that restored the old database records where the
 	// post-upgrade database was preserved, so the operator can see the newest
 	// data still exists.
@@ -375,6 +378,26 @@ func (s *Service) updateState(jobID, state, message string, finished bool) {
 		s.status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	s.persistStatusLocked()
+}
+
+// Keep the last completed sources visible after the updater replaces and
+// restarts itself, while reading configured counts/errors from the live file.
+func (s *Service) networkSnapshot(previous *updatenet.Status) *updatenet.Status {
+	reporter, ok := s.applier.(interface{ NetworkStatus() updatenet.Status })
+	if !ok {
+		return previous
+	}
+	current := reporter.NetworkStatus()
+	if previous != nil {
+		if current.ImageSource == "" {
+			current.ImageSource, current.ImageFallback = previous.ImageSource, previous.ImageFallback
+		}
+		if current.DownloadSource == "" {
+			current.DownloadSource, current.DownloadFallback = previous.DownloadSource, previous.DownloadFallback
+		}
+	}
+	current.Fallback = current.ImageFallback || current.DownloadFallback
+	return &current
 }
 
 func validateApplyRequest(request ApplyRequest) error {

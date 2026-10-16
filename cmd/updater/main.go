@@ -24,6 +24,7 @@ func main() {
 	var serviceName string
 	var containerName string
 	var imageRepository string
+	var networkFile string
 	var healthURL string
 	var healthTimeout time.Duration
 	flag.StringVar(&socketPath, "socket", "/run/cli2api-updater/updater.sock", "Unix socket path")
@@ -36,6 +37,7 @@ func main() {
 	flag.StringVar(&serviceName, "service", "qoder-api-proxy", "Compose service name")
 	flag.StringVar(&containerName, "container", "qoder-api-proxy", "container name")
 	flag.StringVar(&imageRepository, "image-repository", "ghcr.io/cokeeven/ali2api3", "allowed image repository")
+	flag.StringVar(&networkFile, "network-config", os.Getenv("UPDATE_NETWORK_CONFIG"), "update mirrors/proxy JSON file (reloaded for each operation)")
 	flag.StringVar(&healthURL, "health-url", "http://127.0.0.1:3010/health", "service health URL")
 	flag.DurationVar(&healthTimeout, "health-timeout", 120*time.Second, "versioned health-check timeout")
 	flag.Parse()
@@ -56,6 +58,7 @@ func main() {
 		ContainerName: containerName, ImageRepository: imageRepository, HealthURL: healthURL,
 		HealthTimeout: healthTimeout, HostBinaryPath: hostBinary,
 		GitHubToken: strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),
+		NetworkFile: networkFile,
 	})
 	service := updater.NewService(updater.Config{
 		SocketPath: socketPath, ListenAddress: listenAddress, AuthToken: authToken, StatusFile: statusFile,

@@ -1,6 +1,19 @@
 import { api } from './client'
 
+export type UpdateNetworkStatus = {
+  source?: string
+  image_source?: string
+  download_source?: string
+  fallback: boolean
+  api_mirrors: number
+  download_mirrors: number
+  image_mirrors: number
+  proxy: boolean
+  error?: string
+}
+
 export type UpdateAgentStatus = {
+  network?: UpdateNetworkStatus
   protocol_version?: number
   available: boolean
   staged_update?: boolean
@@ -29,6 +42,7 @@ export type UpdatePreparationStatus = {
 }
 
 export type SystemUpdateInfo = {
+  network?: UpdateNetworkStatus
   current_version: string
   next_version?: string
   skipped_versions?: string[]

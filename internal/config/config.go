@@ -25,6 +25,7 @@ type Config struct {
 	UpdateAgentURL    string
 	UpdateAgentToken  string
 	UpdateGitHubToken string
+	UpdateNetworkFile string
 	// WorkBuddyDeviceToken is the shared Turing Shield device fingerprint
 	// (X-Device-Token) for accounts without a per-account token. Optional.
 	WorkBuddyDeviceToken string
@@ -76,26 +77,27 @@ func Load() (Config, error) {
 		runtimeDir = "/tmp/cli2api-runtime"
 	}
 	return Config{
-		Host:              host,
-		Port:              port,
-		ProxyAPIKey:       "",
-		ProxyURL:          strings.TrimSpace(os.Getenv("QODER_PROXY_URL")),
+		Host:                     host,
+		Port:                     port,
+		ProxyAPIKey:              "",
+		ProxyURL:                 strings.TrimSpace(os.Getenv("QODER_PROXY_URL")),
 		WorkBuddyDeviceToken:     strings.TrimSpace(os.Getenv("WORKBUDDY_DEVICE_TOKEN")),
 		WorkBuddyDeviceTokenFile: strings.TrimSpace(os.Getenv("WORKBUDDY_DEVICE_TOKEN_FILE")),
-		MaxRetryAccounts:  maxRetryAccounts,
-		QoderHome:         home,
-		DataDir:           dataDir,
-		RuntimeDir:        runtimeDir,
-		WorkerBasePort:    workerBasePort,
-		NodeBinary:        firstNonEmpty(os.Getenv("QODER_NODE_BINARY"), "node"),
-		WorkerDaemonPath:  firstNonEmpty(os.Getenv("QODER_WORKER_DAEMON"), "worker/src/daemon.mjs"),
-		QoderCLIPath:      firstNonEmpty(os.Getenv("QODERCLI_JS"), "/usr/local/lib/node_modules/@qoder-ai/qodercli/bundle/qodercli.js"),
-		QoderCNCLIPath:    firstNonEmpty(os.Getenv("QODERCNCLI_JS"), "/usr/local/lib/node_modules/@qodercn-ai/qoderclicn/bundle/qoderclicn.js"),
-		PlainTemplatePath: firstNonEmpty(os.Getenv("PLAIN_TEMPLATE_PATH"), "worker/last-plain.sample.json"),
-		UpdateSocketPath:  firstNonEmpty(os.Getenv("UPDATE_SOCKET_PATH"), "/run/cli2api-updater/updater.sock"),
-		UpdateAgentURL:    strings.TrimSpace(os.Getenv("UPDATE_AGENT_URL")),
-		UpdateAgentToken:  strings.TrimSpace(os.Getenv("UPDATE_AGENT_TOKEN")),
-		UpdateGitHubToken: strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),
+		MaxRetryAccounts:         maxRetryAccounts,
+		QoderHome:                home,
+		DataDir:                  dataDir,
+		RuntimeDir:               runtimeDir,
+		WorkerBasePort:           workerBasePort,
+		NodeBinary:               firstNonEmpty(os.Getenv("QODER_NODE_BINARY"), "node"),
+		WorkerDaemonPath:         firstNonEmpty(os.Getenv("QODER_WORKER_DAEMON"), "worker/src/daemon.mjs"),
+		QoderCLIPath:             firstNonEmpty(os.Getenv("QODERCLI_JS"), "/usr/local/lib/node_modules/@qoder-ai/qodercli/bundle/qodercli.js"),
+		QoderCNCLIPath:           firstNonEmpty(os.Getenv("QODERCNCLI_JS"), "/usr/local/lib/node_modules/@qodercn-ai/qoderclicn/bundle/qoderclicn.js"),
+		PlainTemplatePath:        firstNonEmpty(os.Getenv("PLAIN_TEMPLATE_PATH"), "worker/last-plain.sample.json"),
+		UpdateSocketPath:         firstNonEmpty(os.Getenv("UPDATE_SOCKET_PATH"), "/run/cli2api-updater/updater.sock"),
+		UpdateAgentURL:           strings.TrimSpace(os.Getenv("UPDATE_AGENT_URL")),
+		UpdateAgentToken:         strings.TrimSpace(os.Getenv("UPDATE_AGENT_TOKEN")),
+		UpdateGitHubToken:        strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),
+		UpdateNetworkFile:        firstNonEmpty(os.Getenv("UPDATE_NETWORK_CONFIG"), "/run/cli2api-updater/network.json"),
 	}, nil
 }
 

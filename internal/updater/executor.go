@@ -17,6 +17,7 @@ import (
 	"time"
 
 	control "github.com/caigee-cmd/cli2api/internal/update"
+	"github.com/caigee-cmd/cli2api/internal/updatenet"
 )
 
 type ExecutorConfig struct {
@@ -30,6 +31,7 @@ type ExecutorConfig struct {
 	HostBinaryPath  string
 	GitHubRepo      string
 	GitHubToken     string
+	NetworkFile     string
 	RestartCommand  []string
 }
 
@@ -42,6 +44,8 @@ type Executor struct {
 
 	preserveMu        sync.Mutex
 	preservedDatabase string
+	networkMu         sync.Mutex
+	network           updatenet.Status
 }
 
 type commandRunner interface {
@@ -117,9 +121,8 @@ func (e *Executor) Prepare(ctx context.Context, _ string, request control.Prepar
 	if _, err := control.ParseVersion(request.TargetVersion); err != nil {
 		return fmt.Errorf("invalid target version")
 	}
-	targetImage := e.config.ImageRepository + ":" + request.TargetVersion
 	progress("pulling")
-	if _, err := e.runner.Run(ctx, "docker", "pull", targetImage); err != nil {
+	if err := e.pullTargetImage(ctx, request.TargetVersion); err != nil {
 		return fmt.Errorf("pull target image: %w", err)
 	}
 	return e.stageHostBinary(ctx, request.TargetVersion, progress)
@@ -162,7 +165,7 @@ func (e *Executor) Apply(ctx context.Context, _ string, request ApplyRequest, pr
 		}
 	} else {
 		progress("pulling")
-		if _, err := e.runner.Run(ctx, "docker", "pull", targetImage); err != nil {
+		if err := e.pullTargetImage(ctx, request.TargetVersion); err != nil {
 			return false, err
 		}
 		if err := e.stageHostBinary(ctx, request.TargetVersion, progress); err != nil {

@@ -19,7 +19,7 @@ Deploy with Docker, manage accounts in the web console, and connect clients thro
 
 This repository is published as **ali2api3**, developed from [caigee-cmd/cli2api](https://github.com/caigee-cmd/cli2api), with its MIT license and copyright retained. Additions include per-key platform priorities and concurrency, account usage guardrails and credit-expiry analysis, WorkBuddy CN daily tasks, and confirmed check-in outcomes. The Go module retains the upstream name for package compatibility.
 
-Build this branch from source. References below to upstream images and managed updates do not imply that they include these changes. Account data, credentials, and local instance configuration are excluded from the public repository.
+Stable builds are published through this repository's GitHub Releases and `ghcr.io/cokeeven/ali2api3`. Account data, credentials, and local instance configuration are excluded from the public repository.
 
 ## Features
 
@@ -50,6 +50,8 @@ Edit a client key to configure **platform routing**: higher priorities run first
 The account menu's **Usage and guards** controls reserve credits, daily tokens, daily credits, and per-model daily tokens, and shows credit expiry and daily usage. All guards default off. Strict credit guards reject paid requests whose cost upper bound cannot be established; credit multipliers alone are not trusted quotes. The dialog also states which guards the selected platform can actually enforce: no supported platform reports a trusted absolute per-request credit cost, while token bounds exist only where the platform cannot exceed the client's limit (Trae and the Codex Responses path stay unknown). Actual usage, estimated reservations, and unknown charges remain distinct. Cancellation does not imply zero cost. Manual reconciliation only acknowledges that a specified fresh balance snapshot already includes an unknown liability; it does not invent per-request costs. Expiry preference applies within the selected platform and does not override session affinity.
 
 Docker Compose is the supported install and managed-update path; source runs are for development. See the [deployment guide](deploy/README.md).
+
+Update checks, updater downloads and container pulls support operator-configured fallback sources. Update HTTP requests also support a proxy fallback. No third-party accelerator is enabled by default; see [update network and mirrors](deploy/README.md#update-network-and-mirrors).
 
 ## Connect a client
 

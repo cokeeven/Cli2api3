@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/caigee-cmd/cli2api/internal/updatenet"
 )
 
 const maxHostBinaryBytes = 64 << 20
@@ -137,31 +139,63 @@ func (e *Executor) downloadReleaseFile(ctx context.Context, version, name string
 	if err := validateHostBinaryURL(downloadURL); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	config, err := updatenet.Load(e.config.NetworkFile)
 	if err != nil {
 		return nil, err
+	}
+	urls := []string{downloadURL}
+	for _, mirror := range config.DownloadMirrors {
+		urls = append(urls, strings.TrimRight(mirror, "/")+"/"+downloadURL)
+	}
+	failures := make([]string, 0)
+	for index, candidate := range urls {
+		for _, proxy := range updatenet.Routes(config.ProxyURL) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			body, err := e.downloadCandidate(ctx, candidate, proxy, config.DownloadTimeout)
+			label := updatenet.Label(candidate)
+			if proxy != "" {
+				label += " (proxy)"
+			}
+			if err == nil {
+				e.recordNetworkSource("download", label, index > 0 || proxy != "")
+				return body, nil
+			}
+			failures = append(failures, label+": "+err.Error())
+		}
+	}
+	return nil, fmt.Errorf("all download sources failed for %s: %s", name, strings.Join(failures, "; "))
+}
+
+func (e *Executor) downloadCandidate(ctx context.Context, candidate, proxy string, timeout int) ([]byte, error) {
+	allowed := func(u *url.URL) bool {
+		return validateHostBinaryURL(u.String()) == nil || updatenet.SameOrigin(candidate, u)
+	}
+	client := updatenet.Client(e.download, proxy, time.Duration(timeout)*time.Second, allowed)
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid asset URL")
 	}
 	req.Header.Set("User-Agent", "cli2api-updater")
 	req.Header.Set("Accept", "application/octet-stream")
-	if token := strings.TrimSpace(e.config.GitHubToken); token != "" {
+	if token := strings.TrimSpace(e.config.GitHubToken); token != "" && updatenet.SameOrigin("https://github.com", req.URL) {
 		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	client := e.download
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("request failed or timed out")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub %s returned %d", name, resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	if err := validateHostBinaryURL(resp.Request.URL.String()); err != nil {
-		return nil, err
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHostBinaryBytes+1))
+	if err != nil || len(body) == 0 || len(body) > maxHostBinaryBytes {
+		return nil, fmt.Errorf("empty, incomplete or oversized asset")
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxHostBinaryBytes+1))
+	return body, nil
 }
 
 func validateHostBinaryURL(raw string) error {

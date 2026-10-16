@@ -271,7 +271,7 @@ jobs:
     needs: [prepare, draft, image]
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
@@ -285,6 +285,9 @@ jobs:
           CANDIDATE_IMAGE: ${{ needs.prepare.outputs.image }}:candidate-${{ needs.prepare.outputs.sha }}
           RELEASE_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.tag }}
           SEMVER_IMAGE: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          IMAGE_REPOSITORY: ${{ needs.prepare.outputs.image }}
         run: |
           set -euo pipefail
           docker buildx imagetools create \
@@ -294,6 +297,13 @@ jobs:
           manifest="$(docker buildx imagetools inspect --raw "$RELEASE_IMAGE")"
           jq -e '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")' <<< "$manifest" >/dev/null
           jq -e '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")' <<< "$manifest" >/dev/null
+          # Resolve the registry's exact multi-platform digest, not a digest
+          # of shell-substituted JSON (which strips trailing newlines).
+          digest="$(docker buildx imagetools inspect "$RELEASE_IMAGE" --format '{{json .Manifest}}' | jq -r '.digest')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          jq -n --arg version "$RELEASE_TAG" --arg repository "$IMAGE_REPOSITORY" --arg digest "$digest" \
+            '{version: $version, repository: $repository, digest: $digest}' > cli2api-image-digest.json
+          gh release upload "$RELEASE_TAG" cli2api-image-digest.json --repo "$GITHUB_REPOSITORY" --clobber
 
   publish:
     needs: [prepare, draft, promote]
@@ -312,8 +322,8 @@ jobs:
         run: |
           set -euo pipefail
           asset_count="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
-          if [[ "$asset_count" -ne 7 ]]; then
-            echo "$RELEASE_TAG has $asset_count assets, expected 7" >&2
+          if [[ "$asset_count" -ne 8 ]]; then
+            echo "$RELEASE_TAG has $asset_count assets, expected 8" >&2
             exit 1
           fi
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md --draft=false --latest
@@ -321,7 +331,7 @@ jobs:
             echo "## Published $RELEASE_TAG"
             echo
             echo "- Image: \`${{ needs.prepare.outputs.image }}:$RELEASE_TAG\`"
-            echo "- Updater assets: 6 binaries + SHA256 manifest"
+            echo "- Updater assets: 6 binaries + SHA256 manifest + immutable image digest"
             echo "- Release notes: bilingual fragments from changelog/unreleased/"
           } >> "$GITHUB_STEP_SUMMARY"
 

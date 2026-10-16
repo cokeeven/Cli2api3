@@ -88,7 +88,7 @@ pushes skip publishing. The pipeline still waits for CI on that exact commit,
 then creates and verifies the draft, updater assets, and images before making
 the release public. Use `workflow_dispatch` for a minor or major bump.
 
-The workflow calculates the next patch from the latest published stable release, creates an invisible draft, builds six checksum-verified updater binaries plus `cli2api-updater_checksums.txt`, publishes `linux/amd64` + `linux/arm64` images, then makes the GitHub Release latest and moves `latest` / series aliases. Console update checks ignore drafts, so a failed pre-publication run stays invisible.
+The workflow calculates the next patch from the latest published stable release, creates an invisible draft, builds six checksum-verified updater binaries plus `cli2api-updater_checksums.txt`, publishes `linux/amd64` + `linux/arm64` images, uploads `cli2api-image-digest.json` with that exact multi-platform digest, then makes the GitHub Release latest and moves `latest` / series aliases. Console update checks ignore drafts, so a failed pre-publication run stays invisible.
 
 ### After it publishes
 
@@ -108,7 +108,7 @@ Expected artifacts for a published tag:
 
 | Kind | Names |
 |------|--------|
-| GitHub Release assets (7) | six `cli2api-updater_{os}_{arch}` binaries and `cli2api-updater_checksums.txt` |
+| GitHub Release assets (8) | six `cli2api-updater_{os}_{arch}` binaries, `cli2api-updater_checksums.txt`, and `cli2api-image-digest.json` |
 | GHCR (`ghcr.io/cokeeven/ali2api3`) | `v0.x.y`, `0.x.y`, series (`0.2`), `latest`, all the same multi-arch digest |
 
 If a **pre-publication** job fails (`prepare` / `assets` / `draft` / `image` / `promote`), use **Re-run failed jobs** on the same run. The draft remains unpublished. Do not create the tag locally while that draft exists.

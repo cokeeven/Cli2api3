@@ -1,0 +1,9 @@
+{
+  "api_mirrors": [],
+  "download_mirrors": [],
+  "image_mirrors": [],
+  "proxy_url": "",
+  "request_timeout_seconds": 8,
+  "download_timeout_seconds": 120,
+  "pull_timeout_seconds": 180
+}

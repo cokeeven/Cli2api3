@@ -496,7 +496,7 @@ func TestSPAFallbackServesIndexForClientRoutes(t *testing.T) {
 		t.Fatalf("GET /auth: got %d want 200", rec.Code)
 	}
 	body, _ := io.ReadAll(rec.Body)
-	if !bytes.Contains(body, []byte(`id="root"`)) && !bytes.Contains(body, []byte("CLI2API")) {
+	if !bytes.Contains(body, []byte(`id="root"`)) && !bytes.Contains(body, []byte("Cli2api3")) {
 		t.Fatalf("GET /auth did not serve SPA index: %s", string(body[:min(200, len(body))]))
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {

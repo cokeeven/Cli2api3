@@ -186,7 +186,7 @@ func TestSPAAllowlistAndStaticAssetsDoNotExpandFallback(t *testing.T) {
 		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "text/html") {
 			t.Fatalf("%s: %d type=%q", path, rec.Code, rec.Header().Get("Content-Type"))
 		}
-		if !bytes.Contains(rec.Body.Bytes(), []byte("CLI2API")) {
+		if !bytes.Contains(rec.Body.Bytes(), []byte("<title>Cli2api3</title>")) {
 			t.Fatalf("%s did not serve index", path)
 		}
 	}

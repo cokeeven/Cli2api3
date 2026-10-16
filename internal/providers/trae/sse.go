@@ -113,6 +113,9 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			calls = append(calls, toolCalls[index])
 		}
 		message["tool_calls"] = calls
+		if finishReason == "" || finishReason == "stop" {
+			finishReason = "tool_calls"
+		}
 	}
 	if model != "" {
 		result["model"] = model
@@ -213,6 +216,7 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 		created := time.Now().Unix()
 		var pendingUsage any
 		ended := false
+		sawToolCalls := false
 		writeChunk := func(delta map[string]any, finish string, usage any) error {
 			chunk := map[string]any{
 				"id":      id,
@@ -266,6 +270,7 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 				if len(out.ToolCalls) > 0 && string(out.ToolCalls) != "null" {
 					if remapped := remapToolCallsJSON(out.ToolCalls); remapped != nil {
 						delta["tool_calls"] = remapped
+						sawToolCalls = sawToolCalls || len(remapped) > 0
 					}
 				}
 				if len(delta) == 0 {
@@ -285,6 +290,9 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 				finish := done.FinishReason
 				if finish == "" {
 					finish = "stop"
+				}
+				if finish == "stop" && sawToolCalls {
+					finish = "tool_calls"
 				}
 				usage := pendingUsage
 				pendingUsage = nil

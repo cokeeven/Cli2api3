@@ -1,14 +1,25 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ComposeFile = "",
+    [string]$EnvFile = "",
+    [string]$ContainerName = "qoder-api-proxy",
+    [string]$ServiceName = "qoder-api-proxy",
+    [string]$InstallDir = "",
+    [string]$TaskName = "CLI2API Updater"
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RootDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$EnvFile = Join-Path $RootDir "deploy\.env"
+if ([string]::IsNullOrWhiteSpace($EnvFile)) { $EnvFile = Join-Path $RootDir "deploy\.env" }
 $EnvExample = Join-Path $RootDir "deploy\.env.example"
-$ComposeFile = Join-Path $RootDir "deploy\docker-compose.yml"
-$InstallDir = Join-Path $env:LOCALAPPDATA "cli2api-updater"
+if ([string]::IsNullOrWhiteSpace($ComposeFile)) { $ComposeFile = Join-Path $RootDir "deploy\docker-compose.yml" }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = Join-Path $env:LOCALAPPDATA "cli2api-updater" }
+$ComposeFile = [System.IO.Path]::GetFullPath($ComposeFile)
+$EnvFile = [System.IO.Path]::GetFullPath($EnvFile)
+$InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+if (-not (Test-Path -LiteralPath $ComposeFile -PathType Leaf)) { throw "Compose file does not exist: $ComposeFile" }
 $Binary = Join-Path $InstallDir "cli2api-updater.exe"
 $CandidateBinary = Join-Path $InstallDir "cli2api-updater.new.exe"
 $TokenFile = Join-Path $InstallDir "token"
@@ -17,12 +28,9 @@ $Runner = Join-Path $InstallDir "run-updater.ps1"
 $StdoutLog = Join-Path $InstallDir "stdout.log"
 $StderrLog = Join-Path $InstallDir "stderr.log"
 $SocketPlaceholder = Join-Path $InstallDir "socket-placeholder"
-$TaskName = "CLI2API Updater"
-$ContainerName = "qoder-api-proxy"
-$ServiceName = "qoder-api-proxy"
-$ImageRepository = "ghcr.io/caigee-cmd/cli2api"
+$ImageRepository = "ghcr.io/cokeeven/ali2api3"
 $ListenAddress = "127.0.0.1:3011"
-$GitHubRepository = "caigee-cmd/cli2api"
+$GitHubRepository = "cokeeven/ali2api3"
 
 function Require-Command {
     param([string]$Name)
@@ -323,4 +331,4 @@ if ($ContainerExists) {
 
 Write-Host "Managed updater installed as the current-user scheduled task '$TaskName'."
 Write-Host "Recreate qoder-api-proxy once so it can use the updater channel:"
-Write-Host "docker compose --env-file `"$EnvFile`" -f `"$ComposeFile`" up -d --force-recreate qoder-api-proxy"
+Write-Host "docker compose --env-file `"$EnvFile`" -f `"$ComposeFile`" up -d --force-recreate $ServiceName"

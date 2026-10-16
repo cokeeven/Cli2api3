@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "dependencies": {
-    "undici": "6.21.2"
+    "undici": "6.29.1"
   },
   "type": "module",
   "description": "Qoder one-account daemon for qoder-api-proxy",

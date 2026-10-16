@@ -468,6 +468,97 @@ func TestResponsesRandomAnchorIsSelectedOnce(t *testing.T) {
 	}
 }
 
+// A catalog price multiplier is not a per-request credit bound. The executor
+// must never turn "x1.4" (or any price label) into a CreditUpperBound: a
+// credit guard that cannot price the request must refuse it instead.
+func TestReservationNeverFabricatesCreditUpperBound(t *testing.T) {
+	e := admittedExecutor(admissionChat{})
+	e.Pool = NewPool(nil, nil)
+	// A catalog entry with a price multiplier and a non-free classification.
+	e.Pool.Upsert(Item{
+		ID: "wb", Provider: "workbuddy", Region: "cn", Runtime: "in_process",
+		Models: []string{"glm-5.2", "glm-4.6"}, FreeModels: []string{"glm-4.6"},
+	})
+	e.Providers.Register(providers.Adapter{ID: "workbuddy", Chat: admissionChat{}})
+	budget := &admissionBudget{}
+	e.Budgets = budget
+	req := translate.ChatRequest{Model: "glm-5.2", MaxTokens: []byte("64")}
+	if _, err := e.ChatNonStream(context.Background(), req, "", "workbuddy"); err != nil {
+		t.Fatal(err)
+	}
+	if len(budget.reserves) != 1 {
+		t.Fatalf("reserves=%d", len(budget.reserves))
+	}
+	if budget.reserves[0].CreditUpperBound != nil {
+		t.Fatalf("credit bound was fabricated from catalog pricing: %v", *budget.reserves[0].CreditUpperBound)
+	}
+	if budget.reserves[0].FreeModel {
+		t.Fatal("a priced model must not be treated as free")
+	}
+	// A proven free model keeps a zero bound (not nil): zero is a trusted
+	// fact there, so free models still pass a credit guard.
+	if _, err := e.ChatNonStream(context.Background(), translate.ChatRequest{Model: "glm-4.6", MaxTokens: []byte("64")}, "", "workbuddy"); err != nil {
+		t.Fatal(err)
+	}
+	if len(budget.reserves) != 2 || !budget.reserves[1].FreeModel {
+		t.Fatalf("free model reservation=%+v", budget.reserves)
+	}
+}
+
+// An unknown-cost refusal must say which platform could not price the request
+// and what the operator can do, instead of surfacing a bare reason code.
+func TestUnknownCostGuardRefusalExplainsPlatform(t *testing.T) {
+	e := admittedExecutor(admissionChat{})
+	budget := &admissionBudget{reserveErr: &accounts.UsageGuardError{Reason: "credit_upper_bound_unknown"}}
+	e.Budgets = budget
+	_, err := e.ChatNonStream(context.Background(), translate.ChatRequest{Model: "m", MaxTokens: []byte("5")}, "", "workbuddy")
+	if err == nil {
+		t.Fatal("expected the credit guard to refuse the unpriced request")
+	}
+	classified := ClassifyError(err)
+	if classified.Code != "usage_guard_credit_upper_bound_unknown" || classified.Status != 429 {
+		t.Fatalf("classified=%+v", classified)
+	}
+	for _, want := range []string{"workbuddy", "credit guard", "assuming zero"} {
+		if !strings.Contains(classified.Message, want) {
+			t.Fatalf("message %q must mention %q", classified.Message, want)
+		}
+	}
+}
+
+// The guardrail declaration is the contract the console and docs read, so the
+// two unknown-bound platforms must stay honest.
+func TestProviderGuardrailDeclarationsAreHonest(t *testing.T) {
+	for _, tc := range []struct {
+		provider    string
+		tokenBound  bool
+		wantNoteSub string
+	}{
+		{"trae", false, "max_tokens"},
+		{"codex", false, "Responses"},
+		{"qoder", true, "max_tokens"},
+		{"workbuddy", true, "free model"},
+		{"devin", true, "credits"},
+		{"command", true, "dollars"},
+		{"zhipu", true, "API key"},
+	} {
+		descriptor, ok := providers.Get(tc.provider)
+		if !ok {
+			t.Fatalf("provider %s missing", tc.provider)
+		}
+		guardrails := descriptor.Capabilities.Guardrails
+		if guardrails.TokenBound != tc.tokenBound {
+			t.Fatalf("%s token_bound=%v want %v", tc.provider, guardrails.TokenBound, tc.tokenBound)
+		}
+		if guardrails.CreditBound {
+			t.Fatalf("%s must not claim a trusted per-request credit bound", tc.provider)
+		}
+		if !strings.Contains(guardrails.Note, tc.wantNoteSub) {
+			t.Fatalf("%s note %q must mention %q", tc.provider, guardrails.Note, tc.wantNoteSub)
+		}
+	}
+}
+
 func TestTraeReservationUsesDeclaredOutputCeiling(t *testing.T) {
 	e := admittedExecutor(admissionChat{})
 	e.Pool = NewPool(nil, nil)

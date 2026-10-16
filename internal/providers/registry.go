@@ -21,6 +21,26 @@ const (
 	AuthNative AuthType = "native"
 )
 
+// GuardrailSupport declares which usage guards a provider can actually
+// enforce with a trusted bound. It exists so the console and the docs can
+// state the truth per platform instead of implying that every guard works
+// everywhere: an unknown cost must never be treated as zero, and a credits
+// *multiplier* ("x1.4") or a balance delta is not a per-request cost.
+type GuardrailSupport struct {
+	// TokenBound is true when a normal chat reservation always has a
+	// conservative token upper bound (request size plus the client's
+	// max_tokens, or the model's declared output ceiling). False means some
+	// path can leave the token count unknown, so the token guards refuse
+	// such requests instead of guessing.
+	TokenBound bool `json:"token_bound"`
+	// CreditBound is true only when the adapter reports a trusted absolute
+	// per-request credit upper bound. A per-model price multiplier is not a
+	// bound; no supported platform currently satisfies this.
+	CreditBound bool `json:"credit_bound"`
+	// Note is the operator-facing explanation of the limitation.
+	Note string `json:"note,omitempty"`
+}
+
 type ProviderCapabilities struct {
 	Chat         bool `json:"chat"`
 	Stream       bool `json:"stream"`
@@ -33,6 +53,9 @@ type ProviderCapabilities struct {
 	BrowserLogin bool `json:"browser_login"`
 	PATLogin     bool `json:"pat_login"`
 	ImportExport bool `json:"import_export"`
+	// Guardrails states which usage guards this provider can enforce with a
+	// trusted bound; see GuardrailSupport.
+	Guardrails GuardrailSupport `json:"guardrails"`
 }
 
 type RegionDescriptor struct {
@@ -95,6 +118,10 @@ var Qoder = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
 		PATLogin: true, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: true,
+			Note:       "chat requests carry a token upper bound from the request size plus max_tokens; the native Responses path and unbounded media stay unknown, and the catalog price is a multiplier, not a per-request credit cost",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -125,6 +152,10 @@ var WorkBuddy = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: false, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
 		PATLogin: false, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: true,
+			Note:       "chat requests carry a token upper bound from the request size plus max_tokens; credits text is sometimes the string \"0\" (a proven free model) and otherwise a price label, never an absolute per-request cost",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -156,6 +187,13 @@ var Trae = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: false, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
 		PATLogin: false, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			// Trae can exceed the client's max_tokens (reasoning tokens), so
+			// only a catalog output ceiling bounds the request. Models without
+			// a declared ceiling stay unknown rather than being assumed free.
+			TokenBound: false,
+			Note:       "Trae can exceed the client's max_tokens, so only models with a declared output ceiling get a token upper bound; the price text is a per-message multiplier, not a per-request credit cost",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -180,6 +218,10 @@ var Devin = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
 		PATLogin: false, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: true,
+			Note:       "chat requests carry a token upper bound from the request size plus max_tokens; Devin reports consumed credits only after the request, so no trusted per-request credit bound exists",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -206,6 +248,10 @@ var Command = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: false,
 		ModelCatalog: true, Usage: true, Login: false, BrowserLogin: false,
 		PATLogin: true, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: true,
+			Note:       "chat requests carry a token upper bound from the request size plus max_tokens; Command Code bills in dollars, not platform credits, so the credit guards do not apply",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -229,6 +275,10 @@ var Codex = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
 		PATLogin: false, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: false,
+			Note:       "the Codex subscription path serves native Responses, whose token count is unknown at reservation time, so token guards refuse those requests instead of guessing",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{
@@ -253,6 +303,10 @@ var Zhipu = ProviderDescriptor{
 		Chat: true, Stream: true, Tools: true, Images: false, Reasoning: true,
 		ModelCatalog: true, Usage: true, Login: false, BrowserLogin: false,
 		PATLogin: true, ImportExport: true,
+		Guardrails: GuardrailSupport{
+			TokenBound: true,
+			Note:       "chat requests carry a token upper bound from the request size plus max_tokens; Zhipu bills the API key directly, so the platform credit guards do not apply",
+		},
 	},
 	Regions: []RegionDescriptor{
 		{

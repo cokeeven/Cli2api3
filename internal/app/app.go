@@ -142,7 +142,7 @@ func New(cfg config.Config) *App {
 	stopLogs := make(chan struct{})
 	go recorder.PurgeLoop(stopLogs, time.Hour)
 	go manager.RunMaintenanceLoop(stopLogs)
-	checker := appupdate.NewChecker(buildinfo.Version, appupdate.NewGitHubReleaseSource("caigee-cmd/cli2api", cfg.UpdateGitHubToken))
+	checker := appupdate.NewChecker(buildinfo.Version, appupdate.NewGitHubReleaseSource("cokeeven/ali2api3", cfg.UpdateGitHubToken))
 	var agent appupdate.Agent = appupdate.NewUnixAgentClient(cfg.UpdateSocketPath)
 	if strings.TrimSpace(cfg.UpdateAgentURL) != "" {
 		agent = appupdate.NewHTTPAgentClient(cfg.UpdateAgentURL, cfg.UpdateAgentToken)

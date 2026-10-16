@@ -80,6 +80,7 @@ type Manager struct {
 	checkinRunning    map[string]bool
 	dailyBatchRunning bool
 	maintenanceDone   sync.WaitGroup
+	accountEpoch      map[string]uint64 // guarded by mu; invalidates old probes on start/stop
 	automationMu      sync.Mutex
 	automationNextID  uint64
 	automationRuns    map[uint64]context.CancelFunc
@@ -128,6 +129,13 @@ type Manager struct {
 	resources atomic.Pointer[ResourceSnapshot]
 	resMu     sync.Mutex       // serializes sampleResources
 	cpuPrev   map[int]procTime // pid -> last jiffies sample for CPU% deltas
+
+	// Shared model-catalog refresh machinery: one process-wide semaphore plus
+	// per-account dedup and failure backoff, so concurrent callers cannot
+	// multiply upstream catalog traffic. catalogOnce guards zero-value
+	// Managers created directly in tests.
+	catalog     *catalogRefreshState
+	catalogOnce sync.Once
 }
 
 func NewManager(config ManagerConfig, store AccountStore, starter ProcessStarter) *Manager {
@@ -165,6 +173,11 @@ func NewManager(config ManagerConfig, store AccountStore, starter ProcessStarter
 		persistedVersions: map[string]uint64{},
 		persistCloseCh:    make(chan struct{}),
 		cpuPrev:           map[int]procTime{},
+		catalog: &catalogRefreshState{
+			sem:      make(chan struct{}, maxConcurrentModelFetches),
+			running:  map[string]bool{},
+			failures: map[string]time.Time{},
+		},
 	}
 	manager.persistCond = sync.NewCond(&manager.persistMu)
 	manager.persistDone.Add(1)

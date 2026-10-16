@@ -26,6 +26,10 @@ type Coordinator struct {
 	Checker ReleaseChecker
 	Agent   Agent
 	Backup  func(context.Context, string, int) (accounts.Backup, error)
+	// Drain waits for in-flight business to finish before the pre-upgrade
+	// snapshot is taken. A timeout aborts the update before backup/submission,
+	// so an unfinished request is not cut off by container replacement.
+	Drain   func(context.Context) bool
 	DataDir string
 
 	Maintenance atomic.Bool
@@ -66,9 +70,17 @@ type Job struct {
 	CurrentVersion string `json:"current_version,omitempty"`
 	TargetVersion  string `json:"target_version,omitempty"`
 	BackupPath     string `json:"backup_path,omitempty"`
-	Error          string `json:"error,omitempty"`
-	StartedAt      string `json:"started_at,omitempty"`
-	FinishedAt     string `json:"finished_at,omitempty"`
+	// PreservedDatabasePath records where the post-upgrade database was kept
+	// during an explicit rollback restore, so the console can state that the
+	// newest data still exists.
+	PreservedDatabasePath string `json:"preserved_database_path,omitempty"`
+	// DrainTimedOut reports that in-flight requests did not finish within the
+	// pre-upgrade drain window. The snapshot is still consistent, but the
+	// service was busy when it was taken.
+	DrainTimedOut bool   `json:"drain_timed_out,omitempty"`
+	Error         string `json:"error,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
+	FinishedAt    string `json:"finished_at,omitempty"`
 }
 
 type systemUpdateInfo struct {
@@ -113,6 +125,10 @@ func (c *Coordinator) HandleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Version string `json:"version"`
+		// RestoreDatabase opts into replacing the live database with the
+		// pre-upgrade snapshot. Historical snapshot selection is not currently
+		// supported by this endpoint; reject rather than silently ignore it.
+		RestoreDatabase bool `json:"restore_database"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "version is required")
@@ -123,6 +139,11 @@ func (c *Coordinator) HandleRollback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "version is required")
 		return
 	}
+	if body.RestoreDatabase {
+		writeErr(w, http.StatusBadRequest, "database_restore_unavailable", "Version rollback keeps the current database. Historical database restore requires a separately verified snapshot and recovery procedure.")
+		return
+	}
+	restoreDatabase := false
 	if !c.Running.CompareAndSwap(false, true) {
 		writeErr(w, http.StatusConflict, "update_in_progress", "An update is already in progress")
 		return
@@ -137,8 +158,8 @@ func (c *Coordinator) HandleRollback(w http.ResponseWriter, r *http.Request) {
 	c.Job = &Job{JobID: jobID, State: "preparing", TargetVersion: target, StartedAt: time.Now().UTC().Format(time.RFC3339)}
 	c.mu.Unlock()
 	c.Maintenance.Store(true)
-	go c.rollback(jobID, target)
-	writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID, "target_version": target})
+	go c.rollback(jobID, target, restoreDatabase)
+	writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID, "target_version": target, "restore_database": restoreDatabase})
 }
 
 func (c *Coordinator) HandleCancel(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +245,27 @@ func (c *Coordinator) HandleInfo(w http.ResponseWriter, r *http.Request) {
 	if job == nil && status.State == "succeeded" && strings.TrimSpace(status.JobID) != "" {
 		job = &Job{JobID: "agent-" + status.JobID, AgentJobID: status.JobID, State: "succeeded", CurrentVersion: status.CurrentVersion, TargetVersion: status.TargetVersion, StartedAt: status.StartedAt, FinishedAt: status.FinishedAt}
 	}
+	c.recordPreservedDatabase(status)
+	if job != nil && strings.TrimSpace(status.PreservedDatabasePath) != "" {
+		job.PreservedDatabasePath = status.PreservedDatabasePath
+	}
 	writeJSON(w, http.StatusOK, systemUpdateInfo{Info: info, Agent: status, Update: job})
+}
+
+// recordPreservedDatabase mirrors the updater's preserved-database path into
+// the live job, so the console can state that an explicit rollback restore
+// kept the post-upgrade data. It is a no-op when the updater did not preserve
+// anything (the default program-only rollback).
+func (c *Coordinator) recordPreservedDatabase(status AgentStatus) {
+	path := strings.TrimSpace(status.PreservedDatabasePath)
+	if path == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Job != nil {
+		c.Job.PreservedDatabasePath = path
+	}
 }
 
 func (c *Coordinator) HandleApplyNow(w http.ResponseWriter, _ *http.Request) {
@@ -377,7 +418,7 @@ func (c *Coordinator) prepareOneShot(jobID string) {
 	c.submitOneShot(jobID, info.CurrentVersion, info.NextVersion)
 }
 
-func (c *Coordinator) rollback(jobID, targetVersion string) {
+func (c *Coordinator) rollback(jobID, targetVersion string, restoreDatabase bool) {
 	ctx := context.Background()
 	fail := func(message string) {
 		c.Finish(jobID, "failed", message, true)
@@ -424,10 +465,10 @@ func (c *Coordinator) rollback(jobID, targetVersion string) {
 		fail("Updater daemon is busy")
 		return
 	}
-	c.submitOneShot(jobID, info.CurrentVersion, targetVersion)
+	c.submitOneShot(jobID, info.CurrentVersion, targetVersion, restoreDatabase)
 }
 
-func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string) {
+func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string, restoreDatabase ...bool) {
 	ctx := context.Background()
 	fail := func(message string) {
 		c.Finish(jobID, "failed", message, true)
@@ -437,6 +478,10 @@ func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string)
 	c.Mutate(jobID, func(job *Job) { job.State = "backing_up" })
 	if c.Backup == nil {
 		fail("backup unavailable")
+		return
+	}
+	if err := c.drainBeforeBackup(ctx, jobID); err != nil {
+		fail(err.Error())
 		return
 	}
 	backup, err := c.Backup(ctx, filepath.Join(c.DataDir, "backups"), 5)
@@ -453,6 +498,9 @@ func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string)
 		TargetVersion:  targetVersion,
 		BackupPath:     filepath.Join("/data/backups", backup.Name),
 	}
+	if len(restoreDatabase) > 0 && restoreDatabase[0] {
+		request.RestoreDatabase = true
+	}
 	applyCtx, applyCancel := context.WithTimeout(ctx, 8*time.Second)
 	response, err := c.Agent.Apply(applyCtx, request)
 	applyCancel()
@@ -465,6 +513,19 @@ func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string)
 		job.AgentJobID = response.JobID
 	})
 	go c.monitor(jobID, response.JobID)
+}
+
+func (c *Coordinator) drainBeforeBackup(ctx context.Context, jobID string) error {
+	if c.Drain == nil {
+		return nil
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if c.Drain(drainCtx) {
+		return nil
+	}
+	c.Mutate(jobID, func(job *Job) { job.DrainTimedOut = true })
+	return fmt.Errorf("active requests did not finish; update stopped before backup or container replacement")
 }
 
 func (c *Coordinator) applyPrepared(jobID string) {
@@ -485,6 +546,12 @@ func (c *Coordinator) applyPrepared(jobID string) {
 	ctx := context.Background()
 	if c.Backup == nil {
 		c.Finish(jobID, "failed", "backup unavailable", true)
+		c.Maintenance.Store(false)
+		c.Running.Store(false)
+		return
+	}
+	if err := c.drainBeforeBackup(ctx, jobID); err != nil {
+		c.Finish(jobID, "failed", err.Error(), true)
 		c.Maintenance.Store(false)
 		c.Running.Store(false)
 		return

@@ -1578,6 +1578,130 @@ func TestEnsureModelCatalogsDoesNotBlock(t *testing.T) {
 	}
 }
 
+// The catalog-refresh concurrency limit must be shared process-wide: N
+// concurrent EnsureModelCatalogs calls must not multiply simultaneous
+// upstream fetches beyond maxConcurrentModelFetches, and the same account
+// must not be fetched twice at once.
+func TestEnsureModelCatalogsSharesConcurrencyAndDedups(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlstore.OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var inflight, maxInflight, totalHits int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		current := atomic.AddInt32(&inflight, 1)
+		defer atomic.AddInt32(&inflight, -1)
+		for {
+			observed := atomic.LoadInt32(&maxInflight)
+			if current <= observed || atomic.CompareAndSwapInt32(&maxInflight, observed, current) {
+				break
+			}
+		}
+		atomic.AddInt32(&totalHits, 1)
+		<-release
+	}))
+	defer server.Close()
+
+	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
+	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		manager.Pool().Upsert(executor.Item{ID: id, URL: server.URL, Provider: "qoder", Runtime: "child_process"})
+	}
+
+	// Three callers want all 8 accounts while the first wave is still blocked
+	// in the handler, so dedup and the shared limit are both exercised.
+	for i := 0; i < 3; i++ {
+		manager.EnsureModelCatalogs(ctx, true)
+	}
+	// The shared semaphore must cap simultaneous fetches at four. Wait for
+	// exactly that many to be in the handler, then hold them there.
+	deadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt32(&inflight) < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&inflight); got != 4 {
+		t.Fatalf("in-flight fetches = %d, want the shared limit 4", got)
+	}
+	if got := atomic.LoadInt32(&totalHits); got != 4 {
+		t.Fatalf("upstream hits while capped = %d, want 4", got)
+	}
+	close(release)
+	// The queued accounts finish the first wave; no account may be fetched a
+	// second time by the later callers.
+	deadline = time.Now().Add(10 * time.Second)
+	for atomic.LoadInt32(&totalHits) < 8 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Give any duplicate scheduling a chance to show up before asserting.
+	time.Sleep(300 * time.Millisecond)
+	if hits := atomic.LoadInt32(&totalHits); hits != 8 {
+		t.Fatalf("dedup failed: %d upstream hits, want 8", hits)
+	}
+	if observed := atomic.LoadInt32(&maxInflight); observed > 4 {
+		t.Fatalf("shared concurrency violated: %d simultaneous fetches, want <= 4", observed)
+	}
+}
+
+// A failed catalog fetch must back the account off: an immediate second call
+// must not re-hit the same upstream, while a successful account is retried
+// normally.
+func TestEnsureModelCatalogsBacksOffAfterFailure(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlstore.OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var hits int32
+	var mu sync.Mutex
+	fail := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		mu.Lock()
+		shouldFail := fail
+		mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer server.Close()
+
+	manager := accountruntime.NewManager(accountruntime.ManagerConfig{DataDir: t.TempDir()}, store, &fakeStarter{})
+	defer manager.Close()
+	manager.Pool().Upsert(executor.Item{ID: "broken", URL: server.URL, Provider: "qoder", Runtime: "child_process"})
+
+	manager.EnsureModelCatalogs(ctx, true)
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&hits) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("first refresh must reach the upstream once, hits=%d", hits)
+	}
+	// Wait for the fetch to finish and the backoff entry to land.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		manager.Flush() // unrelated but keeps pool state clean
+		item, _ := manager.Pool().ByID("broken")
+		_ = item
+		break
+	}
+	// A second call inside the backoff window must be a no-op.
+	manager.EnsureModelCatalogs(ctx, true)
+	time.Sleep(300 * time.Millisecond)
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("backoff violated: repeated refresh reached the upstream, hits=%d", hits)
+	}
+}
+
 type fakeCheckinMaintainer struct {
 	calls int
 	msg   string

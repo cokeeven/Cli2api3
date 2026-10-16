@@ -35,6 +35,13 @@ type hostBinaryUpdater interface {
 	RestartHost()
 }
 
+// preservationReporter is implemented by an applier that can copy the live
+// database aside before an explicit rollback restore. The service surfaces the
+// location so the console can show that the newest data was kept.
+type preservationReporter interface {
+	LastPreservedDatabase() string
+}
+
 type Config struct {
 	SocketPath    string
 	ListenAddress string
@@ -358,6 +365,12 @@ func (s *Service) updateState(jobID, state, message string, finished bool) {
 	}
 	s.status.State = state
 	s.status.Error = message
+	// An explicit rollback that restored the old database records where the
+	// post-upgrade database was preserved, so the operator can see the newest
+	// data still exists.
+	if reporter, ok := s.applier.(preservationReporter); ok {
+		s.status.PreservedDatabasePath = reporter.LastPreservedDatabase()
+	}
 	if finished {
 		s.status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	}

@@ -96,20 +96,33 @@ func (m *Manager) refreshOne(ctx context.Context, item Item, forceQuota bool) er
 }
 
 func (m *Manager) refreshInProcess(ctx context.Context, item Item) error {
+	m.mu.Lock()
+	epoch := m.accountEpoch[item.ID]
+	m.mu.Unlock()
+	return m.refreshInProcessAt(ctx, item, epoch)
+}
+
+func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint64) error {
 	adapter, ok := m.providers.Get(item.Provider)
 	if !ok || adapter.Prober == nil {
 		// No prober registered: leave pool state alone and never hit ""+/health.
 		return nil
 	}
 	health, err := adapter.Prober.Probe(ctx, item.ID)
+	m.mu.Lock()
+	if ctx.Err() != nil || m.runCtx.Err() != nil || m.accountEpoch[item.ID] != epoch {
+		m.mu.Unlock()
+		return ctx.Err()
+	}
 	if err != nil {
 		m.pool.MergeHealth(item.ID, false, false, 0, item.Restarts, err.Error())
 		_ = m.store.Observe(ctx, item.ID, "", "error", err.Error(), KindUnavailable)
+		m.mu.Unlock()
 		return fmt.Errorf("probe account %s: %w", item.ID, err)
 	}
 	m.pool.MergeHealth(item.ID, health.Ready, health.Hot, health.InFlight, item.Restarts, health.LastError)
 	if health.Ready || health.Hot {
-		m.resetRestartBackoff(item.ID)
+		delete(m.restartBackoff, item.ID)
 	}
 	status := "login_required"
 	if health.Ready || health.Hot {
@@ -118,15 +131,21 @@ func (m *Manager) refreshInProcess(ctx context.Context, item Item) error {
 		status = "error"
 	}
 	if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, ""); err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	if health.Ready || health.Hot {
+		m.maintenanceDone.Add(1)
+		m.mu.Unlock()
 		go func(accountID string, prober providers.AccountProber) {
+			defer m.maintenanceDone.Done()
 			quotaCtx, cancel := context.WithTimeout(m.runCtx, 5*time.Second)
 			defer cancel()
-			m.fetchProviderQuota(quotaCtx, accountID, prober)
+			m.fetchProviderQuota(quotaCtx, accountID, prober, epoch)
 		}(item.ID, adapter.Prober)
 		m.fetchAccountModels(ctx, item)
+	} else {
+		m.mu.Unlock()
 	}
 	return nil
 }

@@ -39,6 +39,11 @@ func (a *Accounts) PollLogin(ctx context.Context, id string) (bool, string, erro
 	if err != nil {
 		return done, message, operationError("login_poll_failed", err.Error())
 	}
+	if done {
+		if err := a.startAfterLogin(ctx, id); err != nil {
+			return false, "", err
+		}
+	}
 	return done, message, nil
 }
 func (a *Accounts) CompleteLogin(ctx context.Context, id, callback string) error {
@@ -53,7 +58,21 @@ func (a *Accounts) CompleteLogin(ctx context.Context, id, callback string) error
 	if err := completer.CompleteLogin(ctx, id, callback); err != nil {
 		return operationError("login_callback_failed", err.Error())
 	}
-	return nil
+	return a.startAfterLogin(ctx, id)
+}
+
+// Browser login finishes after Create has already attempted a credential
+// probe. Re-enter the runtime start path so the newly saved credentials are
+// verified immediately; a deliberately disabled account remains disabled.
+func (a *Accounts) startAfterLogin(ctx context.Context, id string) error {
+	account, err := a.GetStored(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !account.Enabled {
+		return nil
+	}
+	return a.runtime.StartAccount(ctx, account)
 }
 
 // LoginPAT stores a pasted provider-native token for an in-process account whose

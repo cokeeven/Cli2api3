@@ -29,12 +29,24 @@ go test -race ./...
 go vet ./...
 
 # Qoder child runtime
-(cd worker && npm ci && npm test)
+(cd worker && npm ci && npm audit && npm test)
 
-# Console
-(cd frontend && npm ci && npm run build && npm run lint)
+# Console (npm test runs the pure-logic tests the frontend job also runs in CI)
+(cd frontend && npm ci && npm test && npm run lint && npm run build)
 git diff --check
 ```
+
+`go test -race` needs a C compiler (cgo); on a host without one, record that the
+race run was skipped rather than claiming it passed.
+
+The console's pure-logic tests live in `frontend/tests/*.test.mjs`, import the
+TypeScript sources directly, and run through `node --test
+--experimental-strip-types`. Add a case there when a change fixes a wizard or
+policy behaviour that would otherwise only be covered by hand.
+
+The Qoder worker pins `undici` in `worker/package.json`. Keep `npm audit` clean:
+the pin is exact, so a security fix means a new exact version in the same major
+plus a worker test run.
 
 After frontend changes, run `npm run sync` to update the static assets embedded by Go:
 
@@ -54,7 +66,7 @@ docker compose up -d --build
 
 ## Maintainer release
 
-Do not create or push version tags by hand. The tag, GitHub Release, updater assets, and GHCR image aliases all come from one serialized `workflow_dispatch` on `main`.
+Do not create or push version tags by hand. The tag, GitHub Release, updater assets, and GHCR image aliases all come from the serialized Release workflow on `main`.
 
 ### Before you run it
 
@@ -69,6 +81,13 @@ gh workflow run release.yml --ref main
 
 You can also use **Actions → Release → Run workflow**.
 
+When maintaining through the GitHub Git API without a local authenticated CLI,
+an explicitly authorized commit on `main` whose message starts with
+`release: publish` requests the same pipeline with a patch bump. Ordinary
+pushes skip publishing. The pipeline still waits for CI on that exact commit,
+then creates and verifies the draft, updater assets, and images before making
+the release public. Use `workflow_dispatch` for a minor or major bump.
+
 The workflow calculates the next patch from the latest published stable release, creates an invisible draft, builds six checksum-verified updater binaries plus `cli2api-updater_checksums.txt`, publishes `linux/amd64` + `linux/arm64` images, then makes the GitHub Release latest and moves `latest` / series aliases. Console update checks ignore drafts, so a failed pre-publication run stays invisible.
 
 ### After it publishes
@@ -82,7 +101,7 @@ If required checks do not start on the bot PR (the default Actions token cannot 
 If this checkout cannot switch to `main` because another worktree already has it, merge with the GitHub API instead of `git checkout main`:
 
 ```bash
-gh api -X PUT repos/caigee-cmd/cli2api/pulls/<n>/merge -f merge_method=merge
+gh api -X PUT repos/cokeeven/ali2api3/pulls/<n>/merge -f merge_method=merge
 ```
 
 Expected artifacts for a published tag:
@@ -90,6 +109,6 @@ Expected artifacts for a published tag:
 | Kind | Names |
 |------|--------|
 | GitHub Release assets (7) | six `cli2api-updater_{os}_{arch}` binaries and `cli2api-updater_checksums.txt` |
-| GHCR (`ghcr.io/caigee-cmd/cli2api`) | `v0.x.y`, `0.x.y`, series (`0.2`), `latest`, all the same multi-arch digest |
+| GHCR (`ghcr.io/cokeeven/ali2api3`) | `v0.x.y`, `0.x.y`, series (`0.2`), `latest`, all the same multi-arch digest |
 
 If a **pre-publication** job fails (`prepare` / `assets` / `draft` / `image` / `promote`), use **Re-run failed jobs** on the same run. The draft remains unpublished. Do not create the tag locally while that draft exists.

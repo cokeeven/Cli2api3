@@ -331,7 +331,7 @@ func TestStoreListsUpdatesAndDeletesAccounts(t *testing.T) {
 	}
 }
 
-func TestStoreDefaultsDropSystemPromptOn(t *testing.T) {
+func TestStoreDefaultsPreserveWorkBuddyCallerInstructions(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
 	if err != nil {
@@ -342,19 +342,48 @@ func TestStoreDefaultsDropSystemPromptOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !account.DropSystemPrompt {
-		t.Fatalf("new account must default to dropping system prompts: %+v", account)
+	if account.DropSystemPrompt {
+		t.Fatalf("new account must preserve caller instructions: %+v", account)
 	}
 	reloaded, err := store.Get(ctx, account.ID)
-	if err != nil || !reloaded.DropSystemPrompt {
+	if err != nil || reloaded.DropSystemPrompt {
 		t.Fatalf("reloaded=%+v err=%v", reloaded, err)
 	}
-	if err := store.Update(ctx, account.ID, accounts.UpdateAccount{DropSystemPrompt: boolPtr(false)}); err != nil {
+	if err := store.Update(ctx, account.ID, accounts.UpdateAccount{DropSystemPrompt: boolPtr(true)}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.Get(ctx, account.ID)
-	if err != nil || updated.DropSystemPrompt {
+	if err != nil || !updated.DropSystemPrompt {
 		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+}
+
+// Caller instructions are preserved by default across the supported regions.
+func TestStoreDefaultsPreserveSystemPromptOutsideWorkBuddy(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, tc := range []struct{ name, provider, region string }{
+		{"workbuddy-cn", "workbuddy", "cn"},
+		{"workbuddy-global", "workbuddy", "global"},
+		{"trae", "trae", "cn"},
+		{"qoder", "qoder", "global"},
+		{"qoder-cn", "qoder", "cn"},
+	} {
+		account, err := store.Create(ctx, accounts.CreateAccount{Name: tc.name, Provider: tc.provider, Region: tc.region})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if account.DropSystemPrompt {
+			t.Fatalf("%s new account must default to preserving system prompts: %+v", tc.name, account)
+		}
+		reloaded, err := store.Get(ctx, account.ID)
+		if err != nil || reloaded.DropSystemPrompt {
+			t.Fatalf("%s reloaded=%+v err=%v", tc.name, reloaded, err)
+		}
 	}
 }
 

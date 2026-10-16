@@ -55,6 +55,39 @@ func TestCheckerDisablesDevelopmentBuilds(t *testing.T) {
 	}
 }
 
+// A managed build whose repository has not published any stable release is
+// not "up to date": the console needs an explicit count to tell the two
+// apart, and drafts/prereleases/non-semver tags must not count.
+func TestCheckerReportsPublishedReleaseCount(t *testing.T) {
+	empty := NewChecker("v0.1.0", &releaseSourceStub{})
+	info, err := empty.Check(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Managed || info.HasUpdate || info.PublishedReleases != 0 {
+		t.Fatalf("info=%+v", info)
+	}
+
+	mixed := NewChecker("v0.1.0", &releaseSourceStub{releases: []Release{
+		{TagName: "v0.1.0"},
+		{TagName: "v0.1.1", Draft: true},
+		{TagName: "v0.1.2", Prerelease: true},
+		{TagName: "nightly"},
+		{TagName: "v0.1.0"}, // duplicate tag listing
+		{TagName: "0.1.3"},  // parseable without the v prefix
+	}})
+	counted, err := mixed.Check(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counted.PublishedReleases != 2 {
+		t.Fatalf("published=%d want 2 (info=%+v)", counted.PublishedReleases, counted)
+	}
+	if !counted.HasUpdate || counted.NextVersion != "v0.1.3" {
+		t.Fatalf("info=%+v", counted)
+	}
+}
+
 func TestCheckerForceCheckDoesNotUseStaleRelease(t *testing.T) {
 	source := &releaseSourceStub{releases: []Release{{TagName: "v0.2.2"}}}
 	checker := NewChecker("v0.2.1", source)

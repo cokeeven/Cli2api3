@@ -19,8 +19,13 @@ type Info struct {
 	HasUpdate        bool      `json:"has_update"`
 	Managed          bool      `json:"managed"`
 	Cached           bool      `json:"cached"`
-	Warning          string    `json:"warning,omitempty"`
-	Release          *Release  `json:"release,omitempty"`
+	// PublishedReleases counts the stable releases this repository has
+	// published. Zero means the source is reachable but no release exists
+	// yet, which the console must show as "no release published" instead of
+	// "up to date".
+	PublishedReleases int      `json:"published_releases"`
+	Warning           string   `json:"warning,omitempty"`
+	Release           *Release `json:"release,omitempty"`
 }
 
 type Checker struct {
@@ -68,6 +73,7 @@ func (c *Checker) Check(ctx context.Context, force bool) (Info, error) {
 		return Info{}, err
 	}
 	info := Info{CurrentVersion: currentVersion, Managed: true}
+	info.PublishedReleases = CountStableReleases(releases)
 	if next, ok := SelectNextRelease(currentVersion, releases); ok {
 		info.HasUpdate = true
 		info.NextVersion = next.TagName

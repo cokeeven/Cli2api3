@@ -274,6 +274,43 @@ func TestInProcessKeepSystemPromptWhenFlagOff(t *testing.T) {
 	}
 }
 
+// Trae passes caller messages straight through (no upstream screening and no
+// leading-system requirement), so a default account must keep system and
+// developer instructions. Only an explicitly-enabled DropSystemPrompt strips.
+func TestInProcessTraeDefaultKeepsSystemPrompt(t *testing.T) {
+	registry := providers.NewRegistry()
+	ex := NewChatExecutor(NewPool(nil, nil), "")
+	ex.Providers = registry
+
+	cases := []struct {
+		name             string
+		dropSystemPrompt bool
+	}{
+		{"default", false},
+		{"explicit-drop", true},
+	}
+	for _, tc := range cases {
+		pool := NewPool(nil, nil)
+		pool.Upsert(Item{ID: "trae1", Provider: "trae", Runtime: "in_process", DropSystemPrompt: tc.dropSystemPrompt})
+		fake := &systemObservingChat{}
+		registry.Register(providers.Adapter{ID: "trae", Chat: fake})
+		ex.Pool = pool
+		_, err := ex.ChatNonStream(context.Background(), translate.ChatRequest{
+			Model: "claude-sonnet-4", Messages: []translate.ChatMessage{
+				{Role: "system", Content: "keep me"},
+				{Role: "developer", Content: "keep me too"},
+				{Role: "user", Content: "hi"},
+			},
+		}, "", "trae")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if len(fake.sawSystem) != 1 || fake.sawSystem[0] != !tc.dropSystemPrompt {
+			t.Fatalf("%s: sawSystem=%v want system=%v", tc.name, fake.sawSystem, !tc.dropSystemPrompt)
+		}
+	}
+}
+
 type contentRejectedChat struct {
 	calls int
 }

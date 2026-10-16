@@ -18,9 +18,17 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 		}
-		if s.updater().Maintenance.Load() && appupdate.BlocksDuringUpdate(r.URL.Path) {
-			writeErr(w, http.StatusServiceUnavailable, "service_updating", "Service update in progress")
-			return
+		// Count served business traffic so an upgrade can wait for in-flight
+		// requests to finish before it snapshots the database. The update
+		// endpoints and /health stay outside the count: they are how the
+		// upgrade itself observes progress, so counting them would make the
+		// upgrade wait on its own status polling.
+		if appupdate.BlocksDuringUpdate(r.URL.Path) {
+			if !s.admitRequest() {
+				writeErr(w, http.StatusServiceUnavailable, "service_updating", "Service update in progress")
+				return
+			}
+			defer s.finishRequest()
 		}
 		s.mux.ServeHTTP(w, r)
 	})

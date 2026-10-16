@@ -3,14 +3,17 @@ package runtime_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/executor"
 	accountruntime "github.com/caigee-cmd/cli2api/internal/runtime"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"testing"
-	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
@@ -64,18 +67,35 @@ type fakeProber struct {
 	probeN    int
 	quotaN    int
 	quotaDone chan struct{}
-	err       error
+	quotaOnce sync.Once
+	// probeErrNext makes the next Probe call fail once (credential not yet
+	// usable), then subsequent probes succeed. Guards restart-state tests.
+	probeErrNext int32
+	err          error
+	mu           sync.Mutex
 }
 
 func (f *fakeProber) Probe(ctx context.Context, accountID string) (providers.AccountHealth, error) {
+	f.mu.Lock()
 	f.probeN++
-	return f.health, f.err
+	failNext := f.err
+	if f.probeErrNext > 0 {
+		f.probeErrNext--
+		failNext = fmt.Errorf("probe failure %s", accountID)
+	}
+	f.mu.Unlock()
+	if failNext != nil {
+		return providers.AccountHealth{}, failNext
+	}
+	return f.health, nil
 }
 
 func (f *fakeProber) Quota(ctx context.Context, accountID string) (*providers.QuotaInfo, error) {
+	f.mu.Lock()
 	f.quotaN++
+	f.mu.Unlock()
 	if f.quotaDone != nil {
-		close(f.quotaDone)
+		f.quotaOnce.Do(func() { close(f.quotaDone) })
 	}
 	return f.quota, nil
 }
@@ -147,18 +167,77 @@ func TestManagerRefreshUsesInProcessProber(t *testing.T) {
 	if updated.Status != "ready" || updated.RemoteUID != "wb-uid" || updated.LastError != "" {
 		t.Fatalf("store account = %+v", updated)
 	}
+	// ---- restart state contract ----
+	// A "real restart" (stop + start, e.g. re-enable or max_inflight change)
+	// must reset the account to not-ready until a probe verifies it again:
+	//   1. before the probe completes, the account is NOT routable;
+	//   2. after a successful probe, it is routable again;
+	//   3. after a failed probe, it stays unroutable;
+	//   4. the previous quota snapshot survives the restart.
+	//
+	// A repeated pool upsert on its own does not reset readiness (nil Ready
+	// inherits the live value), so an already-verified account is not bounced
+	// by catalog or cooldown merges.
+	prober.mu.Lock()
+	prober.probeErrNext = 1 // next probe (fired by TestStartAccount) fails
+	prober.mu.Unlock()
 	if err := manager.TestStartAccount(ctx, updated); err != nil {
 		t.Fatal(err)
 	}
+	// 4. quota survives the restart upsert.
 	item, _ = manager.Pool().ByID(account.ID)
 	if item.Quota == nil || item.Quota.Remaining != 900 {
 		t.Fatalf("in-process upsert cleared quota: %+v", item.Quota)
+	}
+	// 1. wait for the start-probe to complete (it fails), then assert
+	// the account stayed out of scheduling and quota was kept.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		prober.mu.Lock()
+		calls := prober.probeN
+		prober.mu.Unlock()
+		if calls >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restart did not trigger a probe, probeN=%d", calls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	item, _ = manager.Pool().ByID(account.ID)
+	if item.Ready == nil || *item.Ready {
+		t.Fatalf("account must stay not-ready after a failed probe: %+v", item)
+	}
+	if item.Quota == nil || item.Quota.Remaining != 900 {
+		t.Fatalf("failed probe must keep the quota snapshot: %+v", item.Quota)
 	}
 	views, err := manager.Accounts(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(views) != 1 || !views[0].Ready || !views[0].Hot || views[0].Quota == nil || views[0].LastError != "" {
+	if len(views) != 1 || views[0].Ready || views[0].Quota == nil {
+		t.Fatalf("console view must show unverified account as not ready: %+v", views[0])
+	}
+	// 2. a later successful probe re-enables scheduling.
+	if err := manager.RefreshAll(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		item, _ = manager.Pool().ByID(account.ID)
+		if item.Ready != nil && *item.Ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("successful probe must restore readiness: %+v", item)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	views, err = manager.Accounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || !views[0].Ready || !views[0].Hot || views[0].Quota == nil {
 		t.Fatalf("view = %+v", views[0])
 	}
 }

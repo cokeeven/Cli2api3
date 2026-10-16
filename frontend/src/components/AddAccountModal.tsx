@@ -10,6 +10,7 @@ import { FilterToggle } from '@/components/ui/FilterToggle'
 import { FormRow } from '@/components/ui/FormRow'
 import { OptionTiles } from '@/components/ui/OptionTiles'
 import { useI18n } from '@/hooks/useI18n'
+import { createLoginDelay, pollLogin } from '@/lib/loginPoll'
 import {
   createAccount,
   fetchLoginStatus,
@@ -136,7 +137,7 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
   const [name, setName] = useState('')
   const [maxInFlight, setMaxInFlight] = useState(4)
   const [priority, setPriority] = useState(50)
-  const [dropSystemPrompt, setDropSystemPrompt] = useState(true)
+  const [dropSystemPrompt, setDropSystemPrompt] = useState(false)
   const [proxyUrl, setProxyUrl] = useState('')
   const [pat, setPat] = useState('')
   const [json, setJson] = useState('')
@@ -151,18 +152,28 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
   const [callbackUrl, setCallbackUrl] = useState('')
   const stepBody = useRef<HTMLDivElement>(null)
   const createdId = useRef<string>('')
-  const pollTimer = useRef<number | null>(null)
+  const pollDelay = useRef<ReturnType<typeof createLoginDelay> | null>(null)
+  // loginSession identifies the current login attempt. A stale async result
+  // (a poll that resolved after the operator cancelled, retried, or switched
+  // to the paste-callback tab) is discarded instead of completing or failing
+  // the newer attempt.
+  const loginSession = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
 
   function stopPolling() {
-    if (pollTimer.current !== null) {
-      window.clearTimeout(pollTimer.current)
-      pollTimer.current = null
-    }
+    pollDelay.current?.cancel()
+  }
+
+  // cancelLogin abandons the in-flight login attempt: the poll loop's next
+  // tick observes the generation change (or the cleared timer) and exits
+  // without touching phase state, and a late async result is discarded.
+  function cancelLogin() {
+    loginSession.current += 1
+    stopPolling()
   }
 
   useEffect(() => {
-    return () => stopPolling()
+    return () => cancelLogin()
   }, [])
 
   useEffect(() => {
@@ -193,7 +204,7 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
   // Command Code has no browser login (a pasted user_… key is the only auth),
   // so the wizard opens on the PAT tab instead of the browser tab.
   const hasBrowserLogin = activeOption?.descriptor.capabilities?.browser_login !== false
-  const showDropSystem = activeOption?.provider === 'workbuddy'
+  const showDropSystem = activeOption?.provider === 'workbuddy' || activeOption?.provider === 'trae'
   const showCallbackPaste = activeOption?.provider === 'trae' || activeOption?.provider === 'devin' || activeOption?.provider === 'codex'
   const busy = phase === 'busy' || phase === 'polling'
   const settingsLocked = Boolean(createdId.current) || busy
@@ -224,16 +235,18 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
   }
 
   function accountOptions() {
+    // Caller instructions are separate from the provider client's own prompt.
+    const providerDefault = false
     return {
       max_inflight: parsedMaxInFlight(),
       priority: parsedPriority(),
-      drop_system_prompt: showDropSystem ? dropSystemPrompt : true,
+      drop_system_prompt: showDropSystem ? dropSystemPrompt : providerDefault,
       proxy_url: proxyUrl.trim(),
     }
   }
 
   function reset() {
-    stopPolling()
+    cancelLogin()
     setStep('method')
     setTab('browser')
     setAccountType('')
@@ -242,7 +255,7 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
     setName('')
     setMaxInFlight(4)
     setPriority(50)
-    setDropSystemPrompt(true)
+    setDropSystemPrompt(false)
     setProxyUrl('')
     setPat('')
     setJson('')
@@ -260,7 +273,11 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
   }
 
   function close() {
-    if (busy) return
+    if (phase === 'busy') return
+    // Polling is a client-side wait: the operator may abort it (cancel login)
+    // and close. Any in-flight network result for the cancelled session is
+    // discarded by the generation check in runBrowser/runCallback/runPat.
+    if (phase === 'polling') cancelLogin()
     reset()
     onClose()
   }
@@ -293,6 +310,8 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
     if (busy || !typesReady) return
     const option = providerOptions.find((item) => item.id === next)
     setAccountType(next)
+    // Dropping caller instructions is an explicit compatibility opt-in.
+    setDropSystemPrompt(false)
     setTab(option?.provider === 'zhipu' ? 'pat' : 'browser')
     setMessage('')
     setStep('login')
@@ -309,33 +328,51 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
     return id
   }
 
+  // waitPollInterval resolves after POLL_INTERVAL. When the attempt is
+  // cancelled (timer cleared), it resolves immediately with cancelled=true so
+  // the poll loop exits instead of awaiting a timer that will never fire.
+  async function waitPollInterval(session: number): Promise<boolean> {
+    pollDelay.current ??= createLoginDelay()
+    const alive = await pollDelay.current.wait(POLL_INTERVAL)
+    return alive && loginSession.current === session
+  }
+
   async function runBrowser() {
     setMessage('')
     setAuthUrl('')
+    const session = ++loginSession.current
+    stopPolling()
     try {
       setPhase('busy')
       const id = await ensureAccount()
+      if (loginSession.current !== session) return
       setMessage(t('wizardStartingSession'))
       setPhase('polling')
       const output = await startDeviceLogin(id)
+      if (loginSession.current !== session) return
       if (output.authUrl) {
         setAuthUrl(output.authUrl)
       }
       setMessage(t('wizardWaitingBrowser'))
-      for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
-        await new Promise((resolve) => { pollTimer.current = window.setTimeout(resolve, POLL_INTERVAL) })
-        const status = await fetchLoginStatus(id)
-        const login = status.login || {}
-        if (login.message) setMessage(login.message)
-        if (login.status === 'ok') break
-        if (login.status === 'error') throw new Error(login.message || 'login failed')
-        if (attempt === POLL_ATTEMPTS - 1) throw new Error(t('wizardLoginTimeout'))
-      }
+      const outcome = await pollLogin({
+        attempts: POLL_ATTEMPTS,
+        sleep: () => waitPollInterval(session),
+        fetchStatus: () => fetchLoginStatus(id),
+        isCancelled: () => loginSession.current !== session,
+        onMessage: setMessage,
+        timeoutMessage: t('wizardLoginTimeout'),
+      })
+      // A superseded attempt (cancelled, retried, or completed through a
+      // pasted callback) must not touch this wizard's state.
+      if (loginSession.current !== session || outcome.kind === 'cancelled') return
+      if (outcome.kind === 'error') throw new Error(outcome.message)
       setPhase('done')
       setMessage(t('wizardAccountReady'))
       onAdded()
       window.setTimeout(finishAndClose, 900)
     } catch (error) {
+      if (loginSession.current !== session) return
+      stopPolling()
       setPhase('idle')
       setMessage(error instanceof Error ? error.message : String(error))
     }
@@ -347,17 +384,27 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
       setMessage(t('wizardCallbackPh'))
       return
     }
+    // Abandon any in-flight browser-login poll: the pasted callback is the
+    // authoritative result of that same login, so a late poll result must not
+    // overwrite this outcome. The old loop exits on the generation change.
+    const session = ++loginSession.current
+    stopPolling()
     try {
       setPhase('busy')
       const id = await ensureAccount()
-      stopPolling()
+      if (loginSession.current !== session) return
       await completeLoginCallback(id, pasted)
+      if (loginSession.current !== session) return
       setPhase('done')
       setMessage(t('wizardAccountReady'))
       onAdded()
       window.setTimeout(finishAndClose, 900)
     } catch (error) {
-      setPhase('polling')
+      if (loginSession.current !== session) return
+      // Failure recovery: nothing is polling anymore (the poll was cancelled
+      // above), so return to the editable state — not 'polling' — so the
+      // operator can retry, re-login, or close the modal.
+      setPhase('idle')
       setMessage(error instanceof Error ? error.message : String(error))
     }
   }
@@ -399,16 +446,21 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
     const token = pat.trim()
     if (!token) { setMessage(t('pastePatFirst')); return }
     setMessage('')
+    const session = ++loginSession.current
+    stopPolling()
     try {
       setPhase('busy')
       const id = await ensureAccount()
+      if (loginSession.current !== session) return
       setMessage(t('wizardStartingSession'))
       await loginWithPat(token, id)
+      if (loginSession.current !== session) return
       setPhase('done')
       setMessage(t('patDone'))
       onAdded()
       window.setTimeout(finishAndClose, 700)
     } catch (error) {
+      if (loginSession.current !== session) return
       setPhase('idle')
       setMessage(error instanceof Error ? error.message : String(error))
     }
@@ -505,7 +557,7 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
 
   return (
     <Modal.Root isOpen={isOpen} onOpenChange={(next: boolean) => { if (!next) close() }}>
-      <Modal.Backdrop variant="blur" isDismissable={!busy}>
+      <Modal.Backdrop variant="blur" isDismissable={phase !== 'busy'}>
         <Modal.Container size="lg" scroll="inside" className="sm:max-w-4xl">
           <Modal.Dialog>
             <Modal.Header className="relative items-center justify-center px-12 pt-5 text-center">
@@ -515,7 +567,7 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
                   {step === 'method' ? t('addAccountDesc') : (hint || t('addAccountDesc'))}
                 </p>
               </div>
-              <Modal.CloseTrigger aria-label={t('close')} className="absolute right-4 top-4 grid size-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-surface-secondary hover:text-foreground"><X size={16} /></Modal.CloseTrigger>
+              <Modal.CloseTrigger aria-label={t('close')} isDisabled={phase === 'busy'} className="absolute right-4 top-4 grid size-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-surface-secondary hover:text-foreground"><X size={16} /></Modal.CloseTrigger>
             </Modal.Header>
             <Modal.Body className="px-6 pb-2">
               <div ref={stepBody}>
@@ -780,7 +832,9 @@ export function AddAccountModal({ isOpen, onClose, onAdded }: Props) {
               </div>
             </Modal.Body>
             <Modal.Footer className="justify-end px-5 pb-5">
-              <Button variant="ghost" onPress={close} isDisabled={busy}>{t('cancel')}</Button>
+              {/* Polling is cancellable (client-side wait); only a request
+                  mid-flight (busy) keeps the button disabled. */}
+              <Button variant="ghost" onPress={close} isDisabled={phase === 'busy'}>{t('cancel')}</Button>
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>

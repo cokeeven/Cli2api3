@@ -51,6 +51,9 @@ export function SystemPage() {
   const [now, setNow] = useState(() => Date.now())
   const [initialVersion, setInitialVersion] = useState('')
   const [restoreTarget, setRestoreTarget] = useState('')
+  // Tracks whether the last version check actually succeeded. A failed check
+  // must never be rendered as "up to date".
+  const [checkFailed, setCheckFailed] = useState(false)
 
   const load = useCallback(async (force = false, quiet = false) => {
     if (force && !quiet) setChecking(true)
@@ -58,6 +61,9 @@ export function SystemPage() {
       const result = await fetchSystemUpdate(force)
       setInfo(result)
       setInitialVersion((current) => current || result.current_version || '')
+      // A managed build that carries a warning fell back to a cached or empty
+      // listing because the release source was unreachable.
+      setCheckFailed(Boolean(result.managed && result.warning))
       const failed = result.update?.state === 'failed' || result.update?.state === 'rolled_back' || result.agent?.state === 'failed' || result.agent?.state === 'rolled_back'
       if (failed) {
         setError(result.update?.error || result.agent?.error || t('updateFailedHint'))
@@ -65,6 +71,7 @@ export function SystemPage() {
         setError('')
       }
     } catch (err) {
+      setCheckFailed(true)
       if (!quiet) setError(err instanceof Error ? err.message : t('updateCheckFailedHint'))
     } finally {
       setLoading(false)
@@ -138,6 +145,17 @@ export function SystemPage() {
     [info?.current_version, info?.next_version, info?.release, info?.recent_releases, info?.rollback_versions],
   )
   const rollbackTags = useMemo(() => (info?.rollback_versions || []).map((release) => release.tag_name), [info?.rollback_versions])
+  // Version status must never overstate what the check knows: a development
+  // build, a failed check, and a repository with no published release are all
+  // distinct from "up to date".
+  const versionStatus = useMemo(() => {
+    if (checkFailed) return { key: 'updateStatusCheckFailed' as const, color: 'warning' as const, hint: t('updateStatusCheckFailedHint') }
+    if (info && !info.managed) return { key: 'updateStatusDevBuild' as const, color: 'default' as const, hint: t('updateStatusDevBuildHint') }
+    if (info?.has_update) return { key: 'updateAvailable' as const, color: 'warning' as const, hint: t('updateStatusAvailableHint', { version: info.next_version || '' }) }
+    if (info && (info.published_releases ?? 0) === 0) return { key: 'updateStatusNoRelease' as const, color: 'default' as const, hint: t('updateStatusNoReleaseHint') }
+    if (info) return { key: 'upToDate' as const, color: 'success' as const, hint: t('updateStatusUpToDateHint') }
+    return { key: 'updateStatusUnknown' as const, color: 'default' as const, hint: t('updateStatusUnknownHint') }
+  }, [checkFailed, info, t])
   const primaryLabel = reloadIn != null
     ? t('updateReloadingIn', { seconds: reloadIn })
     : canApply
@@ -186,12 +204,12 @@ export function SystemPage() {
     }
   }
 
-  async function rollbackTo(version: string) {
+  async function rollbackTo(version: string, restoreOldDatabase = false) {
     setSubmitting(true)
     setStarted(null)
     setError('')
     try {
-      const result = await rollbackSystemUpdate(version)
+      const result = await rollbackSystemUpdate(version, restoreOldDatabase)
       setStarted(result)
       await load(false, true)
     } catch (err) {
@@ -309,11 +327,17 @@ export function SystemPage() {
           <div className="flex items-center justify-between gap-3 border-b border-separator px-5 py-4">
             <div>
               <h3 className="font-semibold tracking-[-0.015em]">{t('versionUpdate')}</h3>
-              <p className="mt-0.5 text-xs text-muted">{t('latestVersionHint')}</p>
+              <p className="mt-0.5 text-xs text-muted">{versionStatus.hint}</p>
             </div>
-            <Chip size="sm" variant="soft" color={info?.has_update ? 'warning' : 'success'}>
-              {info?.has_update ? t('updateAvailable') : t('upToDate')}
-            </Chip>
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <Chip size="sm" variant="soft" color={versionStatus.color}>{t(versionStatus.key)}</Chip>
+              {/* The updater connection is a separate fact from the version
+                  check: a dev build with a connected updater, or a released
+                  build with no daemon, must both read correctly. */}
+              <Chip size="sm" variant="soft" color={info?.agent?.available ? 'success' : 'warning'}>
+                {info?.agent?.available ? t('updateStatusUpdaterConnected') : t('updateStatusUpdaterDisconnected')}
+              </Chip>
+            </div>
           </div>
 
           <div className="px-5 py-5">
@@ -344,6 +368,12 @@ export function SystemPage() {
             </div>
             {!info?.agent?.available && !busy ? <p className="mt-3 text-right text-xs text-muted">{t('updateUnavailableHint')}</p> : null}
             {info?.agent?.available && !info.agent.staged_update && !busy ? <p className="mt-3 text-right text-xs text-muted">{t('updateLegacyOneShotHint')}</p> : null}
+            {info?.update?.preserved_database_path ? (
+              <p className="mt-3 rounded-lg border border-success/25 bg-success/5 px-3 py-2 text-[11px] leading-5 text-muted">
+                {t('rollbackPreservedDatabase', { path: info.update.preserved_database_path })}
+              </p>
+            ) : null}
+            {info?.update?.drain_timed_out ? <p className="mt-3 text-[11px] leading-5 text-warning">{t('updateDrainTimedOut')}</p> : null}
             {readyToApply || busy || reloadIn != null || justUpdated ? (
               <div className={`mt-4 rounded-lg border px-3 py-3 ${readyToApply || justUpdated ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5'}`} role="status" aria-live="polite">
                 {updateStateText ? <p className="text-xs font-medium text-foreground">{updateStateText}{targetVersion ? ` · ${targetVersion}` : ''}{elapsed ? ` · ${t('updateElapsed', { seconds: elapsed })}` : ''}</p> : null}

@@ -21,6 +21,8 @@ export type UpdatePreparationStatus = {
   current_version?: string
   target_version?: string
   backup_path?: string
+  preserved_database_path?: string
+  drain_timed_out?: boolean
   error?: string
   started_at?: string
   finished_at?: string
@@ -47,6 +49,7 @@ export type SystemUpdateInfo = {
   has_update: boolean
   managed: boolean
   cached: boolean
+  published_releases?: number
   warning?: string
   release?: {
     tag_name: string
@@ -119,8 +122,11 @@ export function cancelSystemUpdate() {
   return api<{ ok: boolean }>('/api/system/update/cancel', { method: 'POST', body: '{}' })
 }
 
-export function rollbackSystemUpdate(version: string) {
-  return api<StartUpdateResult>('/api/system/update/rollback', { method: 'POST', body: JSON.stringify({ version }) })
+export function rollbackSystemUpdate(version: string, restoreDatabase = false) {
+  return api<StartUpdateResult>('/api/system/update/rollback', {
+    method: 'POST',
+    body: JSON.stringify(restoreDatabase ? { version, restore_database: true } : { version }),
+  })
 }
 
 export type SystemResources = {

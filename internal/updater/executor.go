@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	control "github.com/caigee-cmd/cli2api/internal/update"
@@ -37,6 +39,9 @@ type Executor struct {
 	client   *http.Client
 	download *http.Client
 	fetch    func(context.Context, string, string) ([]byte, error)
+
+	preserveMu        sync.Mutex
+	preservedDatabase string
 }
 
 type commandRunner interface {
@@ -83,7 +88,7 @@ func NewExecutor(config ExecutorConfig) *Executor {
 		config.ContainerName = "qoder-api-proxy"
 	}
 	if config.ImageRepository == "" {
-		config.ImageRepository = "ghcr.io/caigee-cmd/cli2api"
+		config.ImageRepository = "ghcr.io/cokeeven/ali2api3"
 	}
 	if config.HealthURL == "" {
 		config.HealthURL = "http://127.0.0.1:3010/health"
@@ -92,7 +97,7 @@ func NewExecutor(config ExecutorConfig) *Executor {
 		config.HealthTimeout = 120 * time.Second
 	}
 	if strings.TrimSpace(config.GitHubRepo) == "" {
-		config.GitHubRepo = "caigee-cmd/cli2api"
+		config.GitHubRepo = "cokeeven/ali2api3"
 	}
 	return &Executor{
 		config:   config,
@@ -121,6 +126,7 @@ func (e *Executor) Prepare(ctx context.Context, _ string, request control.Prepar
 }
 
 func (e *Executor) Apply(ctx context.Context, _ string, request ApplyRequest, progress func(string)) (bool, error) {
+	e.setPreservedDatabase("")
 	if err := e.validateConfig(); err != nil {
 		return false, err
 	}
@@ -209,10 +215,23 @@ func (e *Executor) rollback(request ApplyRequest, before containerInspect, mount
 	if err := e.compose(ctx, "stop", e.config.ServiceName); err != nil {
 		return false, rollbackFailed(cause, err)
 	}
-	if err := setEnvValueAtomic(e.config.EnvFile, envMode, "CLI2API_IMAGE", currentImage); err != nil {
-		return false, rollbackFailed(cause, err)
+	// Program-only rollback preserves all current data. Append-only migration
+	// files do not guarantee backward-compatible schemas; health checks must
+	// confirm that the previous program can actually run. Replacing
+	// the database is an explicit operator choice, and even then the
+	// post-upgrade database is preserved first — if that preservation cannot
+	// be proven, the rollback stops instead of overwriting newer data.
+	if request.RestoreDatabase {
+		preservedPath, err := e.preserveDatabase(ctx, mount, currentImage, request)
+		if err != nil {
+			return false, rollbackFailed(cause, fmt.Errorf("preserve post-upgrade database before restore: %w", err))
+		}
+		e.setPreservedDatabase(preservedPath)
+		if err := e.restoreSQLite(ctx, mount, currentImage, request.BackupPath); err != nil {
+			return false, rollbackFailed(cause, err)
+		}
 	}
-	if err := e.restoreSQLite(ctx, mount, currentImage, request.BackupPath); err != nil {
+	if err := setEnvValueAtomic(e.config.EnvFile, envMode, "CLI2API_IMAGE", currentImage); err != nil {
 		return false, rollbackFailed(cause, err)
 	}
 	if err := e.compose(ctx, "up", "-d", "--no-deps", "--force-recreate", e.config.ServiceName); err != nil {
@@ -235,12 +254,109 @@ func rollbackFailed(cause, rollbackErr error) error {
 	return fmt.Errorf("update failed: %v; rollback failed: %w", cause, rollbackErr)
 }
 
+// verifyBackupExists proves the pre-upgrade snapshot is usable before the
+// upgrade touches anything: the file must exist and be non-empty, its
+// integrity manifest must accompany it, and the recorded SHA-256 must match
+// the file. A missing or mismatched record stops the upgrade instead of
+// proceeding on an unverifiable backup. The record is written by the app when
+// it takes the snapshot (see store.Backup).
 func (e *Executor) verifyBackupExists(ctx context.Context, mount dataMount, image, backupPath string) error {
-	_, err := e.runner.Run(ctx, "docker", "run", "--rm", "-v", dockerMountArg(mount), "-e", "BACKUP_PATH="+backupPath, "--entrypoint", "/bin/sh", image, "-c", `test -f "$BACKUP_PATH"`)
+	script := `set -eu
+test -n "$BACKUP_PATH"
+test -f "$BACKUP_PATH"
+test -s "$BACKUP_PATH"
+MANIFEST="$BACKUP_PATH.manifest.json"
+test -f "$MANIFEST"
+recorded="$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$MANIFEST" | head -n 1 | tr 'A-F' 'a-f')"
+test -n "$recorded"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$BACKUP_PATH" | awk '{print $1}' | tr 'A-F' 'a-f')"
+else
+  actual="$(node -e 'const c=require("crypto"),f=require("fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$BACKUP_PATH")"
+fi
+test "$recorded" = "$actual"
+`
+	_, err := e.runner.Run(ctx, "docker", "run", "--rm", "-v", dockerMountArg(mount), "-e", "BACKUP_PATH="+backupPath, "--entrypoint", "/bin/sh", image, "-c", script)
 	if err != nil {
-		return fmt.Errorf("verify sqlite backup exists: %w", err)
+		return fmt.Errorf("verify sqlite backup integrity: %w", err)
 	}
 	return nil
+}
+
+// preserveDatabase copies the live database aside before an explicit rollback
+// restore overwrites it, and refuses to report success unless the copy is
+// byte-identical, non-empty, and hashed. The updater must abort the rollback
+// when this fails, because the post-upgrade data would otherwise be lost.
+func (e *Executor) preserveDatabase(ctx context.Context, mount dataMount, image string, request ApplyRequest) (string, error) {
+	name := fmt.Sprintf("qoder-pre-rollback-%s-%s.db", sanitizeVersion(request.TargetVersion), time.Now().UTC().Format("20060102T150405.000000000Z"))
+	target := path.Join("/data/backups", name)
+	script := `set -eu
+SRC=/data/qoder.db
+DEST="$PRESERVE_PATH"
+test -f "$SRC"
+test -s "$SRC"
+mkdir -p /data/backups
+# The service is stopped, but a killed SQLite writer may leave committed data
+# in WAL or a rollback journal. Keep the recoverable set, not just qoder.db.
+# SHM is an index and SQLite can rebuild it from the preserved WAL.
+for suffix in '' -wal -journal; do
+  test -f "$SRC$suffix" || continue
+  test ! -e "$DEST$suffix"
+  test ! -e "$DEST$suffix.sha256"
+  cp "$SRC$suffix" "$DEST$suffix"
+  chmod 600 "$DEST$suffix"
+  cmp "$SRC$suffix" "$DEST$suffix"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$DEST$suffix" | awk '{print $1}' | tr 'A-F' 'a-f' > "$DEST$suffix.sha256"
+  else
+    node -e 'const c=require("crypto"),f=require("fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$DEST$suffix" > "$DEST$suffix.sha256"
+  fi
+  chmod 600 "$DEST$suffix.sha256"
+  test -s "$DEST$suffix.sha256"
+done
+sync`
+	_, err := e.runner.Run(ctx, "docker", "run", "--rm", "-v", dockerMountArg(mount), "-e", "PRESERVE_PATH="+target, "--entrypoint", "/bin/sh", image, "-c", script)
+	if err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func sanitizeVersion(version string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, version)
+	cleaned = strings.Trim(cleaned, "-")
+	if cleaned == "" {
+		return "unknown"
+	}
+	return cleaned
+}
+
+func (e *Executor) setPreservedDatabase(path string) {
+	if e == nil {
+		return
+	}
+	e.preserveMu.Lock()
+	e.preservedDatabase = path
+	e.preserveMu.Unlock()
+}
+
+// LastPreservedDatabase reports where the most recent explicit rollback stored
+// the post-upgrade database, so the console can tell the operator that the
+// newest data still exists.
+func (e *Executor) LastPreservedDatabase() string {
+	if e == nil {
+		return ""
+	}
+	e.preserveMu.Lock()
+	defer e.preserveMu.Unlock()
+	return e.preservedDatabase
 }
 
 func (e *Executor) restoreSQLite(ctx context.Context, mount dataMount, image, backupPath string) error {

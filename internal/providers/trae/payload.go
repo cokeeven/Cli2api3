@@ -30,6 +30,11 @@ func PrepareBody(src []byte, fn string) []byte {
 				continue
 			}
 			role, _ := m["role"].(string)
+			if strings.EqualFold(role, "developer") {
+				// Trae's legacy chat protocol has no developer role. Preserve
+				// caller instructions using its supported system role.
+				m["role"] = "system"
+			}
 			if strings.EqualFold(role, "assistant") {
 				if tcs, ok := m["tool_calls"].([]any); ok {
 					kept := make([]any, 0, len(tcs))

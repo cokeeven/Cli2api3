@@ -7,8 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test:account-state": "node --test tests/account-daily-tasks.test.mjs",
-    "test:usage-policy": "node --test tests/usage-policy.test.mjs",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:account-state": "node --experimental-strip-types --test tests/account-daily-tasks.test.mjs",
+    "test:usage-policy": "node --experimental-strip-types --test tests/usage-policy.test.mjs",
+    "test:login-poll": "node --experimental-strip-types --test tests/login-poll.test.mjs",
     "preview": "vite preview",
     "sync": "npm run build && node ./scripts/sync-static.mjs"
   },

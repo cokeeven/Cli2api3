@@ -22,7 +22,7 @@ function timeLabel(value?: string | number) {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
 }
 
-export function AccountUsageModal({ account, t, onClose }: { account: AccountRow; t: Translate; onClose: () => void }) {
+export function AccountUsageModal({ account, guardrails, t, onClose }: { account: AccountRow; guardrails?: { token_bound: boolean; credit_bound: boolean; note?: string }; t: Translate; onClose: () => void }) {
   const [usage, setUsage] = useState<AccountUsage | null>(null)
   const [policy, setPolicy] = useState<AccountUsagePolicy>(EMPTY_POLICY)
   const [models, setModels] = useState<ModelTokenLimit[]>([])
@@ -187,6 +187,23 @@ export function AccountUsageModal({ account, t, onClose }: { account: AccountRow
                 <Button size="sm" variant="secondary" isDisabled={loading || saving || !usage} onPress={() => changeModels([...models, { model: '', tokens: 10000 }])}><Plus size={14} />{t('usageAddModel')}</Button>
               </section>
               <FormRow label={t('usagePreferExpiring')} hint={t('usagePreferExpiringHint')}><CompactSwitch isSelected={policy.prefer_expiring} isDisabled={loading || saving || !usage} ariaLabel={t('usagePreferExpiring')} onChange={(value) => changePolicy({ ...policy, prefer_expiring: value })} /></FormRow>
+              {/* Which guards this platform can actually enforce. The credit
+                  guards need a trusted absolute per-request cost, which none of
+                  the supported platforms report (their price text is a
+                  multiplier), so a paid request is refused rather than priced
+                  as zero. */}
+              <section className="space-y-2 rounded-lg border border-separator px-3 py-2.5" aria-label={t('usageGuardSupport')}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-muted">{t('usageGuardSupport')}</span>
+                  <Chip size="sm" variant="soft" color={guardrails?.token_bound ? 'success' : 'warning'}>
+                    {t('usageGuardTokenBound', { state: guardrails?.token_bound ? t('usageGuardSupported') : t('usageGuardUnsupported') })}
+                  </Chip>
+                  <Chip size="sm" variant="soft" color={guardrails?.credit_bound ? 'success' : 'warning'}>
+                    {t('usageGuardCreditBound', { state: guardrails?.credit_bound ? t('usageGuardSupported') : t('usageGuardUnsupported') })}
+                  </Chip>
+                </div>
+                <p className="text-[11px] leading-5 text-muted">{guardrails?.note || t('usageGuardNoteFallback')}</p>
+              </section>
               <p className="text-xs leading-5 text-muted">{t('usageCostGuardHint')}</p>
             </Form>
           </Modal.Body>

@@ -6,30 +6,58 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
 )
 
+// maxConcurrentModelFetches bounds simultaneous upstream catalog fetches for
+// the whole process, shared by every EnsureModelCatalogs call.
+const maxConcurrentModelFetches = 4
+
 // Per-account catalog snapshots on Pool items. Qoder uses worker /admin/models;
 // in-process providers use adapter.Models(). Does not merge with API display cache.
 
-const modelCatalogTTL = 5 * time.Minute
+const (
+	modelCatalogTTL = 5 * time.Minute
+	// modelCatalogBackoff caps how soon a failed account is retried, so one
+	// unreachable upstream cannot be hammered at the callers' pace.
+	modelCatalogBackoff = 30 * time.Second
+)
+
+// catalogRefreshState tracks the shared, process-wide catalog refresh
+// machinery on the Manager. The semaphore and per-account inflight map are
+// shared across every EnsureModelCatalogs call, so N concurrent callers
+// still bound total upstream catalog traffic to maxConcurrentModelFetches
+// and each account is fetched at most once at a time.
+type catalogRefreshState struct {
+	sem      chan struct{}
+	mu       sync.Mutex
+	running  map[string]bool
+	failures map[string]time.Time
+}
 
 // EnsureModelCatalogs refreshes per-account catalogs that are missing or
 // older than the worker TTL. Failures leave the previous snapshot in place
 // and never flip readiness or cooldown.
 //
-// Refreshes run concurrently in the background with a bounded semaphore so
-// the first chat request is never blocked by N serial 15-second timeouts
-// when multiple accounts are offline. The caller returns immediately; a
-// nil Models slice means unknown (fail open) until the background refresh
-// completes and subsequent requests use the fresh catalog.
+// Concurrency contract:
+//   - the semaphore is shared on the Manager, so concurrent calls never
+//     multiply the number of simultaneous upstream fetches;
+//   - an account already being refreshed is skipped (per-account dedup);
+//   - an account that failed recently is skipped for modelCatalogBackoff
+//     instead of being retried on every request.
+//
+// The caller returns immediately; a nil Models slice means unknown (fail
+// open) until the background refresh completes and subsequent requests use
+// the fresh catalog.
 func (m *Manager) EnsureModelCatalogs(ctx context.Context, force bool) {
 	if m == nil || m.pool == nil {
 		return
 	}
+	state := m.catalogRefresh()
 	now := time.Now()
 	var stale []Item
 	for _, item := range m.pool.Items() {
@@ -41,33 +69,99 @@ func (m *Manager) EnsureModelCatalogs(ctx context.Context, force bool) {
 	if len(stale) == 0 {
 		return
 	}
-	// Fire background refreshes concurrently with a bounded semaphore.
-	// Use m.runCtx so refreshes survive the caller's request context and
-	// are canceled only on shutdown.
+	// Fire background refreshes concurrently with the bounded shared
+	// semaphore. Use m.runCtx so refreshes survive the caller's request
+	// context and are canceled only on shutdown.
 	if ctx.Err() != nil {
 		return // caller context already cancelled — no point firing goroutines
 	}
-	const maxConcurrent = 4
-	sem := make(chan struct{}, maxConcurrent)
 	for _, item := range stale {
-		go func(it Item) {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-				m.fetchAccountModels(m.runCtx, it)
-			case <-m.runCtx.Done():
-			}
-		}(item)
+		m.startCatalogRefresh(state, item)
 	}
 }
 
-func (m *Manager) fetchAccountModels(ctx context.Context, item Item) {
-	if m == nil || m.pool == nil || item.ID == "" {
+// catalogRefresh lazily creates the shared refresh state. Managers built by
+// NewManager have it pre-created; zero-value Managers (tests) get it on
+// first use.
+func (m *Manager) catalogRefresh() *catalogRefreshState {
+	m.catalogOnce.Do(func() {
+		if m.catalog == nil {
+			m.catalog = &catalogRefreshState{
+				sem:      make(chan struct{}, maxConcurrentModelFetches),
+				running:  map[string]bool{},
+				failures: map[string]time.Time{},
+			}
+		}
+	})
+	return m.catalog
+}
+
+// startCatalogRefresh deduplicates per account and applies failure backoff.
+// It never blocks: when the account is already refreshing or in backoff, the
+// call returns without scheduling anything.
+func (m *Manager) startCatalogRefresh(state *catalogRefreshState, item Item) {
+	if item.ID == "" {
 		return
 	}
-	if item.Runtime == string(providers.RuntimeInProcess) || strings.TrimSpace(item.URL) == "" {
-		m.fetchProviderModels(ctx, item)
+	state.mu.Lock()
+	if state.running[item.ID] {
+		state.mu.Unlock()
 		return
+	}
+	if until, ok := state.failures[item.ID]; ok {
+		if time.Now().Before(until) {
+			state.mu.Unlock()
+			return
+		}
+		delete(state.failures, item.ID)
+	}
+	state.running[item.ID] = true
+	state.mu.Unlock()
+
+	// Serialize task registration with Close's cancellation and Wait.
+	m.mu.Lock()
+	if m.runCtx.Err() != nil {
+		m.mu.Unlock()
+		state.mu.Lock()
+		delete(state.running, item.ID)
+		state.mu.Unlock()
+		return
+	}
+	m.maintenanceDone.Add(1)
+	m.mu.Unlock()
+	go func(it Item) {
+		defer m.maintenanceDone.Done()
+		defer func() {
+			state.mu.Lock()
+			delete(state.running, it.ID)
+			state.mu.Unlock()
+		}()
+		select {
+		case state.sem <- struct{}{}:
+			defer func() { <-state.sem }()
+		case <-m.runCtx.Done():
+			return
+		}
+		if !m.fetchAccountModels(m.runCtx, it) {
+			// Refresh failed upstream; back off so request-paced callers
+			// cannot hammer one broken account on every call.
+			state.mu.Lock()
+			state.failures[it.ID] = time.Now().Add(modelCatalogBackoff)
+			state.mu.Unlock()
+		}
+	}(item)
+}
+
+// fetchAccountModels fetches one account's catalog and merges it into the
+// pool. It reports whether the upstream fetch succeeded; a nil adapter or
+// unsupported provider reports true (nothing failed — there is just nothing
+// to fetch), so only real upstream errors engage backoff.
+func (m *Manager) fetchAccountModels(ctx context.Context, item Item) bool {
+	if m == nil || m.pool == nil || item.ID == "" {
+		return true
+	}
+	if item.Runtime == string(providers.RuntimeInProcess) || strings.TrimSpace(item.URL) == "" {
+		return m.fetchProviderModels(ctx, item)
 	}
 	if adapter, ok := m.providers.Get(item.Provider); ok && adapter.Models != nil {
 		models, err := adapter.Models.Models(ctx, item.ID)
@@ -82,12 +176,12 @@ func (m *Manager) fetchAccountModels(ctx context.Context, item Item) {
 			default:
 				log.Printf("catalog refresh failed account=%s provider=%s stage=decode: %v", item.ID, item.Provider, err)
 			}
-			return
+			return false
 		}
 		m.pool.MergeModelsWithPricing(item.ID, qoder.CatalogIDsFromInfos(models), qoder.FreeCatalogIDsFromInfos(models))
 		m.pool.MergeNativeModels(item.ID, qoder.NativeCatalogIDsFromInfos(models))
 		m.mergeModelOutputLimits(item.ID, models)
-		return
+		return true
 	}
 	client := qoder.WorkerClient{
 		HTTP:        &http.Client{Timeout: 15 * time.Second},
@@ -96,9 +190,10 @@ func (m *Manager) fetchAccountModels(ctx context.Context, item Item) {
 	entries, status, rawBody, err := client.Models(ctx, item.URL, false)
 	if err != nil || status >= 300 {
 		m.logCatalogRefresh(item, status, rawBody, err)
-		return
+		return false
 	}
 	m.pool.MergeModels(item.ID, qoder.CatalogIDs(entries, nil))
+	return true
 }
 
 func (m *Manager) logCatalogRefresh(item Item, status int, rawBody string, err error) {
@@ -122,21 +217,25 @@ func (m *Manager) logCatalogRefresh(item Item, status int, rawBody string, err e
 	}
 }
 
-func (m *Manager) fetchProviderModels(ctx context.Context, item Item) {
+// fetchProviderModels fetches the catalog for an in-process provider account
+// and reports whether the upstream fetch succeeded. Unsupported providers
+// (no adapter, no Models capability, or in-process qoder stubs) report true:
+// nothing failed, so no backoff is engaged.
+func (m *Manager) fetchProviderModels(ctx context.Context, item Item) bool {
 	if m.providers == nil {
-		return
+		return true
 	}
 	if strings.EqualFold(strings.TrimSpace(item.Provider), "qoder") {
-		return
+		return true
 	}
 	adapter, ok := m.providers.Get(item.Provider)
 	if !ok || adapter.Models == nil {
-		return
+		return true
 	}
 	models, err := adapter.Models.Models(ctx, item.ID)
 	if err != nil {
 		log.Printf("catalog fetch failed account=%s provider=%s: %v", item.ID, item.Provider, err)
-		return
+		return false
 	}
 	ids := make([]string, 0, len(models)*2)
 	for _, model := range models {
@@ -144,6 +243,7 @@ func (m *Manager) fetchProviderModels(ctx context.Context, item Item) {
 	}
 	m.pool.MergeModels(item.ID, ids)
 	m.mergeFreeModels(item.ID, models)
+	return true
 }
 
 func (m *Manager) mergeFreeModels(accountID string, models []providers.ModelInfo) {

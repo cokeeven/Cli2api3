@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -487,6 +488,7 @@ func applyUsage(out *providers.ChatOutcome, raw json.RawMessage) {
 func collectUpstream(r io.Reader) (upstreamFrame, error) {
 	var frame upstreamFrame
 	var content, reasoning strings.Builder
+	toolsByIndex := map[int]map[string]any{}
 	err := walkUpstream(r, func(body map[string]any) error {
 		if errText, status, kind := upstreamError(body); errText != "" {
 			frame.errText = errText
@@ -523,15 +525,65 @@ func collectUpstream(r io.Reader) (upstreamFrame, error) {
 		if text, _ := part["reasoning_content"].(string); text != "" {
 			reasoning.WriteString(text)
 		}
-		if tools := part["tool_calls"]; tools != nil {
-			raw, _ := json.Marshal(tools)
-			frame.tools = raw
+		if tools, ok := part["tool_calls"].([]any); ok {
+			if delta == nil && len(tools) > 0 {
+				// A full message is a snapshot, not another argument fragment.
+				toolsByIndex = map[int]map[string]any{}
+			}
+			mergeDirectToolCalls(toolsByIndex, tools)
 		}
 		return nil
 	})
 	frame.content = content.String()
 	frame.reasoning = reasoning.String()
+	if len(toolsByIndex) > 0 {
+		indices := make([]int, 0, len(toolsByIndex))
+		for index := range toolsByIndex {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		calls := make([]any, 0, len(indices))
+		for _, index := range indices {
+			calls = append(calls, toolsByIndex[index])
+		}
+		frame.tools, _ = json.Marshal(calls)
+	}
 	return frame, err
+}
+
+// COSY sends OpenAI tool-call deltas: later frames may contain only a suffix
+// of arguments and empty identity fields. Preserve the first identity and
+// assemble each call separately instead of retaining only the final frame.
+func mergeDirectToolCalls(merged map[int]map[string]any, deltas []any) {
+	for position, item := range deltas {
+		delta, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		index := position
+		if value, ok := delta["index"].(float64); ok {
+			index = int(value)
+		}
+		call := merged[index]
+		if call == nil {
+			call = map[string]any{"type": "function", "function": map[string]any{}}
+			merged[index] = call
+		}
+		for _, key := range []string{"id", "type"} {
+			if value, ok := delta[key].(string); ok && value != "" {
+				call[key] = value
+			}
+		}
+		if fn, ok := delta["function"].(map[string]any); ok {
+			function := call["function"].(map[string]any)
+			for _, key := range []string{"name", "arguments"} {
+				if value, ok := fn[key].(string); ok && value != "" {
+					previous, _ := function[key].(string)
+					function[key] = previous + value
+				}
+			}
+		}
+	}
 }
 
 func upstreamError(body map[string]any) (string, int, string) {

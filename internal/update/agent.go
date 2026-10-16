@@ -22,6 +22,10 @@ type ApplyRequest struct {
 	TargetVersion  string `json:"target_version"`
 	BackupPath     string `json:"backup_path"`
 	SkipPull       bool   `json:"skip_pull,omitempty"`
+	// RestoreDatabase opts into host recovery after a failed apply. It does
+	// not select a historical snapshot for a manual version rollback. The
+	// current database and WAL must be preserved before replacing them.
+	RestoreDatabase bool `json:"restore_database,omitempty"`
 }
 
 type ApplyResponse struct {
@@ -38,9 +42,13 @@ type AgentStatus struct {
 	CurrentVersion  string `json:"current_version,omitempty"`
 	TargetVersion   string `json:"target_version,omitempty"`
 	BackupPath      string `json:"backup_path,omitempty"`
-	Error           string `json:"error,omitempty"`
-	StartedAt       string `json:"started_at,omitempty"`
-	FinishedAt      string `json:"finished_at,omitempty"`
+	// PreservedDatabasePath is where an explicit rollback stored the
+	// post-upgrade database before restoring the snapshot, so the operator can
+	// see that the newest data still exists.
+	PreservedDatabasePath string `json:"preserved_database_path,omitempty"`
+	Error                 string `json:"error,omitempty"`
+	StartedAt             string `json:"started_at,omitempty"`
+	FinishedAt            string `json:"finished_at,omitempty"`
 }
 
 type Agent interface {

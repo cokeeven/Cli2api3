@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -101,6 +102,21 @@ func hasUnboundedMedia(value any) bool {
 	return false
 }
 
+// usageGuardMessage turns a raw guard reason into an operator-facing sentence.
+// The unknown-cost and unknown-token reasons are not plain "limit exceeded"
+// errors: they mean the platform cannot supply a trusted bound for this
+// request, and the guard refuses it rather than treating the cost as zero.
+func usageGuardMessage(reason, provider, model string) string {
+	switch reason {
+	case "credit_upper_bound_unknown":
+		return fmt.Sprintf("usage guard: the %s platform does not report a trusted per-request credit cost for %s, so the configured credit guard (daily_credits/reserve_credits) refuses this paid request instead of assuming zero cost; disable that guard for this account or rely on a token guard", provider, model)
+	case "daily_tokens", "model_daily_tokens":
+		return fmt.Sprintf("usage guard: %s cannot bound the token count for this %s request (no usable max_tokens or an unbounded attachment), so the token guard refuses it; set max_tokens or shorten the request", provider, model)
+	default:
+		return "usage guard: " + reason
+	}
+}
+
 func (l *routeLoop) reserve(e ChatExecutor, item Item) error {
 	if e.Budgets == nil {
 		return nil
@@ -122,13 +138,19 @@ func (l *routeLoop) reserve(e ChatExecutor, item Item) error {
 	if l.native {
 		reservation.EstimatedTokens = -1
 	}
+	// CreditUpperBound stays nil on purpose. No supported platform exposes a
+	// trusted absolute per-request credit cost: the catalog "credits" values
+	// are multipliers ("x1.4") or price labels, and a balance difference is a
+	// measurement of the past, not a bound on the next request. Inventing a
+	// bound from either would let a credit guard admit a request it cannot
+	// price, so the store denies it as credit_upper_bound_unknown instead.
 	if err := e.Budgets.ReserveUsage(l.ctx, reservation); err != nil {
 		classified := Classified{Kind: accounts.KindUnavailable, Status: 503, Code: "usage_budget_unavailable", Type: "api_error", Message: "usage budget storage is unavailable"}
 		var guard *accounts.UsageGuardError
 		if errors.As(err, &guard) {
 			classified.Kind = accounts.KindRateLimit
 			classified.Status = 429
-			classified.Message = err.Error()
+			classified.Message = usageGuardMessage(guard.Reason, itemProvider(item), routeModel(l.request.Model))
 			classified.Code = "usage_guard_" + guard.Reason
 			if !guard.ResetAt.IsZero() {
 				classified.RetryAfter = time.Until(guard.ResetAt)

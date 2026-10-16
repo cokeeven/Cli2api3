@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
@@ -56,15 +57,49 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 		return err
 	}
 	if descriptor.Runtime == providers.RuntimeInProcess {
+		m.mu.Lock()
 		if m.runCtx.Err() != nil {
+			m.mu.Unlock()
 			return errManagerClosed
 		}
+		if m.accountEpoch == nil {
+			m.accountEpoch = make(map[string]uint64)
+		}
+		m.accountEpoch[account.ID]++
+		epoch := m.accountEpoch[account.ID]
+		// In-process accounts start unauthenticated until the provider probe
+		// flips Ready. A nil Ready pointer is treated as ready by routing, so
+		// an account whose credentials have not been verified yet must be
+		// upserted with an explicit false to stay out of request scheduling
+		// and out of the console's available list.
+		notReady := false
 		m.pool.Upsert(Item{
 			ID: account.ID, Provider: descriptor.ID, Region: account.ProviderRegion,
 			Runtime: string(descriptor.Runtime), DropSystemPrompt: account.DropSystemPrompt,
 			Weight: NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
-			RuntimeState: "starting",
+			Ready: &notReady, Hot: &notReady, RuntimeState: "starting",
 		})
+		// Verify credentials immediately so a login / import / re-enable
+		// flips Ready (and refreshes quota + model catalog) as soon as the
+		// probe succeeds, instead of waiting for the next maintenance sweep.
+		// Tracked by maintenanceDone so Manager.Close drains an in-flight
+		// probe instead of racing it; probeCtx derives from runCtx, so a
+		// shutdown cancels it. A stale result (account removed mid-probe) is
+		// ignored by the epoch check, including a rapid stop/re-enable.
+		if m.providers != nil {
+			m.maintenanceDone.Add(1)
+			m.mu.Unlock()
+			go func(id string) {
+				defer m.maintenanceDone.Done()
+				probeCtx, cancel := context.WithTimeout(m.runCtx, 30*time.Second)
+				defer cancel()
+				if item, ok := m.pool.ByID(id); ok {
+					_ = m.refreshInProcessAt(probeCtx, item, epoch)
+				}
+			}(account.ID)
+		} else {
+			m.mu.Unlock()
+		}
 		return nil
 	}
 	m.mu.Lock()
@@ -278,10 +313,14 @@ func (m *Manager) SyncCredential(ctx context.Context, id, authType string) error
 
 func (m *Manager) stopAccount(id string) error {
 	m.mu.Lock()
+	if m.accountEpoch == nil {
+		m.accountEpoch = make(map[string]uint64)
+	}
+	m.accountEpoch[id]++
 	process := m.processes[id]
 	delete(m.processes, id)
-	m.mu.Unlock()
 	m.pool.Remove(id)
+	m.mu.Unlock()
 	if process == nil {
 		return nil
 	}

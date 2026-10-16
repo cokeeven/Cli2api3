@@ -5,15 +5,63 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/caigee-cmd/cli2api/internal/accounts"
+
 	_ "modernc.org/sqlite"
 )
+
+func TestVerifyBackupRejectsMismatchedSchemaMetadata(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	backup, err := s.Backup(ctx, t.TempDir(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := s.VerifyBackup(ctx, backup.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.SchemaCount++
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup.Path+backupManifestSuffix, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyBackup(ctx, backup.Path); err == nil {
+		t.Fatal("mismatched schema metadata accepted")
+	}
+}
+
+func TestBackupPruningRetainsPostUpgradeRecoverySet(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"qoder-old.db", "qoder-new.db", "qoder-pre-rollback-v1.db", "qoder-pre-rollback-v1.db-wal", "qoder-pre-rollback-v1.db.sha256"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pruneSQLiteBackups(dir, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"qoder-pre-rollback-v1.db", "qoder-pre-rollback-v1.db-wal", "qoder-pre-rollback-v1.db.sha256"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("recovery data pruned: %s: %v", name, err)
+		}
+	}
+}
 
 func TestStoreBackupCreatesConsistentSQLiteSnapshot(t *testing.T) {
 	ctx := context.Background()
@@ -70,6 +118,139 @@ func TestStoreBackupCreatesConsistentSQLiteSnapshot(t *testing.T) {
 	}
 	if secret != "secret-value" {
 		t.Fatalf("secret = %q", secret)
+	}
+}
+
+// Every snapshot must carry an integrity checksum and the schema state it was
+// taken at, so a restore can prove what it is about to put back instead of
+// trusting a filename.
+func TestStoreBackupWritesVerifiableManifest(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := OpenStore(filepath.Join(root, "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Create(ctx, accounts.CreateAccount{Name: "Primary", Provider: "trae", Region: "cn", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	backup, err := store.Backup(ctx, filepath.Join(root, "backups"), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.VerifyBackup(ctx, backup.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SHA256 == "" || manifest.IntegrityCheck != "ok" || manifest.SizeBytes <= 0 {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	if manifest.Name != backup.Name {
+		t.Fatalf("manifest name %q want %q", manifest.Name, backup.Name)
+	}
+	if manifest.SchemaMigration == "" || manifest.SchemaChecksum == "" || manifest.SchemaCount != len(sqliteMigrations) {
+		t.Fatalf("manifest must record the snapshot schema state: %+v", manifest)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
+		t.Fatalf("created_at = %q: %v", manifest.CreatedAt, err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(backup.Path + backupManifestSuffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("manifest mode = %o, want 600", info.Mode().Perm())
+		}
+	}
+
+	// A tampered snapshot must fail verification instead of being restored.
+	file, err := os.OpenFile(backup.Path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("tamper")); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.VerifyBackup(ctx, backup.Path); err == nil {
+		t.Fatal("tampered snapshot must fail verification")
+	}
+}
+
+// A snapshot published without its manifest record (the shape older builds
+// wrote) must be rejected by the restore path.
+func TestStoreVerifyBackupWithoutManifestFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := OpenStore(filepath.Join(root, "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backup, err := store.Backup(ctx, filepath.Join(root, "backups"), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(backup.Path + backupManifestSuffix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.VerifyBackup(ctx, backup.Path); err == nil {
+		t.Fatal("a snapshot without an integrity record must not verify")
+	}
+}
+
+// Pruning must take the manifest with its snapshot and drop orphaned records,
+// so a later restore can never pair a record with the wrong file.
+func TestStoreBackupPruneRemovesManifestsAndOrphans(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	directory := filepath.Join(root, "backups")
+	store, err := OpenStore(filepath.Join(root, "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 3; i++ {
+		if _, err := store.Backup(ctx, directory, 2); err != nil {
+			t.Fatal(err)
+		}
+		// Keep the modification times distinct enough for the newest-first
+		// prune to be deterministic on coarse filesystems.
+		time.Sleep(20 * time.Millisecond)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots, manifests := 0, 0
+	for _, entry := range entries {
+		switch {
+		case strings.HasSuffix(entry.Name(), backupManifestSuffix):
+			manifests++
+		case strings.HasSuffix(entry.Name(), ".db"):
+			snapshots++
+		}
+	}
+	if snapshots != 2 || manifests != 2 {
+		t.Fatalf("snapshots=%d manifests=%d, want 2 each", snapshots, manifests)
+	}
+	// An orphan manifest (snapshot already gone) is cleaned up on the next prune.
+	orphan := filepath.Join(directory, "qoder-20000101T000000.000000000Z.db"+backupManifestSuffix)
+	if err := os.WriteFile(orphan, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Backup(ctx, directory, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan manifest survived pruning: %v", err)
 	}
 }
 

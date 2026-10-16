@@ -20,6 +20,11 @@ func (a *App) newUpdateCoordinator(checker appupdate.ReleaseChecker, agent appup
 	if a.Control != nil && a.Control.Backup != nil {
 		coord.Backup = a.Control.Backup.Snapshot
 	}
+	// Drain in-flight business before the pre-upgrade snapshot. The HTTP
+	// server owns the request count; a nil HTTP (tests) simply skips it.
+	if a.HTTP != nil {
+		coord.Drain = a.HTTP.Drain
+	}
 	return coord
 }
 

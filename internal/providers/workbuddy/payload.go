@@ -18,6 +18,7 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	body["stream"] = true
+	normalizeInstructionRoles(body)
 	normalizeToolChoice(body)
 	normalizeTools(body)
 	dropEmptyTools(body)
@@ -29,6 +30,22 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	return out
+}
+
+// WorkBuddy's legacy chat API supports system instructions, not the newer
+// developer role. Keep caller text and message order while adapting the role.
+func normalizeInstructionRoles(body map[string]any) {
+	messages, _ := body["messages"].([]any)
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if strings.EqualFold(strings.TrimSpace(role), "developer") {
+			message["role"] = "system"
+		}
+	}
 }
 
 func normalizeTools(body map[string]any) {

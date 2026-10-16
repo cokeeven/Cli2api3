@@ -219,18 +219,34 @@ Scheduled Task; both Docker Desktop platforms use an authenticated updater bound
 to `127.0.0.1` and reached through `host.docker.internal`.
 
 In **System**, download the latest stable update, then confirm installation.
-Confirmation pauses new API traffic, creates a SQLite snapshot, and replaces
-the container. Active connections may be interrupted; clients should retry.
-Development builds without a semantic version cannot use managed updates.
+Confirmation waits for in-flight requests (up to 30 seconds), creates a SQLite
+snapshot, and replaces the container. If draining times out, the update stops
+before backup and replacement. Development builds without a semantic
+version cannot use managed updates.
 
 Updates jump directly to the latest stable release. The console shows skipped
 versions and offers rollback to one of the three previous stable releases.
-If an upgrade fails its health check or updater replacement, the updater restores
-the previous image and pre-update database snapshot. The five most recent
+Every snapshot is published with an integrity manifest that records its SHA-256
+and the schema migrations it contains; an upgrade stops before touching the
+container when that record is missing or does not match. The five most recent
 snapshots are retained in `/data/backups`.
 
-The flow is implemented, but live upgrade / rollback acceptance remains pending.
-Keep a separate database backup before upgrading.
+If an upgrade fails its health check or updater replacement, the updater restores
+the previous image. **Version rollback keeps the current database**. Append-only
+migration files do not guarantee that an older program understands the newer
+schema; health checks must confirm compatibility. The console rejects
+`restore_database: true` because selecting a version does not identify a verified
+historical snapshot. Historical data recovery requires a separate reviewed
+procedure. The host's explicit failure-recovery path preserves the database and
+any WAL/journal files before restoring its supplied snapshot, aborts if that copy
+fails, and excludes preserved recovery sets from routine backup pruning.
+The application and its data live in separate places:
+`/data` is a named volume, and no upgrade path deletes or re-initialises it.
+
+The flow is implemented and covered by isolated tests (backup integrity,
+migration failure, failed start, rollback, rollback after new data, and
+database/config restore); live upgrade / rollback acceptance on a real host
+remains pending. Keep a separate database backup before upgrading.
 
 Keep `deploy/.env` private: Docker Desktop mode stores an updater token there.
 Do not remove `qoder-data` or run `docker compose down -v` unless you intend to

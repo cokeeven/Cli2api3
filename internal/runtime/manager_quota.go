@@ -23,7 +23,7 @@ func (e *QuotaRefreshError) Unwrap() error { return e.Err }
 // Quota snapshots: pool MergeQuota then Store.SaveQuota. Worker JSON is Qoder-only;
 // in-process providers use AccountProber.Quota.
 
-func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prober providers.AccountProber) {
+func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prober providers.AccountProber, expectedEpoch ...uint64) {
 	if prober == nil {
 		return
 	}
@@ -57,6 +57,13 @@ func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prob
 	}
 	if info.ProviderID == "codex" {
 		quota.Plan = strings.TrimSpace(info.Plan)
+	}
+	if len(expectedEpoch) > 0 {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if ctx.Err() != nil || m.runCtx.Err() != nil || m.accountEpoch[accountID] != expectedEpoch[0] {
+			return
+		}
 	}
 	m.persistQuota(ctx, accountID, quota)
 }

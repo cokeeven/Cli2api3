@@ -253,6 +253,80 @@ func TestSystemUpdateInfoSurfacesSucceededAgent(t *testing.T) {
 	}
 }
 
+// A rollback must default to the compatible program-only path: the updater is
+// asked to swap the image back and is NOT asked to overwrite the database
+// with the pre-upgrade snapshot, so nothing written since the upgrade is lost.
+func TestSystemRollbackKeepsNewestDatabaseByDefault(t *testing.T) {
+	dataDir := t.TempDir()
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: dataDir,
+	})
+	defer srv.Close()
+	checker := &updateCheckerStub{info: control.Info{
+		CurrentVersion: "v0.2.2", Managed: true,
+		RollbackVersions: []control.Release{{TagName: "v0.2.1"}},
+	}}
+	agent := &updateAgentStub{
+		status:      control.AgentStatus{Available: true, StagedUpdate: true, State: "idle"},
+		applyCalled: make(chan struct{}),
+	}
+	srv.Update.Checker = checker
+	srv.Update.Agent = agent
+
+	req := httptest.NewRequest(http.MethodPost, "/api/system/update/rollback", strings.NewReader(`{"version":"v0.2.1"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-agent.applyCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rollback was not submitted")
+	}
+	request := agent.requestSnapshot()
+	if request.TargetVersion != "v0.2.1" || request.CurrentVersion != "v0.2.2" {
+		t.Fatalf("request = %+v", request)
+	}
+	if request.RestoreDatabase {
+		t.Fatal("default rollback must not overwrite the live database")
+	}
+}
+
+// A version alone cannot identify a historical database snapshot. Reject the
+// unsupported option rather than reporting a successful restore without one.
+func TestSystemRollbackRejectsUnspecifiedHistoricalDatabaseRestore(t *testing.T) {
+	srv := New(config.Config{
+		Host: "127.0.0.1", Port: 3010, ProxyAPIKey: "secret",
+		QoderHome: t.TempDir(), DataDir: t.TempDir(),
+	})
+	defer srv.Close()
+	srv.Update.Checker = &updateCheckerStub{info: control.Info{
+		CurrentVersion: "v0.2.2", Managed: true,
+		RollbackVersions: []control.Release{{TagName: "v0.2.1"}},
+	}}
+	agent := &updateAgentStub{
+		status:      control.AgentStatus{Available: true, StagedUpdate: true, State: "idle"},
+		applyCalled: make(chan struct{}),
+	}
+	srv.Update.Agent = agent
+
+	req := httptest.NewRequest(http.MethodPost, "/api/system/update/rollback", strings.NewReader(`{"version":"v0.2.1","restore_database":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "database_restore_unavailable") {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-agent.applyCalled:
+		t.Fatal("unsupported restore must not start an update")
+	default:
+	}
+}
+
 func TestSystemUpdateReturnsBeforePreparationCompletes(t *testing.T) {
 	dataDir := t.TempDir()
 	srv := New(config.Config{

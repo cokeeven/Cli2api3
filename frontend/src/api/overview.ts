@@ -174,6 +174,11 @@ export type ProviderDescriptor = {
     browser_login: boolean
     pat_login: boolean
     import_export: boolean
+    guardrails?: {
+      token_bound: boolean
+      credit_bound: boolean
+      note?: string
+    }
   }
   regions: Array<{ id: string; label: string; checkin?: { timezone: string } }>
   default_region: string

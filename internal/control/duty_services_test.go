@@ -48,6 +48,33 @@ type stubLogin struct {
 	completed int
 }
 
+func TestSuccessfulBrowserLoginRestartsEnabledAccountForProbe(t *testing.T) {
+	for _, callback := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			svc, runtime, store, _ := newTestServices()
+			store.accounts["acc-1"] = accounts.Account{ID: "acc-1", Provider: "trae", Enabled: enabled}
+			svc.Accounts.Providers = providers.NewRegistry()
+			svc.Accounts.Providers.Register(providers.Adapter{ID: "trae", Login: &stubLogin{pollDone: true}})
+			var err error
+			if callback {
+				err = svc.Accounts.CompleteLogin(context.Background(), "acc-1", "http://127.0.0.1/callback")
+			} else {
+				_, _, err = svc.Accounts.PollLogin(context.Background(), "acc-1")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if enabled {
+				want = 1
+			}
+			if len(runtime.started) != want {
+				t.Fatalf("callback=%v enabled=%v starts=%v", callback, enabled, runtime.started)
+			}
+		}
+	}
+}
+
 func (s *stubLogin) StartLogin(context.Context, string) (providers.LoginSession, error) {
 	s.started++
 	return s.session, s.startErr

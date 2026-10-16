@@ -58,7 +58,7 @@ export function EditAccountModal({ account, checkinDefaultTime, checkinTimezone,
         priority,
         proxy_url: proxyUrl.trim(),
         checkin_time: checkinDefaultTime !== undefined ? (inheritCheckinTime ? '' : checkinTime ?? checkinDefaultTime) : undefined,
-        drop_system_prompt: account?.provider === 'workbuddy' ? dropSystemPrompt : undefined,
+        drop_system_prompt: (account?.provider === 'workbuddy' || account?.provider === 'trae') ? dropSystemPrompt : undefined,
       })
       onClose()
     } catch (err) {
@@ -152,7 +152,7 @@ export function EditAccountModal({ account, checkinDefaultTime, checkinTimezone,
                     disabled={busy}
                   />
                 </FormRow>
-                {account?.provider === 'workbuddy' ? (
+                {(account?.provider === 'workbuddy' || account?.provider === 'trae') ? (
                   <FormRow label={t('dropSystemPrompt')} hint={t('dropSystemPromptHint')}>
                     <CompactSwitch
                       isSelected={dropSystemPrompt}

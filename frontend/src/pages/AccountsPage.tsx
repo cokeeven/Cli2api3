@@ -447,7 +447,7 @@ export function AccountsPage() {
       {settings?.automation_maintenance_enabled === false ? <PageAlert status="default" title={t('maintenancePaused')} description={t('maintenanceAccountHint')} /> : null}
       <AddAccountModal isOpen={addOpen} onClose={() => setAddOpen(false)} onAdded={() => void reloadAccounts(false)} />
       <AccountModelsModal key={modelsId ?? 'closed'} account={modelsAccount} t={t} onClose={() => setModelsId(null)} />
-      {usageId && accounts.find((account) => account.id === usageId) ? <AccountUsageModal key={usageId} account={accounts.find((account) => account.id === usageId)!} t={t} onClose={() => setUsageId(null)} /> : null}
+      {usageId && accounts.find((account) => account.id === usageId) ? <AccountUsageModal key={usageId} account={accounts.find((account) => account.id === usageId)!} guardrails={providers.find((descriptor) => descriptor.id === accounts.find((account) => account.id === usageId)!.provider)?.capabilities?.guardrails} t={t} onClose={() => setUsageId(null)} /> : null}
       <AccountCheckinRecordsModal key={checkinHistoryId ?? 'closed'} account={checkinHistoryAccount} t={t} onClose={() => setCheckinHistoryId(null)} />
       {dailyHistoryId && accounts.find((account) => account.id === dailyHistoryId) ? <AccountDailyTasksModal key={dailyHistoryId} account={accounts.find((account) => account.id === dailyHistoryId)!} t={t} onClose={() => setDailyHistoryId(null)} /> : null}
       <EditAccountModal

@@ -34,6 +34,17 @@ func DefaultDropSystemPrompt(value *bool) bool {
 	return *value
 }
 
+// DefaultDropSystemPromptForProvider preserves caller instructions by default.
+// Exclude provider-native agent prompts at request construction, rather than
+// deleting caller system/developer messages. Explicit compatibility settings
+// still win, and existing account settings are not rewritten.
+func DefaultDropSystemPromptForProvider(_ string, value *bool) bool {
+	if value != nil {
+		return *value
+	}
+	return false
+}
+
 func DefaultWorkBuddyAutoCheckin(value *bool) bool {
 	if value == nil {
 		return false

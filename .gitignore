@@ -27,7 +27,7 @@ deploy/docker-compose.override.yml
 !.env.example
 data/
 data_*/
-runtime/
+/runtime/
 runtime_*/
 %SystemDrive%/
 *.log

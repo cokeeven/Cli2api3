@@ -61,6 +61,31 @@ type Release struct {
 	Prerelease  bool   `json:"prerelease"`
 }
 
+// CountStableReleases counts the published stable releases in one listing:
+// drafts, prereleases, and tags that are not x.y.z are excluded. The console
+// uses a zero count to say "no release published yet" rather than "up to
+// date", so a repository that has never released is never mislabelled.
+func CountStableReleases(releases []Release) int {
+	seen := map[string]bool{}
+	count := 0
+	for _, release := range releases {
+		if release.Draft || release.Prerelease {
+			continue
+		}
+		version, err := ParseVersion(release.TagName)
+		if err != nil {
+			continue
+		}
+		tag := version.String()
+		if seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		count++
+	}
+	return count
+}
+
 func SelectNextRelease(current string, releases []Release) (Release, bool) {
 	currentVersion, err := ParseVersion(current)
 	if err != nil {

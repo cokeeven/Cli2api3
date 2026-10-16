@@ -215,7 +215,8 @@ docker compose --env-file deploy\.env -f deploy\docker-compose.yml up -d --force
 
 The application container never receives the Docker socket. Linux uses a private
 Unix Socket. macOS runs a per-user LaunchAgent and Windows runs a current-user
-Scheduled Task; both Docker Desktop platforms use an authenticated updater bound
+Scheduled Task (or a current-user Startup entry when task registration is denied);
+both Docker Desktop platforms use an authenticated updater bound
 to `127.0.0.1` and reached through `host.docker.internal`.
 
 In **System**, download the latest stable update, then confirm installation.

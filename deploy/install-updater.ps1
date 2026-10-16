@@ -253,6 +253,13 @@ if ($ExistingTask) {
     }
 }
 try {
+    # A previous installation may use the current-user Startup fallback.
+    # Stop only this installation's executable before replacing its binary.
+    Get-Process -Name "cli2api-updater" -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Path -and [string]::Equals($_.Path, $Binary, [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-Process -Id $_.Id -ErrorAction Stop
+        }
+    }
     Move-Item -Force $CandidateBinary $Binary
 } catch {
     if ($ExistingTask) {
@@ -290,7 +297,7 @@ exit `$LASTEXITCODE
 
 $Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $UserName = $Identity.Name
-$ActionArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Runner`""
+$ActionArguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Runner`""
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $ActionArguments -WorkingDirectory $RootDir
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserName
 $Principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Limited
@@ -299,8 +306,19 @@ $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -
 if ($ExistingTask) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
-Start-ScheduledTask -TaskName $TaskName
+$StartupFile = Join-Path ([Environment]::GetFolderPath("Startup")) (($TaskName -replace '[^a-zA-Z0-9_-]', '-') + ".vbs")
+$StartupFallback = $false
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
+    if (Test-Path -LiteralPath $StartupFile) { Remove-Item -LiteralPath $StartupFile }
+} catch {
+    if ($_.Exception -isnot [UnauthorizedAccessException] -and $_.FullyQualifiedErrorId -notmatch '0x80070005') { throw }
+    $StartupFallback = $true
+    $Launch = ('powershell.exe ' + $ActionArguments).Replace('"', '""')
+    [System.IO.File]::WriteAllText($StartupFile, ('CreateObject("WScript.Shell").Run "' + $Launch + '", 0, False' + "`r`n"), $Encoding)
+    Start-Process -FilePath "powershell.exe" -ArgumentList $ActionArguments -WindowStyle Hidden
+}
 
 $Headers = @{ Authorization = "Bearer $Token" }
 $Ready = $false
@@ -329,6 +347,10 @@ if ($ContainerExists) {
     }
 }
 
-Write-Host "Managed updater installed as the current-user scheduled task '$TaskName'."
+if ($StartupFallback) {
+    Write-Host "Scheduled tasks are restricted; managed updater installed in the current-user Startup folder."
+} else {
+    Write-Host "Managed updater installed as the current-user scheduled task '$TaskName'."
+}
 Write-Host "Recreate qoder-api-proxy once so it can use the updater channel:"
 Write-Host "docker compose --env-file `"$EnvFile`" -f `"$ComposeFile`" up -d --force-recreate $ServiceName"

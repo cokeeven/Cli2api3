@@ -76,6 +76,8 @@ Model:    <model ID from Access or /v1/models>
 | Anthropic Messages | `POST /v1/messages` |
 | Model listing | `GET /v1/models` |
 
+Client model lists return provider-qualified IDs and display names, such as `workbuddy/glm-5.3`, `trae/glm-5.3`, or `qoder/<model>` when present in the provider's catalog. Select a returned ID to pin that provider while retaining account rotation within it. Existing bare-ID calls remain available when the cross-provider model pool is enabled; disabling it requires qualified IDs. Refresh the client's model list after updating the gateway.
+
 Clients execute tools and return their results. Compatibility does not guarantee full official API parity. Account pinning, session headers, platform prefixes and request examples are documented in the [deployment guide](deploy/README.md).
 
 ## Console and accounts

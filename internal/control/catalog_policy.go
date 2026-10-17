@@ -187,6 +187,39 @@ func ProviderModelEntry(model providers.ModelInfo, provider string) map[string]a
 	return entry
 }
 
+// PublicModelCatalog presents provider-qualified IDs to API clients. Keep this
+// projection outside the shared catalog: internal settings and upstream aliases
+// still use their original model IDs, and each provider keeps its own metadata.
+func PublicModelCatalog(models []map[string]any) []map[string]any {
+	public := CloneModelList(models)
+	for _, model := range public {
+		id, _ := model["id"].(string)
+		id = strings.TrimSpace(id)
+		provider, _ := model["provider"].(string)
+		if strings.TrimSpace(provider) == "" {
+			provider, _ = model["owned_by"].(string)
+		}
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if _, known := providers.Get(provider); !known || id == "" {
+			continue
+		}
+		prefix := provider + "/"
+		if !strings.HasPrefix(id, prefix) {
+			id = prefix + id
+		}
+		model["id"] = id
+		label, _ := model["display_name"].(string)
+		label = strings.TrimSpace(label)
+		if label == "" {
+			label = id
+		} else if !strings.HasPrefix(label, prefix) {
+			label = prefix + label
+		}
+		model["display_name"] = label
+	}
+	return public
+}
+
 // FilterModelsForIdentity applies grants after loading the shared catalog.
 func FilterModelsForIdentity(identity auth.Identity, models []map[string]any) []map[string]any {
 	if len(identity.AllowedProviders) == 0 {

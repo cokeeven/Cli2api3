@@ -981,13 +981,13 @@ func TestNamedAPIKeyRegionScopedModelsList(t *testing.T) {
 		t.Fatal(err)
 	}
 	cnBody := fetch(cnKey.Secret)
-	if !bytes.Contains([]byte(cnBody), []byte(`"id":"glm-5.2"`)) {
+	if !bytes.Contains([]byte(cnBody), []byte(`"id":"workbuddy/glm-5.2"`)) {
 		t.Fatalf("cn-only key must still see glm-5.2 served by the cn account: %s", cnBody)
 	}
-	if bytes.Contains([]byte(cnBody), []byte(`"deepseek-v4"`)) {
+	if bytes.Contains([]byte(cnBody), []byte(`"id":"trae/deepseek-v4"`)) {
 		t.Fatalf("cn-only key must not see trae models: %s", cnBody)
 	}
-	if bytes.Count([]byte(cnBody), []byte(`"id":"glm-5.2"`)) != 1 {
+	if bytes.Count([]byte(cnBody), []byte(`"id":"workbuddy/glm-5.2"`)) != 1 {
 		t.Fatalf("model entries must dedup across regions: %s", cnBody)
 	}
 
@@ -1000,10 +1000,10 @@ func TestNamedAPIKeyRegionScopedModelsList(t *testing.T) {
 		t.Fatal(err)
 	}
 	globalBody := fetch(globalKey.Secret)
-	if bytes.Contains([]byte(globalBody), []byte(`"glm-5.2"`)) {
+	if bytes.Contains([]byte(globalBody), []byte(`"id":"workbuddy/glm-5.2"`)) {
 		t.Fatalf("global-only key must not see models only served by cn accounts: %s", globalBody)
 	}
-	if !bytes.Contains([]byte(globalBody), []byte(`"id":"kimi-k3"`)) {
+	if !bytes.Contains([]byte(globalBody), []byte(`"id":"workbuddy/kimi-k3"`)) {
 		t.Fatalf("global-only key must see the model served by the global account: %s", globalBody)
 	}
 
@@ -1015,10 +1015,10 @@ func TestNamedAPIKeyRegionScopedModelsList(t *testing.T) {
 		t.Fatal(err)
 	}
 	bareBody := fetch(bareKey.Secret)
-	if !bytes.Contains([]byte(bareBody), []byte(`"id":"glm-5.2"`)) {
+	if !bytes.Contains([]byte(bareBody), []byte(`"id":"workbuddy/glm-5.2"`)) {
 		t.Fatalf("bare family entry must still list glm-5.2: %s", bareBody)
 	}
-	if bytes.Contains([]byte(bareBody), []byte(`"deepseek-v4"`)) {
+	if bytes.Contains([]byte(bareBody), []byte(`"id":"trae/deepseek-v4"`)) {
 		t.Fatalf("bare workbuddy entry must not list trae models: %s", bareBody)
 	}
 }

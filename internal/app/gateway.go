@@ -24,7 +24,7 @@ func (a *App) newGateway() *apigateway.Handler {
 			if r != nil {
 				ctx = r.Context()
 			}
-			return a.decorateModelsWithContext(ctx, models)
+			return control.PublicModelCatalog(a.decorateModelsWithContext(ctx, models))
 		},
 		Models: func(refresh bool, accountID string) ([]map[string]any, error) {
 			return a.fetchDisplayModels(refresh, accountID, control.CatalogModeMerge)

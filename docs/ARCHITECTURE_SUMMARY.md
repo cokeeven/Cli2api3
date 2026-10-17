@@ -121,3 +121,12 @@ cmd/server
 
 详细 provider 协议、真实账号验收、部署主机信息和抓包记录属于本地资料，
 不作为本公共摘要的实现来源。
+
+
+## Windows 原生托管更新
+
+网页 `update.Coordinator` 共用检查、准备、确认、排空和备份入口，按 `UPDATE_BACKEND` 验证宿主类型；Docker 执行器保持默认。`updater.NativeExecutor` 仅管理已配置的 Windows amd64 安装，下载完整运行包后校验清单/架构/路径并暂存，用户确认后再替换受控文件。数据目录、原配置和账号 HOME 不属于更新包。
+
+独立 supervisor 与 gateway launcher 为 `cmd/updater` 的 exe 模式，计划任务动作指向不可变的 seed 路径，保留原任务身份；宿主自更新运行于新的 hash 目录。实例标识、PID 的真实 exe 路径、目标版本/commit共同验证启动归属。网关拥有自己的 Windows Job Object，只在本进程退出时清理所属 worker，不扫描结束系统中所有 Node 进程。
+
+Agent 状态和原生事务日志保留在独立更新器目录；确认前校验 SQLite 一致快照及 SHA/schema/integrity 清单。失败和中断默认仅恢复程序/受控组件，保留最新库；旧程序无法兼容新库时报告 recovery_failed，不以旧库覆盖伪造成功。详细接入与恢复边界见 deploy/README.md。

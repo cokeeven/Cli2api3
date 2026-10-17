@@ -92,7 +92,7 @@ Cross-provider failover defaults off; explicit platform prefixes, permissions an
 
 ## Updates and data protection
 
-Stable builds come from [this repository's Releases](https://github.com/cokeeven/Cli2api3/releases) and `ghcr.io/cokeeven/ali2api3`. With the host updater installed, **download first, then confirm installation** in System settings. Managed updates support Docker Compose deployments; source runs and native Windows deployments do not directly use this update path.
+Stable builds come from [this repository's Releases](https://github.com/cokeeven/Cli2api3/releases) and `ghcr.io/cokeeven/ali2api3`. With the host updater installed, **download first, then confirm installation** in System settings. Managed updates support Docker Compose and Windows amd64 native deployments after the one-time [native onboarding](deploy/README.md#windows-native-updates). Use a release that includes the full native application package and installer; an older standalone updater binary is insufficient.
 
 - Wait for in-flight requests, create a consistent SQLite snapshot and verify its integrity. Draining or verification failure stops the upgrade.
 - Keep application binaries separate from durable data. Program rollback preserves the current database by default; restoring an older database requires separate verification and preservation of newer data.

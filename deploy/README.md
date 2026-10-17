@@ -305,3 +305,63 @@ keep an independent database backup before upgrading.
 Keep `deploy/.env` private: Docker Desktop mode stores an updater token there.
 Do not remove `qoder-data` or run `docker compose down -v` unless you intend to
 delete the accounts and credentials.
+
+
+## Windows native updates
+
+### Windows Server 2022 首次接入
+
+此后端只支持 **Windows amd64**；原有 Docker updater 与镜像包名保持兼容。必须使用包含 `cli2api-app_windows_amd64.zip` 的支持版正式 Release。仓库中已增加构建和 CI 流程；本地开发包或尚未运行的工作流不能算作已发布版本。
+
+1. 核对当前网关计划任务、身份、启动参数、环境文件、工作目录与持久目录。保留 `ali2api3-Server` 的任务名，图形控制台可继续启停它。不要更改独立的 `ali2api3-Caddy`。
+2. 从同一正式 tag 下载六项更新器资产中的 `cli2api-updater_windows_amd64.exe`、`cli2api-updater_checksums.txt`，以及应用 zip 和 `cli2api-app_checksums.txt`。安装脚本来自该 tag 的 `deploy/install-native-updater.ps1`。核对下载来源及 SHA-256；同一来源的校验和属于完整性检查，不是独立数字签名。
+3. 以 `deploy/native-launch.example.json` 为格式，将**原有**启动参数、环境文件与工作目录写到新的接入 JSON。不要把示例环境覆盖到现有未知配置上。环境变量从原文件读取，再应用 JSON 的明确值；原凭据和 Key 留在现有数据目录。
+4. 在管理员 PowerShell 中执行以下模板。这里的版本必须替换成实际已发布的支持版；下面路径只是现有布局的接入示例，不是硬编码。
+
+```powershell
+$version = Read-Host '已发布且包含 Windows 应用包的版本，如 v0.x.y'
+./install-native-updater.ps1 `
+  -InstallRoot 'C:\ali2api3' `
+  -ProgramDirectory 'C:\ali2api3\program' `
+  -DataDirectory 'C:\ali2api3\data' `
+  -LaunchConfig 'C:\ali2api3\config\native-launch.json' `
+  -TaskName 'ali2api3-Server' `
+  -UpdaterTaskName 'ali2api3-NativeUpdater' `
+  -UpdaterDirectory 'C:\ali2api3\updater-native' `
+  -Port 3011 -HealthURL 'http://127.0.0.1:3010/health' `
+  -UpdaterBinary '.\cli2api-updater_windows_amd64.exe' `
+  -UpdaterChecksums '.\cli2api-updater_checksums.txt' `
+  -BootstrapPackage '.\cli2api-app_windows_amd64.zip' `
+  -PackageChecksums '.\cli2api-app_checksums.txt' `
+  -Version $version
+```
+
+脚本先校验包并准备完整组件，再对原库通过 SQLite `VACUUM INTO` 生成包含 WAL 已提交数据的一致快照和 SHA/schema/integrity 清单；失败不停止网关。首次明确调用 `-BootstrapPackage` 是一次性引导安装，保留原 exe/组件及任务 XML，再切换到支持版。它不会把 live `qoder.db` 当普通文件复制、脱敏或文本转换。原有 data、runtime、认证 HOME、config、logs、console、Caddy 均不属于更新包替换范围。
+
+接入后，原网关任务的身份、触发器和设置继续保留，动作改为稳定 seed exe 的 `--run-native-gateway`。独立 SYSTEM 更新器任务运行 `--supervise-native`；子更新器从经过校验的 hash 目录启动，Windows 文件锁不会阻止自身更新。无需保留 AI 会话、RDP 或控制台窗口。只监听回环端口，Token 首次随机生成并限制 NTFS 权限，重复接入复用已有 Token，端口归属不符则拒绝，不抢占其他服务。
+
+若 Windows 阻止运行首次安装脚本，使用管理员窗口并按组织批准的签名/执行策略运行本仓库可信脚本；不要加 `-ExecutionPolicy Bypass` 或绕过组策略。运行期启动和监督均为 exe，不需要放宽 PowerShell 脚本策略。没有管理员权限的 `-IsolatedProcessMode` 仅用于临时验收，**不提供重启自启，也不能代替服务器正式接入**。
+
+### 后续网页更新与恢复
+
+在“系统设置 → 版本更新”检查并下载，等待校验完成后由用户确认安装。准备阶段网关继续运行；确认后排空最多 30 秒，超时中止。宿主再次验证备份、暂存文件、版本/架构与组件清单，只交换 `program/qoder-api-proxy.exe`、`program/components`、`program/native-manifest.json`。旧文件存放于 `program/.cli2api-update/rollback/<job>`，不会先删除唯一可用版本。
+
+启动验证要求健康返回目标版本/commit/实例 ID，且 PID 的真实 exe 路径属于本安装；单独健康 200 不算成功。失败默认仅恢复程序/组件，保留最新数据库，包括失败前新版本写入的记录。旧程序不兼容新库时显示恢复失败，**不自动还原旧库**。历史库恢复仍需独立离线方案，网页没有新增覆盖旧库按钮。
+
+宿主状态 `status.json` 与 `transaction.json` 持久化于更新器目录，网关重启或页面刷新后继续显示同一任务。中断时 supervisor 用可用旧宿主核对日志并恢复，禁止盲目重做替换。`recovery_failed` 会阻止新安装；先停止该安装的网关和独立更新器，保留数据库及 WAL/SHM、backups、整个 `.cli2api-update`、状态日志与原任务 XML。检查兼容性并恢复可用程序或前向修复；不要删除事务日志来强行解锁或把旧快照覆盖到有新写入的库。
+
+首次引导的旧版程序可能尚无实例身份接口。如果引导中断，保留上述文件，恢复 `original-gateway-task.xml` 中原动作，并从记录的 `rollback/<bootstrap-job>` 恢复旧程序/受控组件；只在进程停止后处理程序文件，数据库不回退。无法核实旧程序健康时，应报告恢复待核实而不是宣称自动恢复成功。
+
+备用网络配置为 `updater-native/network.json`，复用 GitHub 元数据、附件镜像、HTTP(S)/SOCKS 代理与逐源超时。原生后端忽略 Docker 镜像仓库列表，绝不把镜像当 Windows 应用包。应用附件选择仅 Windows amd64 固定名称；旧 Release 若没有原生包，下载失败并保留当前服务。
+
+### Native onboarding and recovery (English)
+
+Use a published supporting release and the full Windows amd64 application archive, not just updater.exe. Supply the existing task name, data/program/updater paths, loopback health URL, free agent port and a reviewed launch JSON retaining the original environment file, arguments and working directory. Run the parameterized example above in an elevated PowerShell session. The installer verifies the archive, snapshots the existing SQLite database consistently, preserves the original task XML/program, and bootstraps the first supported gateway. It does not touch Caddy or move credentials into the application package.
+
+The gateway retains its original scheduled-task identity/settings and a stable executable launcher action. An independent startup task supervises the authenticated loopback agent. Hash-addressed host executables avoid replacing a running Windows exe; no runtime script-policy bypass is needed. A repeated installation retains the token and existing listener. A foreign port owner/task action is rejected. Process-mode installation is an isolated test option and does not promise reboot persistence.
+
+Later releases use the existing console check → download → explicit confirm → drain → verified snapshot → replace → verify flow. The runtime archive includes Node, worker, pinned CLI packages, updater and the gateway with embedded UI; mutable data/config/HOME are excluded. The backend validates archive paths, file hashes, PE architecture, version/commit and instance/PID ownership. Default rollback preserves the newest database; schema incompatibility or failed program recovery is reported without restoring an older database. Keep journals and rollback copies for operator recovery; never erase a journal or replace a live database to manufacture success.
+
+首次引导旧版尚未提供原生维护接口，应安排维护窗口，先停止客户端新调用并等待在途请求结束，再执行一次性 Bootstrap。后续支持版的网页更新由协调器强制排空，超时中止。当前正式接入针对已有 Windows 计划任务；不把任意 SCM/NSSM 服务包装器视为已支持的接入方式。
+
+For the first bootstrap, an older gateway may lack the native maintenance API: pause incoming client traffic and let existing requests finish in a maintenance window. Subsequent web upgrades enforce request draining and abort on timeout. Production onboarding currently targets an existing Windows Scheduled Task; arbitrary SCM/NSSM service wrappers are not supported.

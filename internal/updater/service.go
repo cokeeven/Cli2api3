@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -44,10 +45,11 @@ type preservationReporter interface {
 }
 
 type Config struct {
-	SocketPath    string
-	ListenAddress string
-	AuthToken     string
-	StatusFile    string
+	RecoverAfterListen bool
+	SocketPath         string
+	ListenAddress      string
+	AuthToken          string
+	StatusFile         string
 }
 
 type Service struct {
@@ -63,7 +65,44 @@ var backupNamePattern = regexp.MustCompile(`^qoder-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z\
 func NewService(config Config, applier applier) *Service {
 	service := &Service{config: config, applier: applier, status: control.AgentStatus{ProtocolVersion: control.AgentProtocolVersion, Available: true, StagedUpdate: true, State: "idle"}}
 	service.loadStatus()
+	if !config.RecoverAfterListen {
+		service.recoverOperation()
+	}
 	return service
+}
+
+func (service *Service) recoverOperation() {
+	applier := service.applier
+	if recovery, ok := applier.(interface {
+		Recover() (string, string, error)
+	}); ok {
+		var state, id string
+		var err error
+		if contextual, ok := applier.(interface {
+			RecoverForStatus(control.AgentStatus) (string, string, error)
+		}); ok {
+			state, id, err = contextual.RecoverForStatus(service.status)
+		} else {
+			state, id, err = recovery.Recover()
+		}
+		if state != "" {
+			service.status.State = state
+			service.status.Error = ""
+			service.status.JobID = id
+			if reporter, ok := applier.(interface{ RecoveryDetails() control.AgentStatus }); ok {
+				details := reporter.RecoveryDetails()
+				service.status.ClientJobID = details.ClientJobID
+				service.status.CurrentVersion = details.CurrentVersion
+				service.status.TargetVersion = details.TargetVersion
+				service.status.BackupPath = details.BackupPath
+			}
+			if err != nil {
+				service.status.Error = err.Error()
+			}
+			service.status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+			service.persistStatusLocked()
+		}
+	}
 }
 
 func (s *Service) Handler() http.Handler {
@@ -94,6 +133,9 @@ func (s *Service) Serve(ctx context.Context) error {
 		return err
 	}
 	defer listener.Close()
+	if s.config.RecoverAfterListen {
+		s.recoverOperation()
+	}
 	if socketPath != "" {
 		defer os.Remove(socketPath)
 		if err := os.Chmod(socketPath, 0o660); err != nil {
@@ -164,10 +206,16 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	status := s.status
 	s.mu.Unlock()
+	if backend, ok := s.applier.(interface{ Backend() string }); ok {
+		status.Backend = backend.Backend()
+	} else {
+		status.Backend = "docker"
+	}
 	status.ProtocolVersion = control.AgentProtocolVersion
 	status.Available = true
 	status.StagedUpdate = true
 	status.Version = buildinfo.Version
+	status.PID = os.Getpid()
 	status.Network = s.networkSnapshot(status.Network)
 	writeJSON(w, http.StatusOK, status)
 }
@@ -184,7 +232,7 @@ func (s *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateApplyRequest(request); err != nil {
+	if err := s.validateApplyRequest(request); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -215,7 +263,7 @@ func (s *Service) handlePrepare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if isActiveState(s.status.State) || s.status.State == "ready_to_apply" {
+	if isActiveState(s.status.State) || s.status.State == "ready_to_apply" || s.status.State == "recovery_failed" {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, "update already in progress")
 		return
@@ -228,9 +276,16 @@ func (s *Service) handlePrepare(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	previousStatus := s.status
 	s.cancel = cancel
-	s.status = control.AgentStatus{ProtocolVersion: control.AgentProtocolVersion, Available: true, StagedUpdate: true, State: "queued", JobID: jobID, CurrentVersion: request.CurrentVersion, TargetVersion: request.TargetVersion, StartedAt: now}
-	s.persistStatusLocked()
+	s.status = control.AgentStatus{ProtocolVersion: control.AgentProtocolVersion, Available: true, StagedUpdate: true, State: "queued", JobID: jobID, ClientJobID: request.ClientJobID, CurrentVersion: request.CurrentVersion, TargetVersion: request.TargetVersion, StartedAt: now}
+	if err := s.persistStatusLocked(); err != nil {
+		s.status = previousStatus
+		cancel()
+		s.mu.Unlock()
+		writeError(w, 500, "cannot persist updater preparation")
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusAccepted, control.ApplyResponse{JobID: jobID})
@@ -269,7 +324,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateApplyRequest(request); err != nil {
+	if err := s.validateApplyRequest(request); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -287,7 +342,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) startApply(w http.ResponseWriter, request ApplyRequest) {
 	s.mu.Lock()
-	if isActiveState(s.status.State) {
+	if isActiveState(s.status.State) || s.status.State == "recovery_failed" || (request.SkipPull && (s.status.State != "ready_to_apply" || s.status.TargetVersion != request.TargetVersion || s.status.CurrentVersion != request.CurrentVersion)) {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, "update already in progress")
 		return
@@ -298,14 +353,24 @@ func (s *Service) startApply(w http.ResponseWriter, request ApplyRequest) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if request.SkipPull {
+		jobID = s.status.JobID
+		request.ClientJobID = s.status.ClientJobID
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	previousStatus := s.status
 	s.status = control.AgentStatus{
 		ProtocolVersion: control.AgentProtocolVersion,
-		Available:       true, StagedUpdate: true, State: "queued", JobID: jobID,
+		Available:       true, StagedUpdate: true, State: "queued", JobID: jobID, ClientJobID: request.ClientJobID,
 		CurrentVersion: request.CurrentVersion, TargetVersion: request.TargetVersion,
 		BackupPath: request.BackupPath, StartedAt: now,
 	}
-	s.persistStatusLocked()
+	if err := s.persistStatusLocked(); err != nil {
+		s.status = previousStatus
+		s.mu.Unlock()
+		writeError(w, 500, "cannot persist updater installation")
+		return
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusAccepted, control.ApplyResponse{JobID: jobID})
@@ -327,9 +392,17 @@ func (s *Service) runPrepare(ctx context.Context, worker preparer, jobID string,
 	}
 	if err := worker.Prepare(ctx, jobID, request, func(state string) { s.updateState(jobID, state, "", false) }); err != nil {
 		if ctx.Err() != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				s.updateState(jobID, "failed", "preparation timed out", true)
+			}
 			return
 		}
-		s.updateState(jobID, "failed", err.Error(), true)
+		state := "failed"
+		var failure *nativeFailure
+		if errors.As(err, &failure) {
+			state = failure.State
+		}
+		s.updateState(jobID, state, err.Error(), true)
 		return
 	}
 	s.updateState(jobID, "ready_to_apply", "", false)
@@ -353,6 +426,9 @@ func (s *Service) run(jobID string, request ApplyRequest) {
 		return
 	}
 	state := "failed"
+	if native, ok := s.applier.(interface{ FailureState() string }); ok {
+		state = native.FailureState()
+	}
 	if rolledBack {
 		state = "rolled_back"
 	}
@@ -400,6 +476,21 @@ func (s *Service) networkSnapshot(previous *updatenet.Status) *updatenet.Status 
 	return &current
 }
 
+func (s *Service) validateApplyRequest(request ApplyRequest) error {
+	if native, ok := s.applier.(interface{ ValidateBackupPath(string) error }); ok {
+		current, err := control.ParseVersion(request.CurrentVersion)
+		if err != nil {
+			return err
+		}
+		target, err := control.ParseVersion(request.TargetVersion)
+		if err != nil || target.Compare(current) == 0 {
+			return fmt.Errorf("invalid target version")
+		}
+		return native.ValidateBackupPath(request.BackupPath)
+	}
+	return validateApplyRequest(request)
+}
+
 func validateApplyRequest(request ApplyRequest) error {
 	current, err := control.ParseVersion(request.CurrentVersion)
 	if err != nil {
@@ -430,7 +521,7 @@ func validatePrepareRequest(request control.PrepareRequest) error {
 
 func isActiveState(state string) bool {
 	switch state {
-	case "queued", "preparing", "pulling", "host_binary", "recreating", "checking", "rolling_back":
+	case "queued", "preparing", "pulling", "host_binary", "recreating", "checking", "rolling_back", "downloading", "verifying", "extracting", "stopping", "replacing", "starting":
 		return true
 	default:
 		return false
@@ -441,7 +532,7 @@ func cancellableStatus(status control.AgentStatus) bool {
 	switch status.State {
 	case "ready_to_apply":
 		return true
-	case "queued", "pulling", "host_binary", "preparing", "image_ready":
+	case "queued", "pulling", "host_binary", "preparing", "image_ready", "downloading", "verifying", "extracting":
 		return status.BackupPath == ""
 	default:
 		return false
@@ -479,18 +570,21 @@ func (s *Service) loadStatus() {
 	s.status = status
 }
 
-func (s *Service) persistStatusLocked() {
+func (s *Service) persistStatusLocked() error {
 	if strings.TrimSpace(s.config.StatusFile) == "" {
-		return
+		if _, native := s.applier.(interface{ Backend() string }); native {
+			return fmt.Errorf("native updater requires persistent status file")
+		}
+		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.config.StatusFile), 0o700); err != nil {
-		return
+	if err := os.MkdirAll(filepath.Dir(s.config.StatusFile), 0700); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(s.status, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = writeEnvFileAtomic(s.config.StatusFile, 0o600, append(data, '\n'))
+	return writeEnvFileAtomic(s.config.StatusFile, 0600, append(data, '\n'))
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

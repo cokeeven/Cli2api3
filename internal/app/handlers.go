@@ -13,9 +13,10 @@ func (a *App) newUpdateCoordinator(checker appupdate.ReleaseChecker, agent appup
 		return &appupdate.Coordinator{}
 	}
 	coord := &appupdate.Coordinator{
-		Checker: checker,
-		Agent:   agent,
-		DataDir: a.Cfg.DataDir,
+		Checker:         checker,
+		Agent:           agent,
+		DataDir:         a.Cfg.DataDir,
+		ExpectedBackend: a.Cfg.UpdateBackend,
 	}
 	if a.Control != nil && a.Control.Backup != nil {
 		coord.Backup = a.Control.Backup.Snapshot

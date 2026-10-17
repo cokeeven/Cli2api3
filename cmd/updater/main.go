@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -14,6 +17,21 @@ import (
 )
 
 func main() {
+	var validateNative bool
+	flag.BoolVar(&validateNative, "validate-native-config", false, "validate native onboarding paths and identity without starting a daemon")
+	var runGateway, superviseNative string
+	flag.StringVar(&runGateway, "run-native-gateway", "", "run gateway using preserved native launch config")
+	flag.StringVar(&superviseNative, "supervise-native", "", "independently supervise a native updater")
+	var packagePath, checksumsPath, extractPath, targetVersion, databasePath, backupDir string
+	flag.StringVar(&packagePath, "unpack-native-package", "", "verify and unpack a Windows application archive, then exit")
+	flag.StringVar(&checksumsPath, "package-checksums", "", "application checksum file")
+	flag.StringVar(&extractPath, "extract-to", "", "new staging directory")
+	flag.StringVar(&targetVersion, "target-version", "", "expected stable application version")
+	flag.StringVar(&databasePath, "snapshot-database", "", "snapshot an existing SQLite database without migrations, then exit")
+	flag.StringVar(&backupDir, "backup-directory", "", "snapshot destination")
+	var backend, nativeConfigPath string
+	flag.StringVar(&backend, "backend", "docker", "deployment backend: docker or windows-native")
+	flag.StringVar(&nativeConfigPath, "native-config", "", "absolute Windows native updater JSON configuration")
 	var socketPath string
 	var listenAddress string
 	var authToken string
@@ -41,6 +59,36 @@ func main() {
 	flag.StringVar(&healthURL, "health-url", "http://127.0.0.1:3010/health", "service health URL")
 	flag.DurationVar(&healthTimeout, "health-timeout", 120*time.Second, "versioned health-check timeout")
 	flag.Parse()
+	if runGateway != "" {
+		if err := updater.RunNativeGateway(runGateway); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if superviseNative != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := updater.RunNativeSupervisor(ctx, superviseNative); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if packagePath != "" {
+		m, err := updater.UnpackNativePackage(packagePath, checksumsPath, targetVersion, extractPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Verified %s %s %s\n", m.Version, m.Arch, m.Commit)
+		return
+	}
+	if databasePath != "" {
+		p, err := updater.SnapshotNativeDatabase(context.Background(), databasePath, backupDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(p)
+		return
+	}
 	if strings.TrimSpace(authToken) == "" && strings.TrimSpace(authTokenFile) != "" {
 		data, err := os.ReadFile(authTokenFile)
 		if err != nil {
@@ -53,16 +101,48 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	executor := updater.NewExecutor(updater.ExecutorConfig{
-		ComposeFile: composeFile, EnvFile: envFile, ServiceName: serviceName,
-		ContainerName: containerName, ImageRepository: imageRepository, HealthURL: healthURL,
-		HealthTimeout: healthTimeout, HostBinaryPath: hostBinary,
-		GitHubToken: strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),
-		NetworkFile: networkFile,
-	})
-	service := updater.NewService(updater.Config{
-		SocketPath: socketPath, ListenAddress: listenAddress, AuthToken: authToken, StatusFile: statusFile,
-	}, executor)
+	serviceConfig := updater.Config{SocketPath: socketPath, ListenAddress: listenAddress, AuthToken: authToken, StatusFile: statusFile}
+	var service *updater.Service
+	if backend == updater.NativeBackend {
+		raw, err := os.ReadFile(nativeConfigPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var cfg updater.NativeConfig
+		if err = json.Unmarshal(raw, &cfg); err != nil {
+			log.Fatal(err)
+		}
+		if !validateNative {
+			if err := updater.ValidateNativeListen(listenAddress); err != nil {
+				log.Fatal(err)
+			}
+			if !filepath.IsAbs(statusFile) || !strings.EqualFold(filepath.Clean(filepath.Dir(statusFile)), filepath.Clean(cfg.StateDir)) {
+				log.Fatal("native status-file must be an absolute path inside configured state_dir")
+			}
+			serviceConfig.RecoverAfterListen = true
+		}
+		executor, err := updater.NewNativeExecutor(cfg, authToken, networkFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if validateNative {
+			executor.Close()
+			fmt.Println("Native configuration verified")
+			return
+		}
+		service = updater.NewService(serviceConfig, executor)
+	} else if backend == "docker" {
+		executor := updater.NewExecutor(updater.ExecutorConfig{
+			ComposeFile: composeFile, EnvFile: envFile, ServiceName: serviceName,
+			ContainerName: containerName, ImageRepository: imageRepository, HealthURL: healthURL,
+			HealthTimeout: healthTimeout, HostBinaryPath: hostBinary,
+			GitHubToken: strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),
+			NetworkFile: networkFile,
+		})
+		service = updater.NewService(serviceConfig, executor)
+	} else {
+		log.Fatal("unknown updater backend")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := service.Serve(ctx); err != nil {

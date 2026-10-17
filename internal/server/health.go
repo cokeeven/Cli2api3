@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/buildinfo"
@@ -27,6 +28,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"chat_url":                  endpoint.ChatCompletionsPath,
 		"time":                      time.Now().UTC().Format(time.RFC3339),
 		"version":                   buildinfo.Version,
+		"instance_id":               os.Getenv("UPDATE_INSTANCE_ID"),
+		"pid":                       os.Getpid(),
 		"commit":                    buildinfo.Commit,
 		"maintenance":               s.updater().Maintenance.Load(),
 	})

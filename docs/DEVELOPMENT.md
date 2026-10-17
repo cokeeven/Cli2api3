@@ -108,7 +108,36 @@ Expected artifacts for a published tag:
 
 | Kind | Names |
 |------|--------|
-| GitHub Release assets (8) | six `cli2api-updater_{os}_{arch}` binaries, `cli2api-updater_checksums.txt`, and `cli2api-image-digest.json` |
+| GitHub Release assets (10) | six `cli2api-updater_{os}_{arch}` binaries, `cli2api-updater_checksums.txt`, `cli2api-image-digest.json`, `cli2api-app_windows_amd64.zip`, and `cli2api-app_checksums.txt` |
 | GHCR (`ghcr.io/cokeeven/ali2api3`) | `v0.x.y`, `0.x.y`, series (`0.2`), `latest`, all the same multi-arch digest |
 
-If a **pre-publication** job fails (`prepare` / `assets` / `draft` / `image` / `promote`), use **Re-run failed jobs** on the same run. The draft remains unpublished. Do not create the tag locally while that draft exists.
+If a **pre-publication** job fails (`prepare` / `assets` / `native-assets` / `draft` / `image` / `promote`), use **Re-run failed jobs** on the same run. The draft remains unpublished. Do not create the tag locally while that draft exists.
+
+
+## Windows native runtime development / Windows 原生更新开发
+
+`internal/updater.NativeExecutor` is selected by `cmd/updater --backend windows-native --native-config <absolute JSON>`. The default remains Docker. Gateway `UPDATE_BACKEND=windows-native` refuses a Docker/legacy agent; protocol 2 retains old Docker request compatibility. The native backend currently supports Windows amd64 only. Keep the historical GHCR package and updater asset names.
+
+The runtime package is built on Windows, embeds the synced console in the gateway exe, and includes Node 22.23.3 (pinned upstream archive SHA-256), worker plus npm lockfile dependencies, qodercli/qoderclicn 1.1.32, and the matching updater. The Windows-only npm lockfile pins a patched sharp 0.35.5 override without changing either CLI version; packaging loads the real Windows addon and checks a one-pixel PNG operation. `native-manifest.json` records backend, OS, architecture, version, commit, protocol, component versions and every file's size/SHA-256. This is integrity metadata, not an independent signature. The CLI runtime has its own lockfile in `scripts/windows-runtime`; do not silently change CLI compatibility hooks to clear a dependency audit. Runtime npm lifecycle scripts are explicitly disabled: the CLI postinstall changes per-user PATH/dispatcher state, which the gateway does not need; the real Windows prebuilt addon and bundle hooks are checked directly.
+
+```powershell
+$env:APP_VERSION='v9.0.2' # isolated test identity, never a manually published tag
+$env:APP_COMMIT='2222222222222222222222222222222222222222'
+./scripts/build-windows-app.ps1 -OutputDirectory "$env:TEMP/native-app-assets"
+$env:CLI2API_NATIVE_REHEARSAL='1'
+$env:CLI2API_NATIVE_APP_PACKAGE="$env:TEMP/native-app-assets/cli2api-app_windows_amd64.zip"
+go test ./internal/updater -run TestNative -count=1 -v -timeout=15m
+./scripts/test-native-installer.ps1 -ApplicationDirectory "$env:TEMP/native-app-assets" -WorkDirectory "$env:TEMP/native-onboarding"
+# An elevated runner is required for real scheduled-task tests:
+$env:CLI2API_NATIVE_TASK_REHEARSAL='1'
+go test ./internal/updater -run TestNative -count=1 -v -timeout=15m
+./scripts/test-native-installer.ps1 -ApplicationDirectory "$env:TEMP/native-app-assets" -WorkDirectory "$env:TEMP/native-onboarding-tasks" -RequireTasks
+```
+
+真实进程用例包含正常替换、失败启动、失败前新写入保留、真实文件占用、损坏备份、错误架构、重复宿主与恢复日志。完整应用包用例运行真实 `cmd/server` 并从受鉴权网页 API 确认安装，核对新进程版本/commit、账号/凭据/管理员密钥/调用 Key/配置/历史及网关重启后的同一任务结果。计划任务模式和首次安装需要提升权限；不得把 process 模式通过写成计划任务已通过。CI 的 `windows-native` 作业构建运行包并执行提升权限专项；本地没有 gcc 时记录 Windows race 未执行，Linux CI 的完整 race 仍须通过。
+
+First onboarding uses a stable, hash-addressed seed exe for `--run-native-gateway` and `--supervise-native`. A successful update exits only its child agent; the independent supervisor starts the package's verified updater from another immutable hash directory. Runtime operation does not require PowerShell script execution-policy changes. The installer preserves the gateway task principal/settings and changes only its reviewed action; unrelated tasks are outside the update backend.
+
+事务日志先于破坏性步骤落盘，组件旧副本位于 `program/.cli2api-update/rollback/<job>`。中断恢复只核对日志并恢复程序，不盲目重放安装或恢复旧库。恢复失败保留日志、组件副本与最新数据库，阻止下一次安装，需按部署文档处理。已发布 migration SQL 不得修改。运行包不得包含 data、认证 HOME 或生产配置。
+
+The Release workflow still builds six host updater binaries and Docker multi-architecture images. A separate Windows job produces the application zip/checksums before the draft can publish; the final release now has ten assets including the existing image digest manifest. Workflow edits must be validated locally but are not proof an online release ran.

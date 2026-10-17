@@ -8,12 +8,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
 )
 
 func TestUnixAgentClientSubmitsFixedUpdateRequest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-socket compatibility is tested on Linux; Windows native uses authenticated loopback HTTP")
+	}
 	socketPath := filepath.Join(os.TempDir(), "cli2api-updater-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
 	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	listener, err := net.Listen("unix", socketPath)

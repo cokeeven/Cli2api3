@@ -1,0 +1,10 @@
+{
+  "working_directory": "C:\\ali2api3",
+  "arguments": [],
+  "env_file": "C:\\ali2api3\\config\\gateway.env",
+  "runtime_dir": "C:\\ali2api3\\runtime",
+  "environment": {
+    "HOST": "127.0.0.1",
+    "PORT": "3010"
+  }
+}

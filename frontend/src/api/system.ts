@@ -13,6 +13,7 @@ export type UpdateNetworkStatus = {
 }
 
 export type UpdateAgentStatus = {
+  backend?: 'docker' | 'windows-native'
   network?: UpdateNetworkStatus
   protocol_version?: number
   available: boolean

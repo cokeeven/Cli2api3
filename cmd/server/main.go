@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,7 +20,18 @@ import (
 )
 
 func main() {
-	_ = godotenv.Load()
+	if f := os.Getenv("CLI2API_ENV_FILE"); f != "" {
+		if err := godotenv.Load(f); err != nil {
+			log.Fatal("cannot read configured environment file")
+		}
+	} else {
+		_ = godotenv.Load()
+	}
+	closeJob, err := nativeWorkerJob()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer closeJob()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -24,9 +39,28 @@ func main() {
 	application := app.New(cfg)
 	defer application.Close()
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	shutdown := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/internal/update/shutdown" {
+			host, _, _ := net.SplitHostPort(r.RemoteAddr)
+			ip := net.ParseIP(host)
+			token := strings.TrimSpace(cfg.UpdateAgentToken)
+			if r.Method != http.MethodPost || ip == nil || !ip.IsLoopback() || token == "" || os.Getenv("UPDATE_INSTANCE_ID") == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			select {
+			case shutdown <- struct{}{}:
+			default:
+			}
+			return
+		}
+		application.Handler().ServeHTTP(w, r)
+	})
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           application.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -39,7 +73,10 @@ func main() {
 			stop()
 		}
 	}()
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-shutdown:
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

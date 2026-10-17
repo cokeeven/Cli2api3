@@ -22,6 +22,7 @@ type Config struct {
 	QoderCNCLIPath    string
 	PlainTemplatePath string
 	UpdateSocketPath  string
+	UpdateBackend     string
 	UpdateAgentURL    string
 	UpdateAgentToken  string
 	UpdateGitHubToken string
@@ -94,6 +95,7 @@ func Load() (Config, error) {
 		QoderCNCLIPath:           firstNonEmpty(os.Getenv("QODERCNCLI_JS"), "/usr/local/lib/node_modules/@qodercn-ai/qoderclicn/bundle/qoderclicn.js"),
 		PlainTemplatePath:        firstNonEmpty(os.Getenv("PLAIN_TEMPLATE_PATH"), "worker/last-plain.sample.json"),
 		UpdateSocketPath:         firstNonEmpty(os.Getenv("UPDATE_SOCKET_PATH"), "/run/cli2api-updater/updater.sock"),
+		UpdateBackend:            firstNonEmpty(os.Getenv("UPDATE_BACKEND"), "docker"),
 		UpdateAgentURL:           strings.TrimSpace(os.Getenv("UPDATE_AGENT_URL")),
 		UpdateAgentToken:         strings.TrimSpace(os.Getenv("UPDATE_AGENT_TOKEN")),
 		UpdateGitHubToken:        strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN")),

@@ -45,7 +45,7 @@ jobs:
         shell: powershell
         run: |
           $Failed = $false
-          foreach ($File in @("scripts\start.ps1", "deploy\install-updater.ps1")) {
+          foreach ($File in @("scripts\start.ps1", "deploy\install-updater.ps1", "deploy\install-native-updater.ps1", "scripts\build-windows-app.ps1", "scripts\test-native-installer.ps1")) {
             $Tokens = $null
             $Errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(
@@ -59,6 +59,30 @@ jobs:
             }
           }
           if ($Failed) { exit 1 }
+
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build real Windows amd64 runtime package
+        shell: powershell
+        run: ./scripts/build-windows-app.ps1 -OutputDirectory "$env:RUNNER_TEMP/native-assets" -Version v9.0.2 -Commit 2222222222222222222222222222222222222222
+      - name: Real Windows process, task, web update and rollback rehearsals
+        shell: powershell
+        run: |
+          $env:CLI2API_NATIVE_REHEARSAL='1'
+          $env:CLI2API_NATIVE_TASK_REHEARSAL='1'
+          $env:CLI2API_NATIVE_APP_PACKAGE="$env:RUNNER_TEMP/native-assets/cli2api-app_windows_amd64.zip"
+          go test ./internal/updater -run TestNative -count=1 -v -timeout=15m
+      - name: First onboarding, repeat install, authentication and port conflict
+        shell: powershell
+        run: ./scripts/test-native-installer.ps1 -ApplicationDirectory "$env:RUNNER_TEMP/native-assets" -WorkDirectory "$env:RUNNER_TEMP/native-onboarding" -RequireTasks
 
   worker:
     runs-on: ubuntu-latest

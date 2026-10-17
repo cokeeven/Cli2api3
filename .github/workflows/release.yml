@@ -180,8 +180,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  native-assets:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build and verify Windows amd64 application package
+        shell: powershell
+        run: ./scripts/build-windows-app.ps1 -OutputDirectory release-assets -Version '${{ needs.prepare.outputs.tag }}' -Commit '${{ needs.prepare.outputs.sha }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-assets-${{ needs.prepare.outputs.tag }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
   draft:
-    needs: [prepare, assets]
+    needs: [prepare, assets, native-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -193,6 +216,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: updater-assets-${{ needs.prepare.outputs.tag }}
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-assets-${{ needs.prepare.outputs.tag }}
           path: release-assets
       - name: Extract bilingual release notes
         env:
@@ -323,8 +350,8 @@ jobs:
         run: |
           set -euo pipefail
           asset_count="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
-          if [[ "$asset_count" -ne 8 ]]; then
-            echo "$RELEASE_TAG has $asset_count assets, expected 8" >&2
+          if [[ "$asset_count" -ne 10 ]]; then
+            echo "$RELEASE_TAG has $asset_count assets, expected 10" >&2
             exit 1
           fi
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md --draft=false --latest
@@ -332,7 +359,7 @@ jobs:
             echo "## Published $RELEASE_TAG"
             echo
             echo "- Image: \`${{ needs.prepare.outputs.image }}:$RELEASE_TAG\`"
-            echo "- Updater assets: 6 binaries + SHA256 manifest + immutable image digest"
+            echo "- Updater assets: 6 binaries + SHA256 manifest + immutable image digest + Windows amd64 app + app checksums"
             echo "- Release notes: bilingual fragments from changelog/unreleased/"
           } >> "$GITHUB_STEP_SUMMARY"
 

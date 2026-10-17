@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/buildinfo"
 )
 
 type ReleaseChecker interface {
@@ -29,8 +31,9 @@ type Coordinator struct {
 	// Drain waits for in-flight business to finish before the pre-upgrade
 	// snapshot is taken. A timeout aborts the update before backup/submission,
 	// so an unfinished request is not cut off by container replacement.
-	Drain   func(context.Context) bool
-	DataDir string
+	Drain           func(context.Context) bool
+	DataDir         string
+	ExpectedBackend string
 
 	Maintenance atomic.Bool
 	Running     atomic.Bool
@@ -212,6 +215,10 @@ func (c *Coordinator) HandleApply(w http.ResponseWriter, r *http.Request) {
 	statusCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	status, _ := c.Agent.Status(statusCtx)
 	cancel()
+	if err := c.checkBackend(status); err != nil {
+		writeErr(w, http.StatusConflict, "updater_backend_mismatch", err.Error())
+		return
+	}
 	job := c.adoptPrepared(status)
 	if job == nil || job.State != "ready_to_apply" {
 		writeErr(w, http.StatusConflict, "update_not_ready", "The target image is not ready to apply")
@@ -236,8 +243,8 @@ func (c *Coordinator) HandleApply(w http.ResponseWriter, r *http.Request) {
 func (c *Coordinator) HandleInfo(w http.ResponseWriter, r *http.Request) {
 	info, err := c.Checker.Check(r.Context(), r.URL.Query().Get("force") == "1")
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "update_check_failed", err.Error())
-		return
+		_, versionErr := ParseVersion(buildinfo.Version)
+		info = Info{CurrentVersion: buildinfo.Version, Managed: versionErr == nil, Warning: err.Error()}
 	}
 	statusCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
@@ -245,9 +252,9 @@ func (c *Coordinator) HandleInfo(w http.ResponseWriter, r *http.Request) {
 	if statusErr != nil {
 		status = AgentStatus{Available: false, State: "unavailable", Error: statusErr.Error()}
 	}
-	job := c.adoptPrepared(status)
+	job := c.adoptAgentStatus(status)
 	if job == nil && status.State == "succeeded" && strings.TrimSpace(status.JobID) != "" {
-		job = &Job{JobID: "agent-" + status.JobID, AgentJobID: status.JobID, State: "succeeded", CurrentVersion: status.CurrentVersion, TargetVersion: status.TargetVersion, StartedAt: status.StartedAt, FinishedAt: status.FinishedAt}
+		job = &Job{JobID: c.agentClientJobID(status), AgentJobID: status.JobID, State: "succeeded", CurrentVersion: status.CurrentVersion, TargetVersion: status.TargetVersion, StartedAt: status.StartedAt, FinishedAt: status.FinishedAt}
 	}
 	c.recordPreservedDatabase(status)
 	if job != nil && strings.TrimSpace(status.PreservedDatabasePath) != "" {
@@ -329,6 +336,9 @@ func (c *Coordinator) prepareImage(jobID string) {
 	statusCtx, statusCancel := context.WithTimeout(ctx, 3*time.Second)
 	status, err := c.Agent.Status(statusCtx)
 	statusCancel()
+	if mismatch := c.checkBackend(status); err == nil && mismatch != nil {
+		err = mismatch
+	}
 	if err != nil || !status.Available {
 		message := "Updater daemon is unavailable"
 		if err != nil {
@@ -355,6 +365,9 @@ func (c *Coordinator) prepareImage(jobID string) {
 
 	setUpdateState("submitting")
 	request := PrepareRequest{CurrentVersion: info.CurrentVersion, TargetVersion: info.NextVersion}
+	if c.ExpectedBackend == "windows-native" {
+		request.ClientJobID = jobID
+	}
 	prepareCtx, prepareCancel := context.WithTimeout(ctx, 8*time.Second)
 	response, err := agent.Prepare(prepareCtx, request)
 	prepareCancel()
@@ -406,6 +419,9 @@ func (c *Coordinator) prepareOneShot(jobID string) {
 	statusCtx, statusCancel := context.WithTimeout(ctx, 3*time.Second)
 	status, err := c.Agent.Status(statusCtx)
 	statusCancel()
+	if mismatch := c.checkBackend(status); err == nil && mismatch != nil {
+		err = mismatch
+	}
 	if err != nil || !status.Available {
 		message := "Updater daemon is unavailable"
 		if err != nil {
@@ -457,6 +473,9 @@ func (c *Coordinator) rollback(jobID, targetVersion string, restoreDatabase bool
 	statusCtx, statusCancel := context.WithTimeout(ctx, 3*time.Second)
 	status, err := c.Agent.Status(statusCtx)
 	statusCancel()
+	if mismatch := c.checkBackend(status); err == nil && mismatch != nil {
+		err = mismatch
+	}
 	if err != nil || !status.Available {
 		message := "Updater daemon is unavailable"
 		if err != nil {
@@ -494,13 +513,16 @@ func (c *Coordinator) submitOneShot(jobID, currentVersion, targetVersion string,
 		return
 	}
 	c.Mutate(jobID, func(job *Job) {
-		job.BackupPath = filepath.Join("/data/backups", backup.Name)
+		job.BackupPath = c.agentBackupPath(backup)
 		job.State = "submitting"
 	})
 	request := ApplyRequest{
 		CurrentVersion: currentVersion,
 		TargetVersion:  targetVersion,
-		BackupPath:     filepath.Join("/data/backups", backup.Name),
+		BackupPath:     c.agentBackupPath(backup),
+	}
+	if c.ExpectedBackend == "windows-native" {
+		request.ClientJobID = jobID
 	}
 	if len(restoreDatabase) > 0 && restoreDatabase[0] {
 		request.RestoreDatabase = true
@@ -568,10 +590,13 @@ func (c *Coordinator) applyPrepared(jobID string) {
 		return
 	}
 	c.Mutate(jobID, func(job *Job) {
-		job.BackupPath = filepath.Join("/data/backups", backup.Name)
+		job.BackupPath = c.agentBackupPath(backup)
 		job.State = "submitting"
 	})
-	request := ApplyRequest{CurrentVersion: job.CurrentVersion, TargetVersion: job.TargetVersion, BackupPath: filepath.Join("/data/backups", backup.Name)}
+	request := ApplyRequest{CurrentVersion: job.CurrentVersion, TargetVersion: job.TargetVersion, BackupPath: c.agentBackupPath(backup)}
+	if c.ExpectedBackend == "windows-native" {
+		request.ClientJobID = jobID
+	}
 	applyCtx, applyCancel := context.WithTimeout(ctx, 8*time.Second)
 	response, err := agent.ApplyPrepared(applyCtx, request)
 	applyCancel()
@@ -599,8 +624,8 @@ func (c *Coordinator) monitorPrepared(jobID, agentJobID string) {
 			case "ready_to_apply":
 				c.setPreparedState(jobID, "ready_to_apply", "")
 				return
-			case "failed":
-				c.setPreparedState(jobID, "failed", status.Error)
+			case "failed", "recovery_failed", "download_failed", "verification_failed":
+				c.setPreparedState(jobID, status.State, status.Error)
 				return
 			case "idle":
 				c.setPreparedState(jobID, "failed", "Update cancelled")
@@ -653,7 +678,7 @@ func (c *Coordinator) adoptPrepared(status AgentStatus) *Job {
 		copy := *c.Job
 		return &copy
 	}
-	job := &Job{JobID: "agent-" + status.JobID, AgentJobID: status.JobID, State: "ready_to_apply", CurrentVersion: status.CurrentVersion, TargetVersion: status.TargetVersion, StartedAt: status.StartedAt}
+	job := &Job{JobID: c.agentClientJobID(status), AgentJobID: status.JobID, State: "ready_to_apply", CurrentVersion: status.CurrentVersion, TargetVersion: status.TargetVersion, StartedAt: status.StartedAt}
 	c.Job = job
 	c.Running.Store(true)
 	copy := *job
@@ -676,9 +701,9 @@ func applyingPreparedUpdate(job *Job) bool {
 
 func updaterApplyActive(status AgentStatus) bool {
 	switch status.State {
-	case "recreating", "rolling_back":
+	case "recreating", "rolling_back", "stopping", "replacing", "starting":
 		return true
-	case "queued", "preparing", "pulling", "host_binary", "checking":
+	case "queued", "preparing", "pulling", "host_binary", "checking", "verifying":
 		return status.BackupPath != ""
 	default:
 		return false
@@ -699,7 +724,7 @@ func cancellablePreparedUpdate(job *Job, status AgentStatus) bool {
 		}
 	}
 	switch status.State {
-	case "queued", "pulling", "host_binary", "preparing", "image_ready":
+	case "queued", "pulling", "host_binary", "preparing", "image_ready", "downloading", "verifying", "extracting":
 		return status.BackupPath == ""
 	default:
 		return false
@@ -711,7 +736,7 @@ func hostCancellable(status AgentStatus) bool {
 		return true
 	}
 	switch status.State {
-	case "queued", "pulling", "host_binary", "preparing", "image_ready":
+	case "queued", "pulling", "host_binary", "preparing", "image_ready", "downloading", "verifying", "extracting":
 		return status.BackupPath == ""
 	default:
 		return false
@@ -751,7 +776,7 @@ func (c *Coordinator) monitor(jobID, agentJobID string) {
 		status, err := c.Agent.Status(ctx)
 		cancel()
 		if err == nil && (status.JobID == "" || status.JobID == agentJobID) {
-			if status.State == "failed" {
+			if status.State == "failed" || status.State == "recovery_failed" {
 				c.Finish(jobID, "failed", status.Error, true)
 				c.Maintenance.Store(false)
 				c.Running.Store(false)
@@ -795,7 +820,7 @@ func newSystemUpdateJobID() (string, error) {
 
 func updaterStateActive(state string) bool {
 	switch state {
-	case "queued", "preparing", "pulling", "host_binary", "recreating", "checking", "rolling_back", "ready_to_apply":
+	case "queued", "preparing", "pulling", "host_binary", "recreating", "checking", "rolling_back", "ready_to_apply", "downloading", "verifying", "extracting", "stopping", "replacing", "starting":
 		return true
 	default:
 		return false
@@ -807,4 +832,63 @@ func BlocksDuringUpdate(path string) bool {
 		return false
 	}
 	return strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/v1/")
+}
+
+func (c *Coordinator) checkBackend(s AgentStatus) error {
+	expected := c.ExpectedBackend
+	if expected == "" {
+		expected = "docker"
+	}
+	actual := s.Backend
+	if actual == "" {
+		actual = "docker"
+	}
+	if expected != actual {
+		return fmt.Errorf("updater backend mismatch: gateway %s, agent %s", expected, actual)
+	}
+	return nil
+}
+func (c *Coordinator) agentBackupPath(b accounts.Backup) string {
+	if c.ExpectedBackend == "windows-native" {
+		return b.Path
+	}
+	return path.Join("/data/backups", b.Name)
+}
+func (c *Coordinator) adoptAgentStatus(s AgentStatus) *Job {
+	if s.State == "ready_to_apply" {
+		return c.adoptPrepared(s)
+	}
+	if s.JobID == "" || !s.Available {
+		return c.Snapshot()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Job != nil && applyingPreparedUpdate(c.Job) && c.Job.AgentJobID != s.JobID {
+		copy := *c.Job
+		return &copy
+	}
+	if c.Job == nil || c.Job.AgentJobID == s.JobID {
+		state := s.State
+		if updaterApplyActive(s) {
+			state = "running"
+		} else if updaterStateActive(s.State) {
+			state = "preparing_image"
+		}
+		c.Job = &Job{JobID: c.agentClientJobID(s), AgentJobID: s.JobID, State: state, CurrentVersion: s.CurrentVersion, TargetVersion: s.TargetVersion, BackupPath: s.BackupPath, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt, Error: s.Error}
+		active := updaterStateActive(s.State)
+		c.Running.Store(active)
+		c.Maintenance.Store(updaterApplyActive(s))
+	}
+	if c.Job == nil {
+		return nil
+	}
+	copy := *c.Job
+	return &copy
+}
+
+func (c *Coordinator) agentClientJobID(s AgentStatus) string {
+	if c.ExpectedBackend == "windows-native" && s.ClientJobID != "" {
+		return s.ClientJobID
+	}
+	return "agent-" + s.JobID
 }

@@ -92,7 +92,7 @@ Model:    <API 接入页面或 /v1/models 返回的模型 ID>
 
 ## 更新与数据保护
 
-正式版本来自 [本仓库 Releases](https://github.com/cokeeven/Cli2api3/releases) 与 `ghcr.io/cokeeven/ali2api3`。安装宿主更新器后，可在系统设置中**先下载、再确认升级**。当前托管更新适用于 Docker Compose 部署；源码或 Windows 原生运行不直接使用这条更新链路。
+正式版本来自 [本仓库 Releases](https://github.com/cokeeven/Cli2api3/releases) 与 `ghcr.io/cokeeven/ali2api3`。安装宿主更新器后，可在系统设置中**先下载、再确认升级**。托管更新支持 Docker Compose；Windows amd64 原生部署首次按[接入说明](deploy/README.md#windows-native-updates)安装独立更新器后，也可使用同一网页流程。原生运行包及安装脚本须来自包含本功能的正式版本，不能仅安装旧版 updater.exe。
 
 - 升级前等待在途请求结束，创建 SQLite 一致快照并校验完整性；排空或校验失败时停止升级。
 - 程序与持久数据分离；默认程序回退保留当前数据库，旧库恢复需要独立验证与保全最新数据。

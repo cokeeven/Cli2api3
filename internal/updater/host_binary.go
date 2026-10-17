@@ -132,6 +132,10 @@ func (e *Executor) RestartHost() {
 }
 
 func (e *Executor) downloadReleaseFile(ctx context.Context, version, name string) ([]byte, error) {
+	return e.downloadReleaseFileLimit(ctx, version, name, maxHostBinaryBytes)
+}
+
+func (e *Executor) downloadReleaseFileLimit(ctx context.Context, version, name string, limit int64) ([]byte, error) {
 	if e.fetch != nil {
 		return e.fetch(ctx, version, name)
 	}
@@ -153,7 +157,7 @@ func (e *Executor) downloadReleaseFile(ctx context.Context, version, name string
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			body, err := e.downloadCandidate(ctx, candidate, proxy, config.DownloadTimeout)
+			body, err := e.downloadCandidateLimit(ctx, candidate, proxy, config.DownloadTimeout, limit)
 			label := updatenet.Label(candidate)
 			if proxy != "" {
 				label += " (proxy)"
@@ -169,6 +173,10 @@ func (e *Executor) downloadReleaseFile(ctx context.Context, version, name string
 }
 
 func (e *Executor) downloadCandidate(ctx context.Context, candidate, proxy string, timeout int) ([]byte, error) {
+	return e.downloadCandidateLimit(ctx, candidate, proxy, timeout, maxHostBinaryBytes)
+}
+
+func (e *Executor) downloadCandidateLimit(ctx context.Context, candidate, proxy string, timeout int, limit int64) ([]byte, error) {
 	allowed := func(u *url.URL) bool {
 		return validateHostBinaryURL(u.String()) == nil || updatenet.SameOrigin(candidate, u)
 	}
@@ -191,8 +199,8 @@ func (e *Executor) downloadCandidate(ctx context.Context, candidate, proxy strin
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHostBinaryBytes+1))
-	if err != nil || len(body) == 0 || len(body) > maxHostBinaryBytes {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil || len(body) == 0 || int64(len(body)) > limit {
 		return nil, fmt.Errorf("empty, incomplete or oversized asset")
 	}
 	return body, nil

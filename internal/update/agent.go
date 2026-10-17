@@ -14,11 +14,13 @@ import (
 const AgentProtocolVersion = 2
 
 type PrepareRequest struct {
+	ClientJobID    string `json:"client_job_id,omitempty"`
 	CurrentVersion string `json:"current_version"`
 	TargetVersion  string `json:"target_version"`
 }
 
 type ApplyRequest struct {
+	ClientJobID    string `json:"client_job_id,omitempty"`
 	CurrentVersion string `json:"current_version"`
 	TargetVersion  string `json:"target_version"`
 	BackupPath     string `json:"backup_path"`
@@ -34,6 +36,9 @@ type ApplyResponse struct {
 }
 
 type AgentStatus struct {
+	PID             int               `json:"pid,omitempty"`
+	ClientJobID     string            `json:"client_job_id,omitempty"`
+	Backend         string            `json:"backend,omitempty"`
 	Network         *updatenet.Status `json:"network,omitempty"`
 	ProtocolVersion int               `json:"protocol_version"`
 	Available       bool              `json:"available"`

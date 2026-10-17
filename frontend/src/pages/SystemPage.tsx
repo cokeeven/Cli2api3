@@ -25,10 +25,7 @@ import { CheckinDefaults } from '@/components/checkin/CheckinDefaults'
 import { VersionHistory } from '@/components/VersionHistory'
 import { buildVersionHistory } from '@/lib/versionHistory'
 
-const busyStates = new Set(['preparing', 'preparing_image', 'checking', 'backing_up', 'submitting', 'running', 'queued', 'pulling', 'host_binary', 'image_ready', 'recreating', 'rolling_back'])
-const applyJobStates = new Set(['backing_up', 'running'])
-const applyAgentStates = new Set(['recreating', 'rolling_back'])
-const progressAgentStates = new Set(['queued', 'pulling', 'host_binary', 'image_ready', 'preparing', 'recreating', 'checking', 'rolling_back'])
+import { busyStates, applyJobStates, applyAgentStates, progressAgentStates, updateFailed } from '@/lib/updateState'
 
 export function SystemPage() {
   const { t } = useI18n()
@@ -64,7 +61,7 @@ export function SystemPage() {
       // A managed build that carries a warning fell back to a cached or empty
       // listing because the release source was unreachable.
       setCheckFailed(Boolean(result.managed && result.warning))
-      const failed = result.update?.state === 'failed' || result.update?.state === 'rolled_back' || result.agent?.state === 'failed' || result.agent?.state === 'rolled_back'
+      const failed = [result.update?.state, result.agent?.state].some(updateFailed)
       if (failed) {
         setError(result.update?.error || result.agent?.error || t('updateFailedHint'))
       } else if (!quiet) {
@@ -335,7 +332,7 @@ export function SystemPage() {
                   check: a dev build with a connected updater, or a released
                   build with no daemon, must both read correctly. */}
               <Chip size="sm" variant="soft" color={info?.agent?.available ? 'success' : 'warning'}>
-                {info?.agent?.available ? t('updateStatusUpdaterConnected') : t('updateStatusUpdaterDisconnected')}
+                {info?.agent?.available ? t(info.agent.backend === 'windows-native' ? 'updateStatusNativeConnected' : 'updateStatusUpdaterConnected') : t('updateStatusUpdaterDisconnected')}
               </Chip>
             </div>
           </div>

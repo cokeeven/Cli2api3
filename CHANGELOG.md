@@ -3,6 +3,64 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.8 - 2026-10-18
+
+### English
+
+- WorkBuddy and Trae reject incomplete or mismatched caller tool history instead of silently removing tool rounds. Explicit named tool choices must refer to a declared tool.
+- Compatibility responses reject empty function arguments instead of manufacturing an executable empty object; confirmed usage is retained without replay. Explicit instruction stripping now uses the same role matching as its diagnostic decision.
+- Report local concurrency saturation separately from upstream rate limits, add a bounded FIFO wait queue for eligible WorkBuddy/Trae requests, and show queue outcome and wait details in request diagnostics.
+- Settle and release a retry's prior account slot and usage reservation before it joins the fair queue, so earlier waiters can use that capacity.
+- Keep cooldown reasons and bounded reset evidence with their account or model scope, and show known fields in route diagnostics while leaving missing historical evidence unknown.
+- Add a protected, local model-usage view for WorkBuddy and Trae with bounded filters, request/attempt usage coverage, current route candidates, and linked request details.
+- Add a manually selected, single-account short probe with a small explicit request budget, cancellation, concurrency limits, and validation of the observed account, visible output, upstream finish reason, and actual usage.
+- Show WorkBuddy budget observations only from distinct 6004 events with explicit reset anchors and complete usage windows; keep Trae single-model balance unknown without a verified source.
+- Store only an allowlisted public API path for new request logs; keep historical paths unknown, and require a known matching path and upstream-reported plan for cross-account references.
+- Add disclosed three-UTC-day 6/3/1 estimates, per-account-balanced references, sample ranges and freshness; exclude explicitly non-billable refusals from usage gaps while retaining canceled attempts with actual usage.
+- Explain classified upstream limits separately from caller API-key rejection, distinguish upstream resets from local retry times, and expose redacted technical details on demand.
+- Record upstream finish reason and source on request logs for output-length diagnostics. Historical rows remain unknown.
+- Give each WorkBuddy budget row a stable identity that includes its full account/model/plan/request-path grouping dimensions.
+- Disclose narrowly-scoped Trae output-budget evidence in model entries and request diagnostics; keep untested models, missing usage, and incomparable token bases explicit without changing upstream requests or finish reasons.
+- Persist account-level quota restriction evidence independently from cooldown timers, so a quota error without an upstream reset remains diagnosable without inventing a retry deadline or relabeling an existing auth cooldown.
+- Preserve this bounded evidence through quota refreshes and SQLite restart, and show its code, source, applied/reported scope, observation times, and any confirmed upstream reset in route diagnostics.
+- Keep legacy quota snapshots and missing reset values unknown; evidence excludes provider messages and request content.
+- Preserve Trae stream termination reasons and report incomplete streams as failures instead of successful completions.
+- Map caller output limits and supported reasoning settings to WorkBuddy and Trae requests; reject explicit unsupported reasoning levels instead of silently lowering them, and expose sourced cache usage in OpenAI responses.
+- Keep request message-shape history and add redacted stream diagnostics for finish reasons, cancellation stage, and phase timings.
+- Add separate WorkBuddy/Trae chat deadlines, preserve known non-stream usage on failure without replay, and discard obsolete catalog tasks after account lifecycle changes.
+- Extend the existing maintenance panel with credential/quota history, independent schedules, manual actions and stale quota indications. Optional process-scoped source fingerprints are disabled by default and only trust explicitly configured proxies.
+- Release skipped quota work before it can block manual refreshes. Successful maintenance follows the current configured period; failed runs retain their persisted retry backoff.
+- Let WorkBuddy/Trae failover reach eligible accounts beyond four within the configured account cap and total deadline; invalidate failed authentication affinity safely and retain candidate exclusions, upstream failures and final scheduling reasons in request details.
+- Preserve a valid upstream WorkBuddy business code in error diagnostics while classifying error kind, scope, and retry safety independently.
+
+### 中文
+
+- WorkBuddy 和 Trae 对残缺或配对错误的调用方工具历史明确报错，不再静默删除工具轮次；显式指定的工具必须已声明。
+- 兼容响应拒绝空函数参数，不再构造可执行的空对象；保留已确认用量且不重放请求。显式指令剥离与诊断判定采用一致的角色匹配规则。
+- 将本机并发容量不足与上游频率限制分开；为符合条件的 WorkBuddy/Trae 请求增加有界 FIFO 等待队列，并在请求诊断中展示排队结果和等待信息。
+- 重试重新进入公平等待队列前先结算并释放上次失败尝试的账号槽位和用量预留，避免占槽阻塞较早的等待请求。
+- 冷却原因和有限的重置证据按账号或模型作用域分别保存，并在路由诊断中展示已知字段；历史缺失证据继续保持未知。
+- 新增受保护的本地 WorkBuddy/Trae 模型用量页，提供有界筛选、请求与尝试用量覆盖、当前路由候选及关联请求详情。
+- 新增管理员手动选择账号的短探测，采用明确的小请求预算，支持取消与并发限制，并校验实际账号、可见正文、上游结束原因和实际 usage。
+- WorkBuddy 预算观测仅依据去重后的明确 6004、上游重置锚点及完整用量窗口；Trae 单模型余额没有已验证来源时保持未知。
+- 新请求日志只记录白名单公开接口路径，历史路径保持未知；跨账号参考要求套餐快照和接口路径均已知且一致。
+- 增加明确披露的近3个UTC统计日6/3/1加权、按账号均衡参考、样本范围与新鲜度；非计费拒绝不再误算为用量缺失，取消尝试中已确认的实际usage仍计入。
+- 分开说明已分类的上游限制与调用方 API Key 拒绝，区分上游重置时间和本地重试时间，并按需展开脱敏技术详情。
+- 请求日志记录上游结束原因及其来源，便于诊断输出长度终止；历史记录仍保持未知。
+- WorkBuddy 预算行的稳定标识包含账号、地区、模型、套餐和请求路径全部分组维度，避免不同路径的样本行互相覆盖。
+- 在模型目录和请求日志中披露有范围限制的 Trae 输出预算证据；未验证模型、缺失用量和不可比较口径保持明确未知，不修改上游请求或结束原因。
+- 将账号额度限制证据与冷却计时分开持久化；上游未提供重置时间时仍可诊断，不伪造重试截止时间，也不改写已有认证冷却原因。
+- 额度刷新与 SQLite 重启后保留这组有限证据，并在路由诊断中展示分类码、来源、实际/报告范围、观测时间及已确认的上游重置时间。
+- 历史额度快照和缺失的重置时间继续保持未知；证据不包含上游错误正文或请求内容。
+- 保留 Trae 流的结束原因；未完整结束的流按失败记录，避免显示为成功完成。
+- 将调用方的输出上限和受支持的推理设置映射到 WorkBuddy、Trae 请求；明确拒绝不受支持的推理强度，避免静默降低，并在 OpenAI 响应中提供有来源依据的缓存用量。
+- 保留请求消息形状记录，并增加脱敏流诊断，展示结束原因、取消阶段和阶段耗时。
+- 增加 WorkBuddy/Trae 分层聊天超时；非流式失败保留已知用量并阻止已产生输出后的重放；账号生命周期变化后丢弃失效目录任务。
+- 在已有维护面板补充凭据/额度历史、独立排程、手动入口和额度陈旧提示。来源指纹默认关闭，仅在当前进程内关联，且只信任显式配置的代理。
+- 跳过的额度任务不再阻塞后续手动刷新；成功维护按当前配置周期调度，失败任务仍保留持久化重试退避。
+- WorkBuddy/Trae 在配置账号上限和总时限内可继续尝试第 5 个及之后的合格账号；安全解除认证失败账号的粘性，并在请求详情保留候选排除原因、上游失败与最终调度停止原因。
+- 在 WorkBuddy 错误诊断中保留有效的上游业务码，并独立判断错误类型、作用范围和重试安全性。
+
 ## 0.1.7 - 2026-10-17
 
 ### English

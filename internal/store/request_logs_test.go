@@ -2,11 +2,163 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestRequestDiagnosticsMigrationPreservesLegacyData(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "legacy-diagnostics.db")
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := &Store{db: database}
+	if _, err := database.ExecContext(ctx, schemaMigrationsDDL); err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range sqliteMigrations[:27] {
+		if err := legacy.applyMigration(ctx, migration); err != nil {
+			t.Fatalf("apply %s: %v", migration.filename, err)
+		}
+	}
+	_, err = database.ExecContext(ctx, `
+INSERT INTO accounts (id, name, provider, provider_region, created_at, updated_at) VALUES ('synthetic-account', 'Synthetic', 'workbuddy', 'cn', '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+INSERT INTO account_credential_payloads (account_id, format, payload, updated_at) VALUES ('synthetic-account', 'test', 'synthetic-credential-payload', '2026-10-17T00:00:00Z');
+INSERT INTO api_keys (id, name, key_hash, prefix, providers_json, created_at, updated_at) VALUES ('synthetic-key-id', 'Synthetic key', 'synthetic-hash', 'sk-test', '["workbuddy:cn"]', '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+INSERT INTO provider_model_settings (provider, model_id, max_mode, reasoning_effort, updated_at) VALUES ('workbuddy', 'test-model', 1, 'high', '2026-10-17T00:00:00Z');
+INSERT INTO app_secrets (name, value, created_at, updated_at) VALUES ('synthetic-config', 'test-config-value', '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+INSERT INTO request_logs (id, created_at, status, requested_model, account_id, message_count, empty_message_indexes, message_roles) VALUES ('synthetic-request', '2026-10-17T00:00:00Z', 'error', 'test-model', 'synthetic-account', 3, '[1]', '["system","user","assistant"]');
+INSERT INTO request_attempts (id, request_id, attempt_index, account_id, started_at, status) VALUES ('synthetic-attempt', 'synthetic-request', 0, 'synthetic-account', '2026-10-17T00:00:00Z', 'error');
+INSERT INTO request_stream_diagnostics (request_id, created_at, finished_at, content_length, saw_done) VALUES ('synthetic-request', '2026-10-17T00:00:00Z', '2026-10-17T00:00:01Z', 0, 0);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := OpenStore(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	var payload string
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT CAST(payload AS TEXT) FROM account_credential_payloads WHERE account_id = 'synthetic-account'`).Scan(&payload); err != nil || payload != "synthetic-credential-payload" {
+		t.Fatalf("credential payload=%q err=%v", payload, err)
+	}
+	var keyCount, settingMaxMode int
+	var settingReasoning, configValue string
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM api_keys WHERE id = 'synthetic-key-id' AND key_hash = 'synthetic-hash'`).Scan(&keyCount); err != nil || keyCount != 1 {
+		t.Fatalf("synthetic key count=%d err=%v", keyCount, err)
+	}
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT max_mode, reasoning_effort FROM provider_model_settings WHERE provider='workbuddy' AND model_id='test-model'`).Scan(&settingMaxMode, &settingReasoning); err != nil || settingMaxMode != 1 || settingReasoning != "high" {
+		t.Fatalf("provider settings=%d/%q err=%v", settingMaxMode, settingReasoning, err)
+	}
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT value FROM app_secrets WHERE name='synthetic-config'`).Scan(&configValue); err != nil || configValue != "test-config-value" {
+		t.Fatalf("synthetic config=%q err=%v", configValue, err)
+	}
+	log, err := upgraded.GetRequestLog(ctx, "synthetic-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log.MessageCount != 3 || len(log.MessageRoles) != 3 || len(log.EmptyMessageIndexes) != 1 || log.MessageShapeKnown {
+		t.Fatalf("legacy request history changed or guessed as known: %+v", log)
+	}
+	if len(log.Attempts) != 1 || log.Attempts[0].ProviderPlan != "" || log.FinishReason != "" || log.FinishReasonSource != "" || log.OutputBudgetEnforcement != "" || log.StreamDiagnostic == nil || log.StreamDiagnostic.ContentLength != nil || log.StreamDiagnostic.OutputBudgetEnforcement != "" {
+		t.Fatalf("legacy request children or unknown content length changed: %+v", log)
+	}
+	var migrationCount int
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE filename = '028_request_diagnostics.sql'`).Scan(&migrationCount); err != nil || migrationCount != 1 {
+		t.Fatalf("028 migration count=%d err=%v", migrationCount, err)
+	}
+	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE filename = '036_output_budget_evidence.sql'`).Scan(&migrationCount); err != nil || migrationCount != 1 {
+		t.Fatalf("036 migration count=%d err=%v", migrationCount, err)
+	}
+}
+
+func TestRequestLogFinishReasonSurvivesCompletionAndList(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "finish-reason.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	if err := store.InsertRequestLog(ctx, accounts.RequestLog{
+		ID: "req-finish-length", CreatedAt: now, Status: accounts.RequestStatusStarted,
+		RequestedModel: "glm-5.3", Provider: "workbuddy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRequestLog(ctx, accounts.RequestLog{
+		ID: "req-finish-length", FinishedAt: &now, Status: accounts.RequestStatusOK,
+		RequestedModel: "glm-5.3", Provider: "workbuddy", FinishReason: "length", FinishReasonSource: "upstream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRequestLog(ctx, "req-finish-length")
+	if err != nil || got.FinishReason != "length" || got.FinishReasonSource != "upstream" {
+		t.Fatalf("get finish reason=%q/%q err=%v", got.FinishReason, got.FinishReasonSource, err)
+	}
+	listed, err := store.ListRequestLogs(ctx, accounts.RequestLogFilter{Limit: 10})
+	if err != nil || len(listed.Items) != 1 || listed.Items[0].FinishReason != "length" || listed.Items[0].FinishReasonSource != "upstream" {
+		t.Fatalf("listed finish reasons=%+v err=%v", listed.Items, err)
+	}
+}
+
+func TestRequestLogOutputBudgetEnforcementPersistsAndEmptyUpdatesPreserve(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "output-budget.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	limit := 16000
+	if err := store.InsertRequestLog(ctx, accounts.RequestLog{
+		ID: "req-budget-evidence", CreatedAt: now, Status: accounts.RequestStatusStarted,
+		RequestedModel: "glm-5.3", Provider: "trae", OutputLimit: &limit, OutputLimitSource: "caller",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRequestLog(ctx, accounts.RequestLog{
+		ID: "req-budget-evidence", FinishedAt: &now, Status: accounts.RequestStatusOK,
+		RequestedModel: "glm-5.3", Provider: "trae", OutputLimit: &limit, OutputLimitSource: "caller",
+		OutputBudgetEnforcement: "observed_ignored",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Later lifecycle writes may omit optional diagnostic fields; they must not
+	// erase a classification already recorded for this request.
+	if err := store.UpdateRequestLog(ctx, accounts.RequestLog{
+		ID: "req-budget-evidence", FinishedAt: &now, Status: accounts.RequestStatusOK,
+		RequestedModel: "glm-5.3", Provider: "trae",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRequestStreamDiagnostic(ctx, accounts.RequestStreamDiagnostic{
+		RequestID: "req-budget-evidence", CreatedAt: now, OutputBudgetEnforcement: "observed_ignored",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRequestStreamDiagnostic(ctx, accounts.RequestStreamDiagnostic{
+		RequestID: "req-budget-evidence", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRequestLog(ctx, "req-budget-evidence")
+	if err != nil || got.OutputBudgetEnforcement != "observed_ignored" || got.StreamDiagnostic == nil || got.StreamDiagnostic.OutputBudgetEnforcement != "observed_ignored" {
+		t.Fatalf("stored request budget evidence=%q stream=%+v err=%v", got.OutputBudgetEnforcement, got.StreamDiagnostic, err)
+	}
+	listed, err := store.ListRequestLogs(ctx, accounts.RequestLogFilter{Limit: 10})
+	if err != nil || len(listed.Items) != 1 || listed.Items[0].OutputBudgetEnforcement != "observed_ignored" {
+		t.Fatalf("listed request budget evidence=%+v err=%v", listed.Items, err)
+	}
+}
 
 func TestRequestLogsInsertListGetAndPurge(t *testing.T) {
 	ctx := context.Background()
@@ -53,7 +205,7 @@ func TestRequestLogsInsertListGetAndPurge(t *testing.T) {
 		RequestID: parentID, CreatedAt: now, FinishedAt: &finished, UpstreamStatus: &upstreamStatus,
 		ContextErr: "context canceled", CancellationSource: "request_context_canceled",
 		RelayError: "stream read error: context canceled", SSEEventCount: 4, BytesRead: 512,
-		ContentLength: -1, LastEvent: "message", SawDone: false,
+		ContentLength: nil, LastEvent: "message", SawDone: false,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +309,52 @@ func TestRequestLogsInsertListGetAndPurge(t *testing.T) {
 	}
 	if usageRows != 0 {
 		t.Fatalf("usage detail rows survived clear: %d", usageRows)
+	}
+}
+
+func TestRequestLogFinishWithoutMessageShapePreservesStartShape(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "request-shape.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	created := time.Now().UTC()
+	if err := store.InsertRequestLog(ctx, accounts.RequestLog{
+		ID: "req_shape_preserve", CreatedAt: created, Status: accounts.RequestStatusStarted,
+		RequestedModel: "trae/glm-5.3", MessageCount: 2, MessageShapeKnown: true,
+		EmptyMessageIndexes: []int{1}, MessageRoles: []string{"system", "user"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finished := created.Add(time.Second)
+	if err := store.UpdateRequestLog(ctx, accounts.RequestLog{
+		ID: "req_shape_preserve", CreatedAt: created, FinishedAt: &finished,
+		Status: accounts.RequestStatusOK, RequestedModel: "trae/glm-5.3",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetRequestLog(ctx, "req_shape_preserve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.MessageShapeKnown || got.MessageCount != 2 || len(got.EmptyMessageIndexes) != 1 || got.EmptyMessageIndexes[0] != 1 ||
+		len(got.MessageRoles) != 2 || got.MessageRoles[0] != "system" || got.MessageRoles[1] != "user" {
+		t.Fatalf("final request log lost the message shape recorded at start: %+v", got)
+	}
+	if err := store.UpdateRequestLog(ctx, accounts.RequestLog{
+		ID: "req_shape_preserve", Status: accounts.RequestStatusError, MessageShapeKnown: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.GetRequestLog(ctx, "req_shape_preserve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.MessageShapeKnown || got.MessageCount != 0 || len(got.EmptyMessageIndexes) != 0 || len(got.MessageRoles) != 0 {
+		t.Fatalf("explicitly supplied empty shape did not replace the earlier value: %+v", got)
 	}
 }
 

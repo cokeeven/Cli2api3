@@ -24,11 +24,15 @@ func TestPrepareBodyMapsDeveloperToSupportedInstructionRole(t *testing.T) {
 }
 
 func TestToolCallsFinishReasonMatchesOpenAI(t *testing.T) {
-	for _, reason := range []string{"stop", "length"} {
+	for _, reason := range []string{"", "stop", "length"} {
 		t.Run(reason, func(t *testing.T) {
-			raw := "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function_call\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"" + reason + "\"}\n\n"
+			done := `{"finish_reason":"` + reason + `"}`
+			if reason == "" {
+				done = `{}`
+			}
+			raw := "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function_call\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}\n\nevent: done\ndata: " + done + "\n\n"
 			want := reason
-			if reason == "stop" {
+			if reason == "" || reason == "stop" {
 				want = "tool_calls"
 			}
 			obj, err := Aggregate(strings.NewReader(raw))
@@ -36,7 +40,10 @@ func TestToolCallsFinishReasonMatchesOpenAI(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got := obj["choices"].([]map[string]any)[0]["finish_reason"]; got != want {
-				t.Fatalf("finish=%v want=%s", got, want)
+				t.Fatalf("finish=%v want=%s object=%#v", got, want, obj)
+			}
+			if len(obj["choices"].([]map[string]any)[0]["message"].(map[string]any)["tool_calls"].([]any)) != 1 {
+				t.Fatalf("non-stream tool call lost or repeated: %#v", obj)
 			}
 			src := io.NopCloser(strings.NewReader(raw))
 			resp, _ := startSoloRewrite(src, src, "test")
@@ -47,6 +54,9 @@ func TestToolCallsFinishReasonMatchesOpenAI(t *testing.T) {
 			}
 			if !strings.Contains(string(data), `"finish_reason":"`+want+`"`) {
 				t.Fatalf("stream finish missing: %s", data)
+			}
+			if strings.Count(string(data), `"id":"call_a"`) != 1 || strings.Contains(string(data), `"content"`) {
+				t.Fatalf("tool-only stream lost/repeated call or invented body content: %s", data)
 			}
 		})
 	}

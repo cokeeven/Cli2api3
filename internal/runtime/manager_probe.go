@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
 )
@@ -24,14 +25,14 @@ func (m *Manager) RefreshAccount(ctx context.Context, id string, forceQuota bool
 	if !ok {
 		return fmt.Errorf("account %s is not running", id)
 	}
-	return m.refreshOne(ctx, item, forceQuota)
+	return m.refreshOne(ctx, item, forceQuota, true)
 }
 
 // AccountView returns the same projection the accounts list builds, for one
 func (m *Manager) RefreshAll(ctx context.Context, forceQuota bool) error {
 	var joined error
 	for _, item := range m.pool.Items() {
-		if err := m.refreshOne(ctx, item, forceQuota); err != nil {
+		if err := m.refreshOne(ctx, item, forceQuota, false); err != nil {
 			var quotaErr *QuotaRefreshError
 			if errors.As(err, &quotaErr) {
 				// Background maintenance must remain best-effort. The manual
@@ -45,12 +46,20 @@ func (m *Manager) RefreshAll(ctx context.Context, forceQuota bool) error {
 	return joined
 }
 
-func (m *Manager) refreshOne(ctx context.Context, item Item, forceQuota bool) error {
+func (m *Manager) refreshOne(ctx context.Context, item Item, forceQuota, manual bool) error {
 	if item.RuntimeState == "dead" {
 		return nil
 	}
 	if item.Runtime == string(providers.RuntimeInProcess) || strings.TrimSpace(item.URL) == "" {
-		return m.refreshInProcess(ctx, item)
+		err := m.refreshInProcess(ctx, item)
+		if err != nil || !manual {
+			return err
+		}
+		latest, ok := m.pool.ByID(item.ID)
+		if !ok {
+			return fmt.Errorf("account %s is not running", item.ID)
+		}
+		return m.refreshQuota(ctx, latest, forceQuota, true)
 	}
 	client := qoder.WorkerClient{HTTP: m.httpClient}
 	health, statusCode, err := client.Health(ctx, item.URL)
@@ -85,7 +94,7 @@ func (m *Manager) refreshOne(ctx context.Context, item Item, forceQuota bool) er
 		// Quota and model discovery are independent upstream operations. Run
 		// them concurrently so a quota outage cannot prevent catalog refresh.
 		quotaDone := make(chan error, 1)
-		go func() { quotaDone <- m.fetchQuota(ctx, item.ID, item.URL, forceQuota) }()
+		go func() { quotaDone <- m.refreshQuota(ctx, item, forceQuota, manual) }()
 		m.fetchAccountModels(ctx, item)
 		quotaErr := <-quotaDone
 		if quotaErr != nil {
@@ -129,21 +138,26 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 		status = "ready"
 	} else if health.LastError != "" {
 		status = "error"
+		if health.LastErrorKind == accounts.KindAuth {
+			status = "login_required"
+		}
 	}
-	if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, ""); err != nil {
+	if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, health.LastErrorKind); err != nil {
 		m.mu.Unlock()
 		return err
 	}
 	if health.Ready || health.Hot {
 		m.maintenanceDone.Add(1)
 		m.mu.Unlock()
-		go func(accountID string, prober providers.AccountProber) {
+		go func(accountID string) {
 			defer m.maintenanceDone.Done()
 			quotaCtx, cancel := context.WithTimeout(m.runCtx, 5*time.Second)
 			defer cancel()
-			m.fetchProviderQuota(quotaCtx, accountID, prober, epoch)
-		}(item.ID, adapter.Prober)
-		m.fetchAccountModels(ctx, item)
+			if latest, ok := m.pool.ByID(accountID); ok {
+				_ = m.refreshQuota(quotaCtx, latest, false, false, epoch)
+			}
+		}(item.ID)
+		m.fetchAccountModelsAt(ctx, item, epoch)
 	} else {
 		m.mu.Unlock()
 	}

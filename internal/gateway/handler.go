@@ -20,6 +20,7 @@ type Handler struct {
 	ModelContexts     executor.ModelContextStore
 	Catalogs          executor.CatalogPreparer
 	Logs              executor.RequestStarter
+	SourceFingerprint func(*http.Request) string
 	CrossProviderPool *atomic.Bool
 	Models            CatalogQuery
 	RequestedAccount  func(*http.Request) string

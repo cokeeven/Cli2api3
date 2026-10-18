@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/executor"
@@ -29,21 +30,31 @@ func (w StreamFlushWriter) Write(data []byte) (int, error) {
 }
 
 type StreamRelayStats struct {
-	PromptTokens     *int
-	CompletionTokens *int
-	CacheReadTokens  *int
-	CacheWriteTokens *int
-	CachedTokens     *int
-	UsageSource      string
-	Credits          *float64
-	ConsumedCredits  *float64
-	Model            string
-	FinishReason     string
-	FirstTokenAt     *time.Time
-	SSEEventCount    int
-	BytesRead        int64
-	LastEvent        string
-	SawDone          bool
+	PromptTokens       *int
+	CompletionTokens   *int
+	CacheReadTokens    *int
+	CacheWriteTokens   *int
+	CachedTokens       *int
+	UsageSource        string
+	Credits            *float64
+	ConsumedCredits    *float64
+	Model              string
+	FinishReason       string
+	FinishReasonSource string
+	FirstTokenAt       *time.Time
+	SSEEventCount      int
+	BytesRead          int64
+	LastEvent          string
+	SawDone            bool
+	ContentChars       *int
+	ReasoningChars     *int
+	ToolEventCount     *int
+	CharCountUnit      string
+	promptSeen         bool
+	completionSeen     bool
+	cacheReadSeen      bool
+	cacheWriteSeen     bool
+	creditsSeen        bool
 }
 
 type countingReader struct {
@@ -88,6 +99,13 @@ func RelayOpenAIStream(w http.ResponseWriter, body io.Reader) (stats StreamRelay
 	sawDone := false
 	var frame []string
 	var streamErr error
+	contentChars, reasoningChars, toolEventCount := 0, 0, 0
+	defer func() {
+		stats.ContentChars = &contentChars
+		stats.ReasoningChars = &reasoningChars
+		stats.ToolEventCount = &toolEventCount
+		stats.CharCountUnit = "unicode_code_points"
+	}()
 
 	flushFrame := func() error {
 		if len(frame) == 0 {
@@ -108,22 +126,27 @@ func RelayOpenAIStream(w http.ResponseWriter, body io.Reader) (stats StreamRelay
 		}
 		for _, line := range frame {
 			line = strings.TrimSuffix(line, "\r")
+			contentDelta, reasoningDelta, toolDelta := streamDeltaMetrics(line)
+			contentChars += contentDelta
+			reasoningChars += reasoningDelta
+			toolEventCount += toolDelta
 			if stats.FirstTokenAt == nil && SSEDeltaHasToken(line) {
 				now := time.Now()
 				stats.FirstTokenAt = &now
 			}
 			if usage, ok := ParseStreamUsageLine(line); ok {
-				usage.FirstTokenAt = stats.FirstTokenAt
-				usage.SSEEventCount = stats.SSEEventCount
-				usage.BytesRead = stats.BytesRead
-				usage.LastEvent = stats.LastEvent
-				usage.SawDone = stats.SawDone
-				usage.FinishReason = stats.FinishReason
-				stats = usage
+				stats = mergeStreamUsage(stats, usage)
+			}
+			if finish, ok := ParseStreamFinishReasonLine(line); ok {
+				stats.FinishReason = finish
+				stats.FinishReasonSource = "openai_choice_finish_reason"
 			}
 			if strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]" {
 				sawDone = true
 			}
+		}
+		for i, line := range frame {
+			frame[i] = normalizeOpenAIStreamUsageLine(line)
 		}
 		output := strings.Join(frame, "\n") + "\n\n"
 		if _, err := io.WriteString(writer, output); err != nil {
@@ -411,39 +434,226 @@ func ParseStreamUsageLine(line string) (StreamRelayStats, bool) {
 		return StreamRelayStats{}, false
 	}
 	var parsed struct {
-		Model string `json:"model"`
-		Usage *struct {
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			CacheReadTokens  *int     `json:"cache_read_tokens"`
-			CacheWriteTokens *int     `json:"cache_write_tokens"`
-			Source           string   `json:"source"`
-			Credits          *float64 `json:"credits"`
-			Credit           *float64 `json:"credit"`
-			PromptDetails    struct {
-				CachedTokens *int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Model string          `json:"model"`
+		Usage json.RawMessage `json:"usage"`
 	}
-	if err := json.Unmarshal([]byte(payload), &parsed); err != nil || parsed.Usage == nil {
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil || len(parsed.Usage) == 0 || string(parsed.Usage) == "null" {
 		return StreamRelayStats{}, false
 	}
-	credits := parsed.Usage.Credits
-	if credits == nil {
-		credits = parsed.Usage.Credit
+	var usage struct {
+		PromptTokens             json.RawMessage `json:"prompt_tokens"`
+		CompletionTokens         json.RawMessage `json:"completion_tokens"`
+		CacheReadTokens          json.RawMessage `json:"cache_read_tokens"`
+		CacheWriteTokens         json.RawMessage `json:"cache_write_tokens"`
+		CacheHitTokens           json.RawMessage `json:"prompt_cache_hit_tokens"`
+		CacheReadInputTokens     json.RawMessage `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens json.RawMessage `json:"cache_creation_input_tokens"`
+		Source                   string          `json:"source"`
+		Credits                  json.RawMessage `json:"credits"`
+		Credit                   json.RawMessage `json:"credit"`
+		PromptDetails            json.RawMessage `json:"prompt_tokens_details"`
 	}
-	cacheRead := parsed.Usage.CacheReadTokens
+	if err := json.Unmarshal(parsed.Usage, &usage); err != nil {
+		return StreamRelayStats{}, false
+	}
+	var details struct {
+		CachedTokens json.RawMessage `json:"cached_tokens"`
+	}
+	if len(usage.PromptDetails) > 0 && string(usage.PromptDetails) != "null" {
+		_ = json.Unmarshal(usage.PromptDetails, &details)
+	}
+	promptTokens, promptSeen := parseUsageInt(usage.PromptTokens)
+	completionTokens, completionSeen := parseUsageInt(usage.CompletionTokens)
+	cacheRead, cacheReadSeen := parseUsageInt(usage.CacheReadTokens)
+	cacheDetails, detailsSeen := parseUsageInt(details.CachedTokens)
+	cacheHit, cacheHitSeen := parseUsageInt(usage.CacheHitTokens)
+	cacheInput, inputSeen := parseUsageInt(usage.CacheReadInputTokens)
 	if cacheRead == nil {
-		cacheRead = parsed.Usage.PromptDetails.CachedTokens
+		cacheRead = cacheDetails
+	}
+	if cacheRead == nil {
+		cacheRead = cacheHit
+	}
+	if cacheRead == nil {
+		cacheRead = cacheInput
+	}
+	cacheReadSeen = cacheReadSeen || detailsSeen || cacheHitSeen || inputSeen
+	cacheWrite, cacheWriteSeen := parseUsageInt(usage.CacheWriteTokens)
+	cacheCreation, creationSeen := parseUsageInt(usage.CacheCreationInputTokens)
+	if cacheWrite == nil {
+		cacheWrite = cacheCreation
+	}
+	cacheWriteSeen = cacheWriteSeen || creationSeen
+	credits, creditsSeen := parseUsageFloat(usage.Credits)
+	if credits == nil {
+		credits, creditsSeen = parseUsageFloat(usage.Credit)
 	}
 	return StreamRelayStats{
-		PromptTokens:     parsed.Usage.PromptTokens,
-		CompletionTokens: parsed.Usage.CompletionTokens,
-		CacheReadTokens:  cacheRead,
-		CacheWriteTokens: parsed.Usage.CacheWriteTokens,
-		CachedTokens:     parsed.Usage.PromptDetails.CachedTokens,
-		UsageSource:      firstNonEmpty(parsed.Usage.Source, "upstream"),
-		Credits:          credits,
-		Model:            parsed.Model,
+		PromptTokens: promptTokens, CompletionTokens: completionTokens,
+		CacheReadTokens: cacheRead, CachedTokens: cacheRead, CacheWriteTokens: cacheWrite,
+		UsageSource: firstNonEmpty(usage.Source, "upstream"), Credits: credits, Model: parsed.Model,
+		promptSeen: promptSeen, completionSeen: completionSeen,
+		cacheReadSeen: cacheReadSeen, cacheWriteSeen: cacheWriteSeen, creditsSeen: creditsSeen,
 	}, true
+}
+
+func parseUsageInt(raw json.RawMessage) (*int, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	if string(raw) == "null" {
+		return nil, true
+	}
+	var value int
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, true
+	}
+	return &value, true
+}
+
+func parseUsageFloat(raw json.RawMessage) (*float64, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	if string(raw) == "null" {
+		return nil, true
+	}
+	var value float64
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, true
+	}
+	return &value, true
+}
+
+// mergeStreamUsage treats each usage object as the latest cumulative snapshot.
+// Fields omitted from a later snapshot retain the previous known value; explicit
+// null clears it, and explicit zero replaces it. Values are never added across
+// snapshots.
+func mergeStreamUsage(current, next StreamRelayStats) StreamRelayStats {
+	if next.promptSeen {
+		current.PromptTokens, current.promptSeen = next.PromptTokens, true
+	}
+	if next.completionSeen {
+		current.CompletionTokens, current.completionSeen = next.CompletionTokens, true
+	}
+	if next.cacheReadSeen {
+		current.CacheReadTokens, current.CachedTokens, current.cacheReadSeen = next.CacheReadTokens, next.CachedTokens, true
+	}
+	if next.cacheWriteSeen {
+		current.CacheWriteTokens, current.cacheWriteSeen = next.CacheWriteTokens, true
+	}
+	if next.creditsSeen {
+		current.Credits, current.creditsSeen = next.Credits, true
+	}
+	if next.UsageSource != "" {
+		current.UsageSource = next.UsageSource
+	}
+	if next.Model != "" {
+		current.Model = next.Model
+	}
+	return current
+}
+
+func ParseStreamFinishReasonLine(line string) (string, bool) {
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	var parsed struct {
+		Choices []struct {
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if payload == "" || payload == "[DONE]" || json.Unmarshal([]byte(payload), &parsed) != nil {
+		return "", false
+	}
+	for _, choice := range parsed.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			return *choice.FinishReason, true
+		}
+	}
+	return "", false
+}
+
+func streamDeltaMetrics(line string) (contentChars, reasoningChars, toolEvents int) {
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	var parsed struct {
+		Choices []struct {
+			Delta struct {
+				Content          json.RawMessage   `json:"content"`
+				ReasoningContent json.RawMessage   `json:"reasoning_content"`
+				ToolCalls        []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if payload == "" || payload == "[DONE]" || json.Unmarshal([]byte(payload), &parsed) != nil {
+		return 0, 0, 0
+	}
+	for _, choice := range parsed.Choices {
+		contentChars += jsonTextRuneCount(choice.Delta.Content)
+		reasoningChars += jsonTextRuneCount(choice.Delta.ReasoningContent)
+		toolEvents += len(choice.Delta.ToolCalls)
+	}
+	return
+}
+
+func jsonTextRuneCount(raw json.RawMessage) int {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return utf8.RuneCountInString(text)
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		count := 0
+		for _, part := range parts {
+			count += utf8.RuneCountInString(part.Text)
+		}
+		return count
+	}
+	return 0
+}
+
+func normalizeOpenAIStreamUsageLine(line string) string {
+	dataIndex := strings.Index(line, "data:")
+	if dataIndex < 0 {
+		return line
+	}
+	prefix := line[:dataIndex+len("data:")]
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	var root map[string]any
+	if payload == "" || payload == "[DONE]" || json.Unmarshal([]byte(payload), &root) != nil {
+		return line
+	}
+	usage, ok := root["usage"].(map[string]any)
+	if !ok {
+		return line
+	}
+	stats, ok := ParseStreamUsageLine(line)
+	if !ok || (stats.CacheReadTokens == nil && stats.CacheWriteTokens == nil) {
+		return line
+	}
+	if stats.CacheReadTokens != nil {
+		usage["cache_read_tokens"] = *stats.CacheReadTokens
+		details, _ := usage["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+			usage["prompt_tokens_details"] = details
+		}
+		details["cached_tokens"] = *stats.CacheReadTokens
+	}
+	if stats.CacheWriteTokens != nil {
+		usage["cache_write_tokens"] = *stats.CacheWriteTokens
+		details, _ := usage["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+			usage["prompt_tokens_details"] = details
+		}
+		// Mirror the top-level compatibility field at the nested location
+		// consumed by the currently installed DSH OpenAI Completions parser.
+		details["cache_write_tokens"] = *stats.CacheWriteTokens
+	}
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return line
+	}
+	return prefix + " " + string(encoded)
 }

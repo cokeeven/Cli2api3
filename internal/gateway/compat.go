@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/caigee-cmd/cli2api/internal/executor"
+	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
 
@@ -80,13 +82,40 @@ func validateProxyToolCallArguments(calls []proxyToolCall) error {
 		}
 		arguments := strings.TrimSpace(call.Arguments)
 		if arguments == "" {
-			call.Arguments = "{}"
-			continue
+			return fmt.Errorf("tool call arguments are invalid JSON: empty arguments")
 		}
 		if !json.Valid([]byte(arguments)) {
 			return fmt.Errorf("tool call %q (%s) arguments are invalid JSON", call.ID, call.Name)
 		}
-		call.Arguments = arguments
+	}
+	return nil
+}
+
+// These adapters carry caller-executed tools. Reject a malformed final call
+// before legacy non-stream decoding can replace empty arguments or drop it.
+// Other providers retain their existing compatibility path.
+func validateProviderToolOutput(provider string, raw json.RawMessage) error {
+	if provider != "workbuddy" && provider != "trae" {
+		return nil
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var calls []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	invalid := json.Unmarshal(raw, &calls) != nil
+	for _, call := range calls {
+		if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" || strings.TrimSpace(call.Function.Arguments) == "" || !json.Valid([]byte(call.Function.Arguments)) {
+			invalid = true
+		}
+	}
+	if invalid {
+		return &providers.Error{Kind: "upstream", Status: http.StatusBadGateway, Code: "invalid_tool_arguments", Message: "upstream tool call is incomplete or has invalid JSON arguments"}
 	}
 	return nil
 }
@@ -100,4 +129,12 @@ func (h *Handler) PrepareCompatibilityExecution(r *http.Request, request transla
 
 func (h *Handler) finishCompatibility(execution Execution, accountID, provider, routing, status string, ttfb int, stats *StreamRelayStats, err error, attempts int, resolvedReasoning string) {
 	h.finishRequestLog(execution.RequestID, execution.Started, execution.Request, execution.PublicModel, accountID, firstNonEmpty(provider, execution.ProviderFilter), routing, status, ttfb, stats, err, attempts, resolvedReasoning)
+}
+
+func nonstreamFailureUsage(result executor.ChatResult) *StreamRelayStats {
+	if !result.HasUsageEvidence() {
+		return nil
+	}
+	prompt, completion := result.UsageTokenEvidence()
+	return &StreamRelayStats{PromptTokens: prompt, CompletionTokens: completion, CacheReadTokens: result.CacheReadTokens, CacheWriteTokens: result.CacheWriteTokens, UsageSource: result.UsageSource, ConsumedCredits: result.ConsumedCredits, Credits: result.Credits, Model: result.Model}
 }

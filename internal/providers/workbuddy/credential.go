@@ -74,6 +74,9 @@ type Credential struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
+	// RefreshAfter records when the local proactive-refresh window opens. It
+	// prevents short-lived tokens from being rotated again on every request.
+	RefreshAfter int64  `json:"refresh_after,omitempty"`
 	Domain       string `json:"domain"`
 	UID          string `json:"uid"`
 	EnterpriseID string `json:"enterprise_id"`
@@ -98,6 +101,7 @@ func DecodeCredential(payload []byte) (Credential, error) {
 			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
 			ExpiresAt    int64  `json:"expiresAt"`
+			RefreshAfter int64  `json:"refreshAfter"`
 			Domain       string `json:"domain"`
 			DeviceToken  string `json:"deviceToken"`
 		} `json:"auth"`
@@ -108,6 +112,7 @@ func DecodeCredential(payload []byte) (Credential, error) {
 			AccessToken:  nested.Auth.AccessToken,
 			RefreshToken: nested.Auth.RefreshToken,
 			ExpiresAt:    nested.Auth.ExpiresAt,
+			RefreshAfter: nested.Auth.RefreshAfter,
 			Domain:       nested.Auth.Domain,
 			UID:          nested.Account.UID,
 			EnterpriseID: nested.Account.EnterpriseID,
@@ -119,6 +124,7 @@ func DecodeCredential(payload []byte) (Credential, error) {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresAt    int64  `json:"expires_at"`
+		RefreshAfter int64  `json:"refresh_after"`
 		Domain       string `json:"domain"`
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterprise_id"`
@@ -130,6 +136,7 @@ func DecodeCredential(payload []byte) (Credential, error) {
 			AccessToken:  flat.AccessToken,
 			RefreshToken: flat.RefreshToken,
 			ExpiresAt:    flat.ExpiresAt,
+			RefreshAfter: flat.RefreshAfter,
 			Domain:       flat.Domain,
 			UID:          flat.UID,
 			EnterpriseID: flat.EnterpriseID,
@@ -142,6 +149,7 @@ func DecodeCredential(payload []byte) (Credential, error) {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		ExpiresAt    int64  `json:"expiresAt"`
+		RefreshAfter int64  `json:"refreshAfter"`
 		Domain       string `json:"domain"`
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
@@ -149,7 +157,11 @@ func DecodeCredential(payload []byte) (Credential, error) {
 		DeviceToken  string `json:"deviceToken"`
 	}
 	if err := json.Unmarshal(payload, &camel); err == nil && camel.AccessToken != "" {
-		return Credential(camel), nil
+		return Credential{
+			AccessToken: camel.AccessToken, RefreshToken: camel.RefreshToken, ExpiresAt: camel.ExpiresAt, RefreshAfter: camel.RefreshAfter,
+			Domain: camel.Domain, UID: camel.UID, EnterpriseID: camel.EnterpriseID,
+			Nickname: camel.Nickname, DeviceToken: camel.DeviceToken,
+		}, nil
 	}
 	return Credential{}, fmt.Errorf("workbuddy credential requires access_token")
 }
@@ -160,6 +172,22 @@ func (c Credential) Encode() ([]byte, error) {
 
 func (c Credential) Ready() bool {
 	return strings.TrimSpace(c.AccessToken) != "" && strings.TrimSpace(c.UID) != ""
+}
+
+func (c Credential) needsRefresh(now time.Time) bool {
+	if strings.TrimSpace(c.AccessToken) == "" {
+		return true
+	}
+	if c.ExpiresAt > 0 && now.Unix() >= c.ExpiresAt {
+		return true
+	}
+	if c.RefreshAfter > now.Unix() {
+		return false
+	}
+	if c.ExpiresAt <= 0 {
+		return true
+	}
+	return now.Add(24*time.Hour).Unix() >= c.ExpiresAt
 }
 
 func (c Credential) ChatBase() string {

@@ -111,6 +111,7 @@ func (r *RequestRecorder) Close() {
 }
 
 func (r *RequestRecorder) Start(log accounts.RequestLog) {
+	log.ErrorMessage = safeDiagnosticMessage(log.ErrorMessage)
 	r.enqueue(func() {
 		if err := r.store.InsertRequestLog(context.Background(), log); err != nil {
 			logf("insert request log: %v", err)
@@ -119,6 +120,7 @@ func (r *RequestRecorder) Start(log accounts.RequestLog) {
 }
 
 func (r *RequestRecorder) Finish(log accounts.RequestLog) {
+	log.ErrorMessage = safeDiagnosticMessage(log.ErrorMessage)
 	r.enqueue(func() {
 		if err := r.store.UpdateRequestLog(context.Background(), log); err != nil {
 			logf("update request log: %v", err)
@@ -127,6 +129,7 @@ func (r *RequestRecorder) Finish(log accounts.RequestLog) {
 }
 
 func (r *RequestRecorder) Attempt(attempt accounts.RequestAttempt) {
+	attempt.ErrorMessage = safeDiagnosticMessage(attempt.ErrorMessage)
 	r.enqueue(func() {
 		if err := r.store.InsertRequestAttempt(context.Background(), attempt); err != nil {
 			logf("insert request attempt: %v", err)
@@ -135,6 +138,8 @@ func (r *RequestRecorder) Attempt(attempt accounts.RequestAttempt) {
 }
 
 func (r *RequestRecorder) StreamDiagnostic(diagnostic accounts.RequestStreamDiagnostic) {
+	diagnostic.RelayError = safeDiagnosticMessage(diagnostic.RelayError)
+	diagnostic.ContextErr = safeDiagnosticMessage(diagnostic.ContextErr)
 	r.enqueue(func() {
 		if err := r.store.InsertRequestStreamDiagnostic(context.Background(), diagnostic); err != nil {
 			logf("insert request stream diagnostic: %v", err)
@@ -146,6 +151,22 @@ func (r *RequestRecorder) UsageDetail(detail accounts.RequestUsageDetail) {
 	r.enqueue(func() {
 		if err := r.store.InsertRequestUsageDetail(context.Background(), detail); err != nil {
 			logf("insert request usage detail: %v", err)
+		}
+	})
+}
+
+// A separate update keeps route facts independent of streaming/final log
+// snapshots. The recorder's FIFO queues Start before this write.
+func (r *RequestRecorder) RoutingDiagnostic(diagnostic accounts.RequestRoutingDiagnostic) {
+	store, ok := r.store.(interface {
+		UpdateRequestRoutingDiagnostic(context.Context, accounts.RequestRoutingDiagnostic) error
+	})
+	if !ok {
+		return
+	}
+	r.enqueue(func() {
+		if err := store.UpdateRequestRoutingDiagnostic(context.Background(), diagnostic); err != nil {
+			logf("update routing diagnostic: %v", err)
 		}
 	})
 }

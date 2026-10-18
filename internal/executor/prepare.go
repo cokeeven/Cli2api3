@@ -46,6 +46,9 @@ type PrepareInput struct {
 	Request           translate.ChatRequest
 	NativeRequest     *translate.NativeResponsesRequest
 	Identity          auth.Identity
+	ClientRequestID   string
+	SourceFingerprint string
+	RequestPath       string
 	PreferAccount     string
 	SessionHeader     string
 	CrossProviderPool bool
@@ -128,7 +131,11 @@ func (e ChatExecutor) Prepare(in PrepareInput) (PreparedRequest, error) {
 			Status:              accounts.RequestStatusStarted,
 			RequestedModel:      firstNonEmpty(publicModel, request.Model),
 			RequestedReasoning:  requestedReasoning,
+			ClientRequestID:     in.ClientRequestID,
+			RequestPath:         in.RequestPath,
+			SourceFingerprint:   in.SourceFingerprint,
 			MessageCount:        len(request.Messages),
+			MessageShapeKnown:   in.NativeRequest == nil,
 			EmptyMessageIndexes: translate.EmptyMessageIndexes(request.Messages),
 			MessageRoles:        translate.MessageRoles(request.Messages),
 		})

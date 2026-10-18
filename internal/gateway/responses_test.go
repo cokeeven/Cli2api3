@@ -137,6 +137,8 @@ func TestParseStreamUsageLineCacheReadFallback(t *testing.T) {
 		{name: "detail only", usage: `"prompt_tokens_details":{"cached_tokens":2176}`, want: ptrInt(2176)},
 		{name: "explicit zero", usage: `"prompt_tokens_details":{"cached_tokens":0}`, want: ptrInt(0)},
 		{name: "top-level wins", usage: `"cache_read_tokens":12,"prompt_tokens_details":{"cached_tokens":2176}`, want: ptrInt(12)},
+		{name: "prompt cache hit alias", usage: `"prompt_cache_hit_tokens":9`, want: ptrInt(9)},
+		{name: "explicit null falls through to standard detail", usage: `"cache_read_tokens":null,"prompt_tokens_details":{"cached_tokens":0}`, want: ptrInt(0)},
 		{name: "unknown stays absent", usage: `"prompt_tokens":16`, want: nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -154,6 +156,64 @@ func TestParseStreamUsageLineCacheReadFallback(t *testing.T) {
 				t.Fatalf("cache read = %v, want %d", stats.CacheReadTokens, *test.want)
 			}
 		})
+	}
+}
+
+func TestRelayOpenAIStreamMergesFinalUsageAndNormalizesCacheAliases(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"推理😀"}}]}`,
+		"",
+		`data: {"choices":[{"delta":{"content":"答案"}}]}`,
+		"",
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"lookup","arguments":"{"}},{"index":1,"id":"call_b","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+		"",
+		`data: {"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":12,"vendor_extension":{"kept":true}}}`,
+		"",
+		`data: {"choices":[{"finish_reason":"tool_calls","delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":10,"cache_read_tokens":null,"prompt_tokens_details":{"cached_tokens":12},"prompt_cache_hit_tokens":11,"vendor_extension":{"final":true}}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	stats, err := RelayOpenAIStream(recorder, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stats.SawDone || stats.PromptTokens == nil || *stats.PromptTokens != 100 || stats.CompletionTokens == nil || *stats.CompletionTokens != 10 {
+		t.Fatalf("latest cumulative usage snapshot not retained: %+v", stats)
+	}
+	if stats.CacheReadTokens == nil || *stats.CacheReadTokens != 12 || stats.CachedTokens == nil || *stats.CachedTokens != 12 {
+		t.Fatalf("cache read alias priority mismatch: %+v", stats)
+	}
+	if stats.FinishReason != "tool_calls" || stats.FinishReasonSource != "openai_choice_finish_reason" {
+		t.Fatalf("finish reason/source=%q/%q", stats.FinishReason, stats.FinishReasonSource)
+	}
+	if stats.ContentChars == nil || *stats.ContentChars != 2 || stats.ReasoningChars == nil || *stats.ReasoningChars != 3 ||
+		stats.ToolEventCount == nil || *stats.ToolEventCount != 2 || stats.CharCountUnit != "unicode_code_points" {
+		t.Fatalf("stream character/tool metrics=%+v", stats)
+	}
+	var usageFrames []map[string]any
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") || strings.Contains(line, "[DONE]") {
+			continue
+		}
+		var frame map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame) == nil {
+			if usage, ok := frame["usage"].(map[string]any); ok {
+				usageFrames = append(usageFrames, usage)
+			}
+		}
+	}
+	if len(usageFrames) != 2 {
+		t.Fatalf("usage frame count=%d body=%s", len(usageFrames), recorder.Body.String())
+	}
+	for i, usage := range usageFrames {
+		if usage["cache_read_tokens"] != float64(12) || usage["prompt_tokens_details"].(map[string]any)["cached_tokens"] != float64(12) {
+			t.Fatalf("usage frame %d lacks normalized standard cache count: %#v", i, usage)
+		}
+	}
+	if usageFrames[0]["vendor_extension"].(map[string]any)["kept"] != true || usageFrames[1]["vendor_extension"].(map[string]any)["final"] != true {
+		t.Fatalf("upstream usage extensions were not preserved: %#v", usageFrames)
 	}
 }
 

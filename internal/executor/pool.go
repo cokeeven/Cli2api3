@@ -75,6 +75,10 @@ type Item struct {
 	// model-A look like a repeat. The account-wide LastKind covers
 	// non-model-scoped failures.
 	ModelLastKind map[string]string
+	// CooldownEvidence is keyed by canonical model ID; the empty key denotes
+	// an account-wide restriction. The bounded facts live with the scope they
+	// describe instead of sharing LastError across all model rows.
+	CooldownEvidence map[string]accounts.CooldownEvidence
 	// BackoffLevel climbs on repeated failures of the same kind and resets
 	// on success, so a persistently failing account backs off instead of
 	// being retried at a fixed interval.
@@ -348,6 +352,7 @@ type Pool struct {
 	keyPlatformLive map[string]int
 	accountLive     map[string]int
 	platformCursor  map[string]string
+	capacityWait    *capacityWaitQueue
 }
 
 // PoolObserver receives a cloned Item after a persistable mutation
@@ -385,7 +390,7 @@ func NewPool(urls []string, ids []string) *Pool {
 			ID: id, URL: url, Provider: "qoder", Runtime: "child_process",
 		})
 	}
-	return &Pool{items: items, routingStrategy: RoutingStrategyRoundRobin}
+	return &Pool{items: items, routingStrategy: RoutingStrategyRoundRobin, capacityWait: newCapacityWaitQueue()}
 }
 
 func (p *Pool) SetRoutingStrategy(strategy string) {
@@ -445,12 +450,15 @@ func (p *Pool) LenRoute(q RouteQuery) int {
 }
 
 func (p *Pool) First() (Item, bool) {
-	if p == nil || len(p.items) == 0 {
+	if p == nil {
 		return Item{}, false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.items[0], true
+	if len(p.items) == 0 {
+		return Item{}, false
+	}
+	return p.items[0].clone(), true
 }
 
 func (p *Pool) ByID(id string) (Item, bool) {
@@ -461,7 +469,7 @@ func (p *Pool) ByID(id string) (Item, bool) {
 	defer p.mu.Unlock()
 	for _, item := range p.items {
 		if item.ID == id {
-			return item, true
+			return item.clone(), true
 		}
 	}
 	return Item{}, false
@@ -475,12 +483,13 @@ func (p *Pool) Pick(prefer string, excluded map[string]struct{}) (Item, bool) {
 // round-robin are applied in that order. The fallback path returns the item
 // with the earliest cooldown so callers can surface a classified error.
 func (p *Pool) PickRoute(q RouteQuery) (Item, bool) {
-	if p == nil || len(p.items) == 0 {
+	if p == nil {
 		return Item{}, false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pickRouteLocked(q)
+	item, ok := p.pickRouteLocked(q)
+	return item.clone(), ok
 }
 
 func (p *Pool) pickRouteLocked(q RouteQuery) (Item, bool) {
@@ -821,11 +830,11 @@ func (p *Pool) RetryAfter(item Item, publicModel string) time.Duration {
 }
 
 func (p *Pool) MarkDown(id string, d time.Duration, err string) {
-	p.MarkClassified(id, Classified{Kind: KindUnavailable, Cooldown: d, Message: err})
+	p.MarkClassified(id, Classified{Kind: KindUnavailable, Cooldown: d, Message: err, EvidenceSource: "local_runtime"})
 }
 
 func (p *Pool) MarkClassified(id string, c Classified) {
-	if p == nil || id == "" || c.Kind == KindModelNotAvailable {
+	if p == nil || id == "" || c.Kind == KindModelNotAvailable || c.Kind == KindConcurrencyCapacity {
 		return
 	}
 	var changed *Item
@@ -836,12 +845,13 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 		}
 		p.items[i].LastError = c.Message
 		if c.Kind == KindQuota && c.Scope != "model" {
-			if p.items[i].Quota == nil {
-				p.items[i].Quota = &QuotaSnapshot{}
+			quota := cloneQuotaSnapshot(p.items[i].Quota)
+			if quota == nil {
+				quota = &QuotaSnapshot{}
 			}
-			copy := *p.items[i].Quota
-			copy.Exceeded = true
-			p.items[i].Quota = &copy
+			quota.Exceeded = true
+			quota.RestrictionEvidence = nextQuotaRestrictionEvidence(quota.RestrictionEvidence, c, time.Now().UTC())
+			p.items[i].Quota = quota
 		}
 		// Backoff climbs only on a repeat of the same kind. The previous
 		// kind must be captured BEFORE overwriting it, and the comparison
@@ -860,7 +870,20 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 		} else {
 			prevKind = p.items[i].LastKind
 		}
-		if c.Kind != KindInvalidRequest {
+		// A quota classification without a timer still sets LastKind when no
+		// cooldown row exists; routing uses it to surface a blocked-candidate
+		// hint. If a timer row already exists, keep its cause aligned with its
+		// own CooldownEvidence so the new quota fact cannot relabel an older
+		// auth/rate-limit cooldown in persistence.
+		updateLastKind := c.Kind != KindInvalidRequest
+		if c.Kind == KindQuota && c.Cooldown == 0 {
+			if model != "" {
+				updateLastKind = p.items[i].ModelDownUntil[model].IsZero()
+			} else {
+				updateLastKind = p.items[i].DownUntil.IsZero()
+			}
+		}
+		if updateLastKind {
 			if model != "" {
 				if p.items[i].ModelLastKind == nil {
 					p.items[i].ModelLastKind = map[string]string{}
@@ -910,8 +933,13 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 			if level > 0 {
 				cooldown, _ = nextBackoffCooldown(c.Cooldown, level)
 			}
-			until := time.Now().Add(cooldown)
+			now := time.Now().UTC()
+			until := now.Add(cooldown)
+			scope := "account"
+			previousUntil := p.items[i].DownUntil
 			if model != "" {
+				scope = "model"
+				previousUntil = p.items[i].ModelDownUntil[model]
 				// Scope to one model: a rate limit on glm-5.3 must not take
 				// the account offline for deepseek-v4-flash.
 				if p.items[i].ModelDownUntil == nil {
@@ -921,6 +949,29 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 			} else {
 				p.items[i].DownUntil = until
 			}
+			if p.items[i].CooldownEvidence == nil {
+				p.items[i].CooldownEvidence = map[string]accounts.CooldownEvidence{}
+			}
+			evidence := p.items[i].CooldownEvidence[model]
+			// Start a new first-observed window only when this is the first
+			// locally known cooldown or the prior local gate has expired. If a
+			// legacy active row has no first-observed value, keep it unknown.
+			if previousUntil.IsZero() || !now.Before(previousUntil) {
+				evidence.FirstObservedAt = now
+			}
+			evidence.LastObservedAt = now
+			evidence.Code = c.Code
+			evidence.Source = c.EvidenceSource
+			evidence.Scope = scope
+			evidence.ReportedScope = c.Scope
+			evidence.UpstreamResetAt = nil
+			if c.UpstreamResetAt != nil && !c.UpstreamResetAt.IsZero() {
+				reset := c.UpstreamResetAt.UTC()
+				evidence.UpstreamResetAt = &reset
+			}
+			evidence.LocalBackoffUntil = until
+			evidence.Message = c.Message
+			p.items[i].CooldownEvidence[model] = evidence
 		}
 		// Stamp a monotonic version under the lock so the persistence
 		// drainer can discard a stale snapshot that arrives after a newer
@@ -1002,6 +1053,12 @@ func (p *Pool) markOK(id, model string, version *uint64) {
 					p.items[i].ModelLastKind = nil
 				}
 			}
+			if p.items[i].CooldownEvidence != nil {
+				delete(p.items[i].CooldownEvidence, scoped)
+				if len(p.items[i].CooldownEvidence) == 0 {
+					p.items[i].CooldownEvidence = nil
+				}
+			}
 			// Only declare the account fully healthy when no cooldown of
 			// any scope remains; otherwise keep the in-flight failure state.
 			if wasCooling {
@@ -1022,6 +1079,7 @@ func (p *Pool) markOK(id, model string, version *uint64) {
 			p.items[i].ModelDownUntil = nil
 			p.items[i].ModelBackoff = nil
 			p.items[i].ModelLastKind = nil
+			p.items[i].CooldownEvidence = nil
 		}
 		p.stateCounter++
 		p.items[i].StateVersion = p.stateCounter
@@ -1261,12 +1319,7 @@ func (p *Pool) MergeQuota(id string, quota *QuotaSnapshot) {
 	var changed *Item
 	for i := range p.items {
 		if p.items[i].ID == id {
-			if quota == nil {
-				p.items[i].Quota = nil
-			} else {
-				copy := *quota
-				p.items[i].Quota = &copy
-			}
+			p.items[i].Quota = mergeQuotaSnapshots(p.items[i].Quota, quota)
 			p.stateCounter++
 			p.items[i].StateVersion = p.stateCounter
 			snapshot := p.items[i].clone()
@@ -1369,6 +1422,7 @@ func (item Item) clone() Item {
 			out.ModelLastKind[k] = v
 		}
 	}
+	out.CooldownEvidence = cloneCooldownEvidenceMap(item.CooldownEvidence)
 	if item.Models != nil {
 		out.Models = append([]string(nil), item.Models...)
 	}
@@ -1376,10 +1430,83 @@ func (item Item) clone() Item {
 		out.ProvenModels = append([]string(nil), item.ProvenModels...)
 	}
 	if item.Quota != nil {
-		q := *item.Quota
-		q.Packages = append([]accounts.QuotaPackage(nil), item.Quota.Packages...)
-		q.Windows = append([]accounts.QuotaWindow(nil), item.Quota.Windows...)
-		out.Quota = &q
+		out.Quota = cloneQuotaSnapshot(item.Quota)
+	}
+	return out
+}
+
+func mergeQuotaSnapshots(previous, incoming *QuotaSnapshot) *QuotaSnapshot {
+	if incoming == nil {
+		return nil
+	}
+	merged := cloneQuotaSnapshot(incoming)
+	if merged.RestrictionEvidence == nil && previous != nil {
+		merged.RestrictionEvidence = cloneQuotaRestrictionEvidence(previous.RestrictionEvidence)
+	}
+	return merged
+}
+
+func cloneQuotaSnapshot(value *QuotaSnapshot) *QuotaSnapshot {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.Packages = append([]accounts.QuotaPackage(nil), value.Packages...)
+	copy.Windows = append([]accounts.QuotaWindow(nil), value.Windows...)
+	copy.RestrictionEvidence = cloneQuotaRestrictionEvidence(value.RestrictionEvidence)
+	return &copy
+}
+
+func cloneQuotaRestrictionEvidence(value *accounts.QuotaRestrictionEvidence) *accounts.QuotaRestrictionEvidence {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.FirstObservedAt = cloneTimePointer(value.FirstObservedAt)
+	copy.LastObservedAt = cloneTimePointer(value.LastObservedAt)
+	copy.UpstreamResetAt = cloneTimePointer(value.UpstreamResetAt)
+	return &copy
+}
+
+func cloneTimePointer(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
+}
+
+func nextQuotaRestrictionEvidence(previous *accounts.QuotaRestrictionEvidence, classified Classified, observedAt time.Time) *accounts.QuotaRestrictionEvidence {
+	firstObservedAt := observedAt
+	if previous != nil && previous.FirstObservedAt != nil && !previous.FirstObservedAt.IsZero() {
+		firstObservedAt = previous.FirstObservedAt.UTC()
+	}
+	evidence := &accounts.QuotaRestrictionEvidence{
+		FirstObservedAt: &firstObservedAt,
+		LastObservedAt:  &observedAt,
+		Code:            classified.Code,
+		Source:          classified.EvidenceSource,
+		Scope:           "account",
+		ReportedScope:   classified.Scope,
+	}
+	if classified.UpstreamResetAt != nil && !classified.UpstreamResetAt.IsZero() {
+		reset := classified.UpstreamResetAt.UTC()
+		evidence.UpstreamResetAt = &reset
+	}
+	return evidence
+}
+
+func cloneCooldownEvidenceMap(value map[string]accounts.CooldownEvidence) map[string]accounts.CooldownEvidence {
+	if value == nil {
+		return nil
+	}
+	out := make(map[string]accounts.CooldownEvidence, len(value))
+	for scope, evidence := range value {
+		if evidence.UpstreamResetAt != nil {
+			reset := *evidence.UpstreamResetAt
+			evidence.UpstreamResetAt = &reset
+		}
+		out[scope] = evidence
 	}
 	return out
 }
@@ -1441,6 +1568,9 @@ func (p *Pool) Upsert(item Item) {
 			if len(item.ModelLastKind) == 0 && len(p.items[i].ModelLastKind) > 0 {
 				item.ModelLastKind = p.items[i].ModelLastKind
 			}
+			if len(item.CooldownEvidence) == 0 && len(p.items[i].CooldownEvidence) > 0 {
+				item.CooldownEvidence = p.items[i].CooldownEvidence
+			}
 			if item.StateVersion == 0 {
 				item.StateVersion = p.items[i].StateVersion
 			}
@@ -1493,10 +1623,14 @@ func (p *Pool) Upsert(item Item) {
 			if item.ModelOutputLimits == nil {
 				item.ModelOutputLimits = p.items[i].ModelOutputLimits
 			}
+			item.Quota = mergeQuotaSnapshots(p.items[i].Quota, item.Quota)
+			item.CooldownEvidence = cloneCooldownEvidenceMap(item.CooldownEvidence)
 			p.items[i] = item
 			return
 		}
 	}
+	item.Quota = cloneQuotaSnapshot(item.Quota)
+	item.CooldownEvidence = cloneCooldownEvidenceMap(item.CooldownEvidence)
 	p.items = append(p.items, item)
 }
 

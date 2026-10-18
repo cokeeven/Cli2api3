@@ -630,6 +630,36 @@ ON CONFLICT(account_id) DO UPDATE SET format=excluded.format, payload=excluded.p
 	return nil
 }
 
+// SaveCredentialPayloadIfCurrent uses a compare-and-swap update so a refresh
+// that started from an older credential cannot overwrite a newer login or
+// another completed refresh.
+func (s *Store) SaveCredentialPayloadIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte) (bool, error) {
+	if len(payload) == 0 {
+		return false, fmt.Errorf("credential payload required")
+	}
+	account, err := s.Get(ctx, accountID)
+	if err != nil {
+		return false, err
+	}
+	if err := providers.ValidateCredentialFormat(account.Provider, format); err != nil {
+		return false, err
+	}
+	now := formatTime(time.Now().UTC())
+	result, err := s.db.ExecContext(ctx, `
+UPDATE account_credential_payloads
+SET format = ?, payload = ?, updated_at = ?
+WHERE account_id = ? AND format = ? AND payload = ?`,
+		format, payload, now, accountID, expectedFormat, expectedPayload)
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap credential payload: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap credential payload rows affected: %w", err)
+	}
+	return changed == 1, nil
+}
+
 func (s *Store) LoadCredentialPayload(ctx context.Context, accountID string) (string, []byte, error) {
 	var format string
 	var payload []byte
@@ -829,18 +859,34 @@ func (s *Store) SaveCooldowns(ctx context.Context, accountID string, rows []acco
 		if row.DownUntil.IsZero() || !now.Before(row.DownUntil) {
 			continue
 		}
+		evidence := row.Evidence
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO account_cooldowns (account_id, model, down_until, backoff_level, kind, message, model_kind, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_cooldowns (
+  account_id, model, down_until, backoff_level, kind, message, model_kind, updated_at,
+  first_observed_at, last_observed_at, evidence_code, evidence_source, evidence_scope,
+  reported_scope, upstream_reset_at, local_backoff_until
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, model) DO UPDATE SET
   down_until = excluded.down_until,
   backoff_level = excluded.backoff_level,
   kind = excluded.kind,
   message = excluded.message,
   model_kind = excluded.model_kind,
+  first_observed_at = excluded.first_observed_at,
+  last_observed_at = excluded.last_observed_at,
+  evidence_code = excluded.evidence_code,
+  evidence_source = excluded.evidence_source,
+  evidence_scope = excluded.evidence_scope,
+  reported_scope = excluded.reported_scope,
+  upstream_reset_at = excluded.upstream_reset_at,
+  local_backoff_until = excluded.local_backoff_until,
   updated_at = excluded.updated_at`,
 			accountID, canonicalCooldownModel(row.Model), formatTime(row.DownUntil), clampBackoffLevel(row.BackoffLevel),
-			row.Kind, row.Message, row.ModelKind, formatTime(now)); err != nil {
+			row.Kind, row.Message, row.ModelKind, formatTime(now), formatOptionalCooldownTime(evidence.FirstObservedAt),
+			formatOptionalCooldownTime(evidence.LastObservedAt), evidence.Code, evidence.Source, evidence.Scope,
+			evidence.ReportedScope, formatOptionalCooldownTimePtr(evidence.UpstreamResetAt),
+			formatOptionalCooldownTime(evidence.LocalBackoffUntil)); err != nil {
 			return fmt.Errorf("save cooldown: %w", err)
 		}
 	}
@@ -860,7 +906,9 @@ func (s *Store) LoadCooldowns(ctx context.Context) ([]accounts.CooldownRow, erro
 		return nil, fmt.Errorf("prune expired cooldowns: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT account_id, model, down_until, backoff_level, kind, message, model_kind
+SELECT account_id, model, down_until, backoff_level, kind, message, model_kind,
+       first_observed_at, last_observed_at, evidence_code, evidence_source, evidence_scope,
+       reported_scope, upstream_reset_at, local_backoff_until
 FROM account_cooldowns WHERE down_until > ? ORDER BY account_id, model`, now)
 	if err != nil {
 		return nil, fmt.Errorf("load cooldowns: %w", err)
@@ -869,15 +917,38 @@ FROM account_cooldowns WHERE down_until > ? ORDER BY account_id, model`, now)
 	var out []accounts.CooldownRow
 	for rows.Next() {
 		var row accounts.CooldownRow
-		var until, model string
-		if err := rows.Scan(&row.AccountID, &model, &until, &row.BackoffLevel, &row.Kind, &row.Message, &row.ModelKind); err != nil {
+		var until, model, firstObservedAt, lastObservedAt, upstreamResetAt, localBackoffUntil string
+		if err := rows.Scan(&row.AccountID, &model, &until, &row.BackoffLevel, &row.Kind, &row.Message, &row.ModelKind,
+			&firstObservedAt, &lastObservedAt, &row.Evidence.Code, &row.Evidence.Source, &row.Evidence.Scope,
+			&row.Evidence.ReportedScope, &upstreamResetAt, &localBackoffUntil); err != nil {
 			return nil, fmt.Errorf("scan cooldown: %w", err)
 		}
 		row.DownUntil = parseTime(until)
 		row.Model = canonicalCooldownModel(model)
+		row.Evidence.Message = row.Message
+		row.Evidence.FirstObservedAt = parseTime(firstObservedAt)
+		row.Evidence.LastObservedAt = parseTime(lastObservedAt)
+		row.Evidence.LocalBackoffUntil = parseTime(localBackoffUntil)
+		if reset := parseTime(upstreamResetAt); !reset.IsZero() {
+			row.Evidence.UpstreamResetAt = &reset
+		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func formatOptionalCooldownTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return formatTime(value)
+}
+
+func formatOptionalCooldownTimePtr(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return ""
+	}
+	return formatTime(*value)
 }
 
 func (s *Store) RecordPoolState(ctx context.Context, state accounts.PoolState) error {

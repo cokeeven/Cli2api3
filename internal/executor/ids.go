@@ -11,15 +11,16 @@ import (
 type QuotaSnapshot = accounts.QuotaSnapshot
 
 const (
-	KindQuota             = accounts.KindQuota
-	KindRateLimit         = accounts.KindRateLimit
-	KindAuth              = accounts.KindAuth
-	KindNotReady          = accounts.KindNotReady
-	KindUnavailable       = accounts.KindUnavailable
-	KindInvalidRequest    = accounts.KindInvalidRequest
-	KindModelNotAvailable = accounts.KindModelNotAvailable
-	KindCanceled          = accounts.KindCanceled
-	BackoffMaxLevel       = accounts.BackoffMaxLevel
+	KindQuota               = accounts.KindQuota
+	KindRateLimit           = accounts.KindRateLimit
+	KindAuth                = accounts.KindAuth
+	KindNotReady            = accounts.KindNotReady
+	KindUnavailable         = accounts.KindUnavailable
+	KindInvalidRequest      = accounts.KindInvalidRequest
+	KindModelNotAvailable   = accounts.KindModelNotAvailable
+	KindCanceled            = accounts.KindCanceled
+	KindConcurrencyCapacity = accounts.KindConcurrencyCapacity
+	BackoffMaxLevel         = accounts.BackoffMaxLevel
 
 	RoutingStrategyRoundRobin         = accounts.RoutingStrategyRoundRobin
 	RoutingStrategyWeightedRoundRobin = accounts.RoutingStrategyWeightedRoundRobin

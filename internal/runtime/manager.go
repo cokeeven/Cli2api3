@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
@@ -70,30 +71,31 @@ type WorkBuddyMaintainer interface {
 }
 
 type Manager struct {
-	config            ManagerConfig
-	store             AccountStore
-	poolState         PoolStateStore
-	starter           ProcessStarter
-	pool              *Pool
-	providers         *providers.Registry
-	workbuddy         WorkBuddyMaintainer
-	checkinRunning    map[string]bool
-	dailyBatchRunning bool
-	maintenanceDone   sync.WaitGroup
-	accountEpoch      map[string]uint64 // guarded by mu; invalidates old probes on start/stop
-	automationMu      sync.Mutex
-	automationNextID  uint64
-	automationRuns    map[uint64]context.CancelFunc
-	mu                sync.Mutex
-	processes         map[string]ManagedProcess
-	restarts          map[string]int
-	restartBackoff    map[string]int
-	recovering        map[string]bool
-	recoverDone       sync.WaitGroup
-	nextPort          int
-	httpClient        *http.Client
-	runCtx            context.Context
-	cancel            context.CancelFunc
+	config                 ManagerConfig
+	store                  AccountStore
+	poolState              PoolStateStore
+	starter                ProcessStarter
+	pool                   *Pool
+	providers              *providers.Registry
+	workbuddy              WorkBuddyMaintainer
+	checkinRunning         map[string]bool
+	dailyBatchRunning      bool
+	credentialBatchRunning bool
+	maintenanceDone        sync.WaitGroup
+	accountEpoch           map[string]uint64 // guarded by mu; invalidates old probes on start/stop
+	automationMu           sync.Mutex
+	automationNextID       uint64
+	automationRuns         map[uint64]context.CancelFunc
+	mu                     sync.Mutex
+	processes              map[string]ManagedProcess
+	restarts               map[string]int
+	restartBackoff         map[string]int
+	recovering             map[string]bool
+	recoverDone            sync.WaitGroup
+	nextPort               int
+	httpClient             *http.Client
+	runCtx                 context.Context
+	cancel                 context.CancelFunc
 	// The persistence path is one mutex-guarded goroutine. The dirty set
 	// is keyed by account ID and merged on enqueue: a stale snapshot (older
 	// StateVersion) that arrives after a newer one is discarded, so the final
@@ -134,8 +136,10 @@ type Manager struct {
 	// per-account dedup and failure backoff, so concurrent callers cannot
 	// multiply upstream catalog traffic. catalogOnce guards zero-value
 	// Managers created directly in tests.
-	catalog     *catalogRefreshState
-	catalogOnce sync.Once
+	catalog      *catalogRefreshState
+	catalogOnce  sync.Once
+	quotaRefresh *quotaRefreshState
+	quotaOnce    sync.Once
 }
 
 func NewManager(config ManagerConfig, store AccountStore, starter ProcessStarter) *Manager {
@@ -177,6 +181,11 @@ func NewManager(config ManagerConfig, store AccountStore, starter ProcessStarter
 			sem:      make(chan struct{}, maxConcurrentModelFetches),
 			running:  map[string]bool{},
 			failures: map[string]time.Time{},
+		},
+		quotaRefresh: &quotaRefreshState{
+			sem:      make(chan struct{}, maxConcurrentQuotaFetches),
+			running:  map[string]*quotaRefreshCall{},
+			failures: map[string]quotaRefreshFailure{},
 		},
 	}
 	manager.persistCond = sync.NewCond(&manager.persistMu)
@@ -332,9 +341,10 @@ func (m *Manager) Flush() {
 func cooldownRows(item Item) []CooldownRow {
 	rows := make([]CooldownRow, 0, 1+len(item.ModelDownUntil))
 	if !item.DownUntil.IsZero() {
+		evidence := item.CooldownEvidence[""]
 		rows = append(rows, CooldownRow{
 			AccountID: item.ID, DownUntil: item.DownUntil,
-			BackoffLevel: item.BackoffLevel, Kind: item.LastKind, Message: item.LastError,
+			BackoffLevel: item.BackoffLevel, Kind: item.LastKind, Message: evidence.Message, Evidence: evidence,
 		})
 	}
 	for model, until := range item.ModelDownUntil {
@@ -355,10 +365,11 @@ func cooldownRows(item Item) []CooldownRow {
 				kind = mk
 			}
 		}
+		evidence := item.CooldownEvidence[model]
 		rows = append(rows, CooldownRow{
 			AccountID: item.ID, Model: model, DownUntil: until,
-			BackoffLevel: level, Kind: kind, Message: item.LastError,
-			ModelKind: kind,
+			BackoffLevel: level, Kind: kind, Message: evidence.Message,
+			ModelKind: kind, Evidence: evidence,
 		})
 	}
 	return rows
@@ -385,6 +396,11 @@ func (m *Manager) restoreCooldowns(ctx context.Context) {
 				item.BackoffLevel = level
 			}
 			item.DownUntil = row.DownUntil
+			if item.CooldownEvidence == nil {
+				item.CooldownEvidence = map[string]accounts.CooldownEvidence{}
+			}
+			row.Evidence.Message = row.Message
+			item.CooldownEvidence[""] = row.Evidence
 		} else {
 			// Model-scoped row: restore only the model's own backoff,
 			// not the account-wide ladder. Writing the model's level into
@@ -396,6 +412,11 @@ func (m *Manager) restoreCooldowns(ctx context.Context) {
 				item.ModelDownUntil = map[string]time.Time{}
 			}
 			item.ModelDownUntil[row.Model] = row.DownUntil
+			if item.CooldownEvidence == nil {
+				item.CooldownEvidence = map[string]accounts.CooldownEvidence{}
+			}
+			row.Evidence.Message = row.Message
+			item.CooldownEvidence[row.Model] = row.Evidence
 			if level := clampBackoffLevel(row.BackoffLevel); level > 0 {
 				if item.ModelBackoff == nil {
 					item.ModelBackoff = map[string]int{}

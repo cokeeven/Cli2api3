@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -44,14 +45,15 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 	result := map[string]any{"object": "chat.completion"}
 	message := map[string]any{"role": "assistant"}
 	toolCalls := map[int]map[string]any{}
-	finishReason := "stop"
+	outputFinishReason := ""
+	doneFinishReason := ""
 	var content, reasoning strings.Builder
 	var order []int
 	sawDone := false
 	var usage any
 	model := ""
 
-	if err := scanSolo(reader, func(ev soloEvent) error {
+	scanErr := scanSolo(reader, func(ev soloEvent) error {
 		switch ev.Name {
 		case "metadata":
 			var meta struct {
@@ -73,8 +75,8 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			}
 			content.WriteString(out.Response)
 			reasoning.WriteString(out.ReasoningContent)
-			if out.FinishReason != "" {
-				finishReason = out.FinishReason
+			if out.FinishReason != "" && !sawDone {
+				outputFinishReason = out.FinishReason
 			}
 			mergeSoloToolCalls(toolCalls, &order, out.ToolCalls)
 		case "token_usage":
@@ -85,9 +87,7 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 				FinishReason string `json:"finish_reason"`
 			}
 			_ = json.Unmarshal(ev.Data, &done)
-			if done.FinishReason != "" {
-				finishReason = done.FinishReason
-			}
+			doneFinishReason = done.FinishReason
 		case "error":
 			var se streamError
 			if err := json.Unmarshal(ev.Data, &se); err != nil {
@@ -96,12 +96,8 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			return classifiedFromSolo(se)
 		}
 		return nil
-	}); err != nil {
-		return nil, err
-	}
-	if !sawDone {
-		return nil, fmt.Errorf("trae stream ended before done")
-	}
+	})
+	_, _, finishReason, _ := soloFinishReasons(outputFinishReason, doneFinishReason, len(toolCalls) > 0)
 	message["content"] = content.String()
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
@@ -113,9 +109,6 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			calls = append(calls, toolCalls[index])
 		}
 		message["tool_calls"] = calls
-		if finishReason == "" || finishReason == "stop" {
-			finishReason = "tool_calls"
-		}
 	}
 	if model != "" {
 		result["model"] = model
@@ -130,6 +123,12 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 		"message":       message,
 		"finish_reason": finishReason,
 	}}
+	if scanErr != nil {
+		return result, scanErr
+	}
+	if !sawDone {
+		return result, fmt.Errorf("trae stream ended before done")
+	}
 	return result, nil
 }
 
@@ -179,6 +178,38 @@ func wrapSoloStream(rest io.ReadCloser, upstream io.Closer, model string) *http.
 	return &wrapped
 }
 
+type soloTerminalMetadata struct {
+	mu                   sync.RWMutex
+	upstreamReason       string
+	upstreamReasonSource string
+	externalReason       string
+	externalReasonSource string
+}
+
+func (m *soloTerminalMetadata) set(upstreamReason, upstreamSource, externalReason, externalSource string) {
+	m.mu.Lock()
+	m.upstreamReason = upstreamReason
+	m.upstreamReasonSource = upstreamSource
+	m.externalReason = externalReason
+	m.externalReasonSource = externalSource
+	m.mu.Unlock()
+}
+
+func (m *soloTerminalMetadata) SoloStreamFinishReason() (string, string, string, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.upstreamReason, m.upstreamReasonSource, m.externalReason, m.externalReasonSource
+}
+
+type soloRewriteBody struct {
+	*io.PipeReader
+	terminal *soloTerminalMetadata
+}
+
+func (b *soloRewriteBody) SoloStreamFinishReason() (string, string, string, string) {
+	return b.terminal.SoloStreamFinishReason()
+}
+
 // streamErrorResponse wraps a rewritten stream so a terminal Solo `error`
 // event that arrives after the 200 response headers is still observable to
 // the executor as a read error once the buffered payload is drained.
@@ -201,8 +232,19 @@ func (s *streamErrorResponse) Close() error {
 	return s.resp.Body.Close()
 }
 
+func (s *streamErrorResponse) SoloStreamFinishReason() (string, string, string, string) {
+	metadata, ok := s.resp.Body.(interface {
+		SoloStreamFinishReason() (string, string, string, string)
+	})
+	if !ok {
+		return "", "", "", ""
+	}
+	return metadata.SoloStreamFinishReason()
+}
+
 func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*http.Response, func() error) {
 	pr, pw := io.Pipe()
+	terminal := &soloTerminalMetadata{}
 	// Solo emits upstream 200 headers first and may deliver a terminal `error`
 	// event after content has already flowed. The caller cannot retry on a
 	// classified error once bytes are on the wire, so stash it: the pipe
@@ -217,6 +259,8 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 		var pendingUsage any
 		ended := false
 		sawToolCalls := false
+		outputFinishReason := ""
+		doneFinishReason := ""
 		writeChunk := func(delta map[string]any, finish string, usage any) error {
 			chunk := map[string]any{
 				"id":      id,
@@ -255,10 +299,14 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 				var out struct {
 					Response         string          `json:"response"`
 					ReasoningContent string          `json:"reasoning_content"`
+					FinishReason     string          `json:"finish_reason"`
 					ToolCalls        json.RawMessage `json:"tool_calls"`
 				}
 				if json.Unmarshal(ev.Data, &out) != nil {
 					return nil
+				}
+				if !ended && out.FinishReason != "" {
+					outputFinishReason = out.FinishReason
 				}
 				delta := map[string]any{}
 				if out.Response != "" {
@@ -287,13 +335,9 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 					FinishReason string `json:"finish_reason"`
 				}
 				_ = json.Unmarshal(ev.Data, &done)
-				finish := done.FinishReason
-				if finish == "" {
-					finish = "stop"
-				}
-				if finish == "stop" && sawToolCalls {
-					finish = "tool_calls"
-				}
+				doneFinishReason = done.FinishReason
+				upstreamReason, upstreamSource, finish, externalSource := soloFinishReasons(outputFinishReason, doneFinishReason, sawToolCalls)
+				terminal.set(upstreamReason, upstreamSource, finish, externalSource)
 				usage := pendingUsage
 				pendingUsage = nil
 				if err := writeChunk(map[string]any{}, finish, usage); err != nil {
@@ -303,6 +347,7 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 				return err
 			case "error":
 				ended = true
+				terminal.set("", "upstream_error_event", "", "upstream_error_event")
 				var se streamError
 				_ = json.Unmarshal(ev.Data, &se)
 				payload, _ := json.Marshal(se.Error())
@@ -314,8 +359,9 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 			return nil
 		})
 		if !ended {
-			_ = writeChunk(map[string]any{}, "stop", pendingUsage)
-			_, _ = io.WriteString(pw, "data: [DONE]\n\n")
+			if err == nil {
+				err = fmt.Errorf("trae stream ended before done")
+			}
 		}
 		if err != nil {
 			_ = pw.CloseWithError(err)
@@ -333,16 +379,46 @@ func startSoloRewrite(src io.ReadCloser, upstream io.Closer, model string) (*htt
 	header.Set("Connection", "keep-alive")
 	header.Set("X-Accel-Buffering", "no")
 	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     header,
-		Body:       pr,
+		StatusCode:    http.StatusOK,
+		Header:        header,
+		Body:          pr,
+		ContentLength: -1,
 	}
+	resp.Body = &soloRewriteBody{PipeReader: pr, terminal: terminal}
 	return resp, func() error {
 		if stored, ok := streamErr.Load().(error); ok {
 			return stored
 		}
 		return nil
 	}
+}
+
+// soloFinishReasons prefers an explicit done reason over an output reason.
+// The previous Trae adapter used OpenAI's stop fallback when it received a
+// real done event without a reason. Keep that compatibility behavior only for
+// a real done event; an EOF without done is always incomplete. Tool calls
+// without a reason, or an upstream stop paired with tool calls, are exposed as
+// tool_calls so API clients know to continue the tool cycle. The upstream
+// value and the public compatibility value remain separately diagnosable.
+func soloFinishReasons(outputReason, doneReason string, hasToolCalls bool) (upstreamReason, upstreamSource, externalReason, externalSource string) {
+	switch {
+	case doneReason != "":
+		upstreamReason, upstreamSource = doneReason, "upstream_done_event"
+	case outputReason != "":
+		upstreamReason, upstreamSource = outputReason, "upstream_output_event"
+	default:
+		upstreamSource = "upstream_done_missing_finish_reason"
+	}
+	if upstreamReason == "" {
+		if hasToolCalls {
+			return upstreamReason, upstreamSource, "tool_calls", "tool_call_semantics"
+		}
+		return upstreamReason, upstreamSource, "stop", "compatibility_fallback_for_real_done"
+	}
+	if hasToolCalls && upstreamReason == "stop" {
+		return upstreamReason, upstreamSource, "tool_calls", "tool_call_semantics"
+	}
+	return upstreamReason, upstreamSource, upstreamReason, "upstream_finish_reason"
 }
 
 func peekFirstSoloEvent(buf *bufio.Reader) (soloEvent, error) {

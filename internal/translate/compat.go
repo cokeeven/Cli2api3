@@ -752,6 +752,13 @@ func ValidateChatRequest(request *ChatRequest) error {
 	if len(request.MaxTokens) > 0 && len(request.MaxCompletionTokens) > 0 {
 		return fmt.Errorf("max_tokens and max_completion_tokens are mutually exclusive")
 	}
+	// Validate explicit named choices before compatibility normalization can
+	// erase them. Keep the established auto/empty-tools compatibility case.
+	if !emptyJSON(request.Tools) {
+		if err := validateToolChoice(request.Tools, request.ToolChoice); err != nil {
+			return err
+		}
+	}
 	request.ToolChoice = sanitizeToolChoice(request.Tools, request.ToolChoice)
 	return validateToolChoice(request.Tools, request.ToolChoice)
 }

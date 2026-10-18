@@ -29,14 +29,17 @@ func (s *Store) InsertRequestLog(ctx context.Context, log accounts.RequestLog) e
 	INSERT INTO request_logs (
 		  id, created_at, finished_at, stream, status, requested_model, mapped_model, requested_reasoning, resolved_reasoning, account_id, provider, routing,
 		  prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, usage_source, credits,
-		  latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles,
+		  client_request_id, output_limit_tokens, output_limit_source, prompt_stripped, message_shape_known, source_fingerprint, finish_reason, finish_reason_source, request_path, output_budget_enforcement
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.ID, formatTime(log.CreatedAt), finished, boolToInt(log.Stream), log.Status,
 		log.RequestedModel, log.MappedModel, strings.TrimSpace(log.RequestedReasoning), strings.TrimSpace(log.ResolvedReasoning), nullIfEmpty(log.AccountID), strings.TrimSpace(log.Provider), strings.TrimSpace(log.Routing),
 		nullableInt(log.PromptTokens), nullableInt(log.CompletionTokens),
 		nullableInt(log.CacheReadTokens), nullableInt(log.CacheWriteTokens),
 		log.UsageSource, nullableFloat(log.Credits), nullableInt(log.LatencyMs), nullableInt(log.TTFBMs),
 		log.ErrorKind, log.ErrorCode, log.ErrorMessage, log.AttemptCount, log.MessageCount, encodeIntSlice(log.EmptyMessageIndexes), encodeStringSlice(log.MessageRoles),
+		log.ClientRequestID, nullableInt(log.OutputLimit), log.OutputLimitSource, nullableBool(log.PromptStripped), boolToInt(log.MessageShapeKnown),
+		log.SourceFingerprint, log.FinishReason, log.FinishReasonSource, log.RequestPath, log.OutputBudgetEnforcement,
 	)
 	if err != nil {
 		return fmt.Errorf("insert request log: %w", err)
@@ -57,13 +60,33 @@ func (s *Store) UpdateRequestLog(ctx context.Context, log accounts.RequestLog) e
 		  finished_at = ?, status = ?, requested_model = ?, mapped_model = ?, requested_reasoning = ?, resolved_reasoning = ?, account_id = ?, provider = ?, routing = ?,
 		  prompt_tokens = ?, completion_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
 		  usage_source = ?, credits = ?, latency_ms = ?, ttfb_ms = ?,
-		  error_kind = ?, error_code = ?, error_message = ?, attempt_count = ?, message_count = ?, empty_message_indexes = ?, message_roles = ?
+		  error_kind = ?, error_code = ?, error_message = ?, attempt_count = ?,
+		  message_count = CASE WHEN ? THEN ? ELSE message_count END,
+		  empty_message_indexes = CASE WHEN ? THEN ? ELSE empty_message_indexes END,
+		  message_roles = CASE WHEN ? THEN ? ELSE message_roles END,
+		  message_shape_known = CASE WHEN ? THEN 1 ELSE message_shape_known END,
+		  client_request_id = CASE WHEN ? <> '' THEN ? ELSE client_request_id END,
+		  output_limit_tokens = COALESCE(?, output_limit_tokens),
+		  output_limit_source = CASE WHEN ? <> '' THEN ? ELSE output_limit_source END,
+		  prompt_stripped = COALESCE(?, prompt_stripped),
+		  finish_reason = CASE WHEN ? <> '' THEN ? ELSE finish_reason END,
+		  finish_reason_source = CASE WHEN ? <> '' THEN ? ELSE finish_reason_source END,
+		  request_path = CASE WHEN ? <> '' THEN ? ELSE request_path END
+		  , output_budget_enforcement = CASE WHEN ? <> '' THEN ? ELSE output_budget_enforcement END
 		WHERE id = ?`,
 		finished, log.Status, log.RequestedModel, log.MappedModel, strings.TrimSpace(log.RequestedReasoning), strings.TrimSpace(log.ResolvedReasoning), nullIfEmpty(log.AccountID), strings.TrimSpace(log.Provider), strings.TrimSpace(log.Routing),
 		nullableInt(log.PromptTokens), nullableInt(log.CompletionTokens),
 		nullableInt(log.CacheReadTokens), nullableInt(log.CacheWriteTokens),
 		log.UsageSource, nullableFloat(log.Credits), nullableInt(log.LatencyMs), nullableInt(log.TTFBMs),
-		log.ErrorKind, log.ErrorCode, log.ErrorMessage, log.AttemptCount, log.MessageCount, encodeIntSlice(log.EmptyMessageIndexes), encodeStringSlice(log.MessageRoles), log.ID,
+		log.ErrorKind, log.ErrorCode, log.ErrorMessage, log.AttemptCount,
+		boolToInt(log.MessageShapeKnown), log.MessageCount,
+		boolToInt(log.MessageShapeKnown), encodeIntSlice(log.EmptyMessageIndexes),
+		boolToInt(log.MessageShapeKnown), encodeStringSlice(log.MessageRoles),
+		boolToInt(log.MessageShapeKnown),
+		log.ClientRequestID, log.ClientRequestID,
+		nullableInt(log.OutputLimit), log.OutputLimitSource, log.OutputLimitSource,
+		nullableBool(log.PromptStripped), log.FinishReason, log.FinishReason, log.FinishReasonSource, log.FinishReasonSource,
+		log.RequestPath, log.RequestPath, log.OutputBudgetEnforcement, log.OutputBudgetEnforcement, log.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update request log: %w", err)
@@ -92,13 +115,15 @@ func (s *Store) InsertRequestAttempt(ctx context.Context, attempt accounts.Reque
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO request_attempts (
   id, request_id, attempt_index, account_id, started_at, finished_at, status, http_status,
-  error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source, provider, model, key_id, credits, usage_state, error_scope, route_reason
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source, provider, model, key_id, credits, usage_state, error_scope, route_reason,
+  provider_region, error_code, upstream_reset_at, provider_plan
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		attempt.ID, attempt.RequestID, attempt.AttemptIndex, attempt.AccountID,
 		formatTime(attempt.StartedAt), finished, attempt.Status, nullableInt(attempt.HTTPStatus),
 		attempt.ErrorKind, attempt.ErrorMessage, nullableInt(attempt.LatencyMs),
 		nullableInt(attempt.PromptTokens), nullableInt(attempt.CompletionTokens), attempt.UsageSource,
 		attempt.Provider, attempt.Model, attempt.KeyID, nullableFloat(attempt.Credits), attempt.UsageState, attempt.ErrorScope, attempt.RouteReason,
+		attempt.Region, attempt.ErrorCode, nullableTimePtr(attempt.UpstreamResetAt), attempt.ProviderPlan,
 	)
 	if err != nil {
 		return fmt.Errorf("insert request attempt: %w", err)
@@ -128,7 +153,8 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter accounts.RequestLogF
 			       COALESCE(NULLIF(provider, ''), (SELECT provider FROM accounts WHERE accounts.id = request_logs.account_id), ''), routing,
 			       prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, usage_source,
 			       COALESCE(credits, (SELECT credit FROM request_usage_details WHERE request_usage_details.request_id = request_logs.id)),
-			       latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles
+			       latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles,
+			       client_request_id, output_limit_tokens, output_limit_source, prompt_stripped, message_shape_known, source_fingerprint, finish_reason, finish_reason_source, request_path, output_budget_enforcement
 			FROM request_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -467,7 +493,8 @@ func (s *Store) GetRequestLog(ctx context.Context, id string) (accounts.RequestL
 			       COALESCE(NULLIF(provider, ''), (SELECT provider FROM accounts WHERE accounts.id = request_logs.account_id), ''), routing,
 			       prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, usage_source,
 			       COALESCE(credits, (SELECT credit FROM request_usage_details WHERE request_usage_details.request_id = request_logs.id)),
-			       latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles
+			       latency_ms, ttfb_ms, error_kind, error_code, error_message, attempt_count, message_count, empty_message_indexes, message_roles,
+			       client_request_id, output_limit_tokens, output_limit_source, prompt_stripped, message_shape_known, source_fingerprint, finish_reason, finish_reason_source, request_path, output_budget_enforcement
 			FROM request_logs WHERE id = ?`, strings.TrimSpace(id))
 	log, err := scanRequestLog(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -486,6 +513,10 @@ func (s *Store) GetRequestLog(ctx context.Context, id string) (accounts.RequestL
 		return accounts.RequestLog{}, err
 	}
 	log.StreamDiagnostic = diagnostic
+	log.RoutingDiagnostic, err = s.requestRoutingDiagnostic(ctx, log.ID)
+	if err != nil {
+		return accounts.RequestLog{}, err
+	}
 	usageDetail, err := s.getRequestUsageDetail(ctx, log.ID)
 	if err != nil {
 		return accounts.RequestLog{}, err
@@ -552,23 +583,55 @@ func (s *Store) InsertRequestStreamDiagnostic(ctx context.Context, diagnostic ac
 	if diagnostic.FinishedAt != nil {
 		finished = formatTime(*diagnostic.FinishedAt)
 	}
+	contentLength := any(-1) // legacy schema requires a value; known flag keeps this unknown.
+	if diagnostic.ContentLength != nil {
+		contentLength = *diagnostic.ContentLength
+	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO request_stream_diagnostics (
   request_id, created_at, finished_at, upstream_status, upstream_request_id, context_err,
   cancellation_source, relay_error, sse_event_count, bytes_read, content_length,
-  last_event, saw_done
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  last_event, saw_done, content_length_known, upstream_finish_reason,
+  upstream_finish_reason_source, external_finish_reason, external_finish_reason_source,
+  content_chars, reasoning_chars, tool_event_count, char_count_unit, cancellation_stage,
+  prepare_duration_ms, upstream_response_duration_ms, first_event_duration_ms, total_duration_ms,
+  first_content_duration_ms, timeout_phase, output_budget_enforcement
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(request_id) DO UPDATE SET
   finished_at = excluded.finished_at, upstream_status = excluded.upstream_status,
   upstream_request_id = excluded.upstream_request_id, context_err = excluded.context_err,
   cancellation_source = excluded.cancellation_source, relay_error = excluded.relay_error,
   sse_event_count = excluded.sse_event_count, bytes_read = excluded.bytes_read,
-  content_length = excluded.content_length, last_event = excluded.last_event,
-  saw_done = excluded.saw_done`,
+	content_length = CASE WHEN excluded.content_length_known = 1 THEN excluded.content_length ELSE content_length END,
+	content_length_known = MAX(content_length_known, excluded.content_length_known),
+	last_event = excluded.last_event, saw_done = excluded.saw_done,
+	upstream_finish_reason = CASE WHEN excluded.upstream_finish_reason <> '' THEN excluded.upstream_finish_reason ELSE upstream_finish_reason END,
+	upstream_finish_reason_source = CASE WHEN excluded.upstream_finish_reason_source <> '' THEN excluded.upstream_finish_reason_source ELSE upstream_finish_reason_source END,
+	external_finish_reason = CASE WHEN excluded.external_finish_reason <> '' THEN excluded.external_finish_reason ELSE external_finish_reason END,
+	external_finish_reason_source = CASE WHEN excluded.external_finish_reason_source <> '' THEN excluded.external_finish_reason_source ELSE external_finish_reason_source END,
+	content_chars = COALESCE(excluded.content_chars, content_chars),
+	reasoning_chars = COALESCE(excluded.reasoning_chars, reasoning_chars),
+	tool_event_count = COALESCE(excluded.tool_event_count, tool_event_count),
+	char_count_unit = CASE WHEN excluded.char_count_unit <> '' THEN excluded.char_count_unit ELSE char_count_unit END,
+	cancellation_stage = CASE WHEN excluded.cancellation_stage <> '' THEN excluded.cancellation_stage ELSE cancellation_stage END,
+	prepare_duration_ms = COALESCE(excluded.prepare_duration_ms, prepare_duration_ms),
+	upstream_response_duration_ms = COALESCE(excluded.upstream_response_duration_ms, upstream_response_duration_ms),
+	first_event_duration_ms = COALESCE(excluded.first_event_duration_ms, first_event_duration_ms),
+	total_duration_ms = COALESCE(excluded.total_duration_ms, total_duration_ms),
+	first_content_duration_ms = COALESCE(excluded.first_content_duration_ms, first_content_duration_ms),
+	timeout_phase = CASE WHEN excluded.timeout_phase <> '' THEN excluded.timeout_phase ELSE timeout_phase END,
+	output_budget_enforcement = CASE WHEN excluded.output_budget_enforcement <> '' THEN excluded.output_budget_enforcement ELSE output_budget_enforcement END`,
 		diagnostic.RequestID, formatTime(diagnostic.CreatedAt), finished, nullableInt(diagnostic.UpstreamStatus),
 		diagnostic.UpstreamRequestID, diagnostic.ContextErr, diagnostic.CancellationSource, diagnostic.RelayError,
-		diagnostic.SSEEventCount, diagnostic.BytesRead, diagnostic.ContentLength, diagnostic.LastEvent,
-		boolToInt(diagnostic.SawDone),
+		diagnostic.SSEEventCount, diagnostic.BytesRead, contentLength, diagnostic.LastEvent,
+		boolToInt(diagnostic.SawDone), boolToInt(diagnostic.ContentLength != nil),
+		diagnostic.UpstreamFinishReason, diagnostic.UpstreamFinishReasonSource,
+		diagnostic.ExternalFinishReason, diagnostic.ExternalFinishReasonSource,
+		nullableInt(diagnostic.ContentChars), nullableInt(diagnostic.ReasoningChars), nullableInt(diagnostic.ToolEventCount),
+		diagnostic.CharCountUnit, diagnostic.CancellationStage,
+		nullableInt(diagnostic.PrepareDurationMs), nullableInt(diagnostic.UpstreamResponseDurationMs),
+		nullableInt(diagnostic.FirstEventDurationMs), nullableInt(diagnostic.TotalDurationMs),
+		nullableInt(diagnostic.FirstContentDurationMs), diagnostic.TimeoutPhase, diagnostic.OutputBudgetEnforcement,
 	)
 	if err != nil {
 		return fmt.Errorf("insert request stream diagnostic: %w", err)
@@ -578,17 +641,31 @@ ON CONFLICT(request_id) DO UPDATE SET
 
 func (s *Store) getRequestStreamDiagnostic(ctx context.Context, requestID string) (*accounts.RequestStreamDiagnostic, error) {
 	var diagnostic accounts.RequestStreamDiagnostic
-	var created, finished, upstreamRequestID, contextErr, cancellationSource, relayError string
-	var upstreamStatus sql.NullInt64
+	var created, upstreamRequestID, contextErr, cancellationSource, relayError string
+	var finished sql.NullString
+	var upstreamFinishReason, upstreamFinishReasonSource, externalFinishReason, externalFinishReasonSource string
+	var charCountUnit, cancellationStage string
+	var upstreamStatus, contentLength, contentChars, reasoningChars, toolEventCount sql.NullInt64
+	var prepareDuration, upstreamResponseDuration, firstEventDuration, totalDuration sql.NullInt64
+	var firstContentDuration sql.NullInt64
+	var contentLengthKnown int
 	var sawDone int
 	err := s.db.QueryRowContext(ctx, `
 SELECT request_id, created_at, finished_at, upstream_status, upstream_request_id, context_err,
        cancellation_source, relay_error, sse_event_count, bytes_read, content_length,
-       last_event, saw_done
+       last_event, saw_done, content_length_known, upstream_finish_reason,
+       upstream_finish_reason_source, external_finish_reason, external_finish_reason_source,
+       content_chars, reasoning_chars, tool_event_count, char_count_unit, cancellation_stage,
+       prepare_duration_ms, upstream_response_duration_ms, first_event_duration_ms, total_duration_ms,
+       first_content_duration_ms, timeout_phase, output_budget_enforcement
 FROM request_stream_diagnostics WHERE request_id = ?`, requestID).Scan(
 		&diagnostic.RequestID, &created, &finished, &upstreamStatus, &upstreamRequestID, &contextErr,
 		&cancellationSource, &relayError, &diagnostic.SSEEventCount, &diagnostic.BytesRead,
-		&diagnostic.ContentLength, &diagnostic.LastEvent, &sawDone,
+		&contentLength, &diagnostic.LastEvent, &sawDone, &contentLengthKnown,
+		&upstreamFinishReason, &upstreamFinishReasonSource, &externalFinishReason, &externalFinishReasonSource,
+		&contentChars, &reasoningChars, &toolEventCount, &charCountUnit, &cancellationStage,
+		&prepareDuration, &upstreamResponseDuration, &firstEventDuration, &totalDuration,
+		&firstContentDuration, &diagnostic.TimeoutPhase, &diagnostic.OutputBudgetEnforcement,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -597,8 +674,8 @@ FROM request_stream_diagnostics WHERE request_id = ?`, requestID).Scan(
 		return nil, fmt.Errorf("get request stream diagnostic: %w", err)
 	}
 	diagnostic.CreatedAt = parseTime(created)
-	if finished != "" {
-		parsed := parseTime(finished)
+	if finished.Valid && finished.String != "" {
+		parsed := parseTime(finished.String)
 		diagnostic.FinishedAt = &parsed
 	}
 	if upstreamStatus.Valid {
@@ -606,6 +683,21 @@ FROM request_stream_diagnostics WHERE request_id = ?`, requestID).Scan(
 	}
 	diagnostic.UpstreamRequestID, diagnostic.ContextErr = upstreamRequestID, contextErr
 	diagnostic.CancellationSource, diagnostic.RelayError = cancellationSource, relayError
+	diagnostic.UpstreamFinishReason, diagnostic.UpstreamFinishReasonSource = upstreamFinishReason, upstreamFinishReasonSource
+	diagnostic.ExternalFinishReason, diagnostic.ExternalFinishReasonSource = externalFinishReason, externalFinishReasonSource
+	diagnostic.ContentLength = nil
+	if contentLengthKnown != 0 {
+		diagnostic.ContentLength = nullIntPtr(contentLength)
+	}
+	diagnostic.ContentChars = nullIntPtr(contentChars)
+	diagnostic.ReasoningChars = nullIntPtr(reasoningChars)
+	diagnostic.ToolEventCount = nullIntPtr(toolEventCount)
+	diagnostic.CharCountUnit, diagnostic.CancellationStage = charCountUnit, cancellationStage
+	diagnostic.PrepareDurationMs = nullIntPtr(prepareDuration)
+	diagnostic.UpstreamResponseDurationMs = nullIntPtr(upstreamResponseDuration)
+	diagnostic.FirstEventDurationMs = nullIntPtr(firstEventDuration)
+	diagnostic.FirstContentDurationMs = nullIntPtr(firstContentDuration)
+	diagnostic.TotalDurationMs = nullIntPtr(totalDuration)
 	diagnostic.SawDone = sawDone != 0
 	return &diagnostic, nil
 }
@@ -613,7 +705,8 @@ FROM request_stream_diagnostics WHERE request_id = ?`, requestID).Scan(
 func (s *Store) listRequestAttempts(ctx context.Context, requestID string) ([]accounts.RequestAttempt, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, request_id, attempt_index, account_id, started_at, finished_at, status, http_status,
-       error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source,provider,model,key_id,credits,usage_state,error_scope,route_reason
+       error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source,provider,model,key_id,credits,usage_state,error_scope,route_reason,
+       provider_region,error_code,upstream_reset_at,provider_plan
 FROM request_attempts WHERE request_id = ? ORDER BY attempt_index ASC, started_at ASC`, requestID)
 	if err != nil {
 		return nil, fmt.Errorf("list request attempts: %w", err)
@@ -757,20 +850,24 @@ func decodeStringSlice(raw string) []string {
 
 func scanRequestLog(row rowScanner) (accounts.RequestLog, error) {
 	var (
-		log                        accounts.RequestLog
-		finished, accountID        sql.NullString
-		stream                     int
-		prompt, completion         sql.NullInt64
-		cacheRead, cacheWrite      sql.NullInt64
-		credits                    sql.NullFloat64
-		latency, ttfb              sql.NullInt64
-		emptyIndexes, messageRoles sql.NullString
-		created                    string
+		log                         accounts.RequestLog
+		finished, accountID         sql.NullString
+		stream                      int
+		prompt, completion          sql.NullInt64
+		cacheRead, cacheWrite       sql.NullInt64
+		outputLimit, promptStripped sql.NullInt64
+		credits                     sql.NullFloat64
+		latency, ttfb               sql.NullInt64
+		emptyIndexes, messageRoles  sql.NullString
+		created                     string
+		shapeKnown                  int
 	)
 	err := row.Scan(
 		&log.ID, &created, &finished, &stream, &log.Status, &log.RequestedModel, &log.MappedModel, &log.RequestedReasoning, &log.ResolvedReasoning, &accountID, &log.Provider, &log.Routing,
 		&prompt, &completion, &cacheRead, &cacheWrite, &log.UsageSource, &credits,
 		&latency, &ttfb, &log.ErrorKind, &log.ErrorCode, &log.ErrorMessage, &log.AttemptCount, &log.MessageCount, &emptyIndexes, &messageRoles,
+		&log.ClientRequestID, &outputLimit, &log.OutputLimitSource, &promptStripped, &shapeKnown,
+		&log.SourceFingerprint, &log.FinishReason, &log.FinishReasonSource, &log.RequestPath, &log.OutputBudgetEnforcement,
 	)
 	if err != nil {
 		return accounts.RequestLog{}, err
@@ -790,6 +887,12 @@ func scanRequestLog(row rowScanner) (accounts.RequestLog, error) {
 	log.CompletionTokens = nullIntPtr(completion)
 	log.CacheReadTokens = nullIntPtr(cacheRead)
 	log.CacheWriteTokens = nullIntPtr(cacheWrite)
+	log.OutputLimit = nullIntPtr(outputLimit)
+	if promptStripped.Valid {
+		value := promptStripped.Int64 != 0
+		log.PromptStripped = &value
+	}
+	log.MessageShapeKnown = shapeKnown != 0
 	log.LatencyMs = nullIntPtr(latency)
 	log.TTFBMs = nullIntPtr(ttfb)
 	if credits.Valid {
@@ -804,6 +907,7 @@ func scanRequestAttempt(row rowScanner) (accounts.RequestAttempt, error) {
 		attempt                     accounts.RequestAttempt
 		credits                     sql.NullFloat64
 		finished                    sql.NullString
+		upstreamResetAt             sql.NullString
 		httpStatus                  sql.NullInt64
 		latency, prompt, completion sql.NullInt64
 		started                     string
@@ -812,6 +916,7 @@ func scanRequestAttempt(row rowScanner) (accounts.RequestAttempt, error) {
 		&attempt.ID, &attempt.RequestID, &attempt.AttemptIndex, &attempt.AccountID, &started, &finished,
 		&attempt.Status, &httpStatus, &attempt.ErrorKind, &attempt.ErrorMessage, &latency, &prompt, &completion, &attempt.UsageSource,
 		&attempt.Provider, &attempt.Model, &attempt.KeyID, &credits, &attempt.UsageState, &attempt.ErrorScope, &attempt.RouteReason,
+		&attempt.Region, &attempt.ErrorCode, &upstreamResetAt, &attempt.ProviderPlan,
 	)
 	if err != nil {
 		return accounts.RequestAttempt{}, err
@@ -823,6 +928,10 @@ func scanRequestAttempt(row rowScanner) (accounts.RequestAttempt, error) {
 	if finished.Valid && finished.String != "" {
 		parsed := parseTime(finished.String)
 		attempt.FinishedAt = &parsed
+	}
+	if upstreamResetAt.Valid && upstreamResetAt.String != "" {
+		parsed := parseTime(upstreamResetAt.String)
+		attempt.UpstreamResetAt = &parsed
 	}
 	attempt.HTTPStatus = nullIntPtr(httpStatus)
 	attempt.LatencyMs = nullIntPtr(latency)
@@ -852,11 +961,25 @@ func nullableInt(value *int) any {
 	return *value
 }
 
+func nullableBool(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return boolToInt(*value)
+}
+
 func nullableFloat(value *float64) any {
 	if value == nil {
 		return nil
 	}
 	return *value
+}
+
+func nullableTimePtr(value *time.Time) any {
+	if value == nil || value.IsZero() {
+		return nil
+	}
+	return formatTime(value.UTC())
 }
 
 func nullIntPtr(value sql.NullInt64) *int {

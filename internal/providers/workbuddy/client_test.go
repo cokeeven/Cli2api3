@@ -198,11 +198,31 @@ func TestChatNonStreamAggregatesToolsAndReasoning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Content != "OK" || out.FinishReason != "tool_calls" || out.PromptTokens != 3 {
+	if out.Content != "OK" || out.FinishReason != "tool_calls" || out.FinishReasonSource != "upstream" || out.PromptTokens != 3 {
 		t.Fatalf("outcome=%+v", out)
 	}
 	if !strings.Contains(string(out.ToolCalls), "get_time") {
 		t.Fatalf("tool calls=%s", out.ToolCalls)
+	}
+}
+
+func TestOutcomeFinishReasonSourceDistinguishesUpstreamFromAdapterDefault(t *testing.T) {
+	for _, test := range []struct {
+		name, raw, wantReason, wantSource string
+	}{
+		{"explicit upstream reason", `{"choices":[{"finish_reason":"stop"}]}`, "stop", "upstream"},
+		{"missing upstream reason", `{"choices":[{"finish_reason":""}]}`, "stop", "adapter_default"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var aggregate map[string]any
+			if err := json.Unmarshal([]byte(test.raw), &aggregate); err != nil {
+				t.Fatal(err)
+			}
+			got, err := outcomeFromAggregate(aggregate)
+			if err != nil || got.FinishReason != test.wantReason || got.FinishReasonSource != test.wantSource {
+				t.Fatalf("outcome=%+v err=%v", got, err)
+			}
+		})
 	}
 }
 
@@ -213,6 +233,7 @@ func TestChatNonStreamSendsSingleAndMultiTurnHistories(t *testing.T) {
 		wantRoles     string
 		wantToolCalls int
 		wantToolID    string
+		wantError     bool
 	}{
 		{
 			name:      "single turn",
@@ -239,7 +260,9 @@ func TestChatNonStreamSendsSingleAndMultiTurnHistories(t *testing.T) {
 				{Role: "assistant", Content: "", ToolCalls: json.RawMessage(`[{"id":"call_interrupted","type":"function","function":{"name":"search","arguments":"{}"}}]`)},
 				{Role: "user", Content: "stop and answer me"},
 			},
-			wantRoles: "system,user,user",
+			// Caller history is now rejected explicitly rather than silently
+			// deleting the interrupted tool round (fidelity contract).
+			wantError: true,
 		},
 	}
 
@@ -248,6 +271,9 @@ func TestChatNonStreamSendsSingleAndMultiTurnHistories(t *testing.T) {
 			payload, _ := Credential{AccessToken: "at", UID: "u1", Domain: "codebuddy.cn", ExpiresAt: 4102444800}.Encode()
 			store := &memStore{items: map[string][]byte{"acc1": payload}}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.wantError {
+					t.Fatal("invalid tool history reached upstream")
+				}
 				if r.URL.Path != pathChat {
 					t.Fatalf("path=%s", r.URL.Path)
 				}
@@ -297,9 +323,16 @@ data: [DONE]
 			client.http = server.Client()
 			client.http.Transport = rewriteTransport{server: server.URL, round: server.Client().Transport}
 
-			if _, err := client.ChatNonStream(context.Background(), "acc1", translate.ChatRequest{
+			_, err := client.ChatNonStream(context.Background(), "acc1", translate.ChatRequest{
 				Model: "glm-5.2", Messages: test.messages,
-			}); err != nil {
+			})
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "require all results") {
+					t.Fatalf("incomplete history must return an explicit validation error: %v", err)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -1895,6 +1928,50 @@ func TestOutcomeFromAggregatePreservesCacheUsage(t *testing.T) {
 		})
 	}
 }
+
+func TestOutcomeFromAggregateCacheAliasPriorityNullAndZero(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		usage      string
+		wantRead   *int
+		wantWrite  *int
+		wantPrompt int
+	}{
+		{name: "top-level wins without inflating prompt", usage: `"prompt_tokens":100,"completion_tokens":10,"cache_read_tokens":12,"prompt_tokens_details":{"cached_tokens":7},"prompt_cache_hit_tokens":9,"cache_write_tokens":0`, wantRead: workbuddyTestIntPtr(12), wantWrite: workbuddyTestIntPtr(0), wantPrompt: 100},
+		{name: "null primary falls through to explicit zero detail", usage: `"prompt_tokens":100,"completion_tokens":10,"cache_read_tokens":null,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":9`, wantRead: workbuddyTestIntPtr(0), wantPrompt: 100},
+		{name: "all cache aliases null stays unknown", usage: `"cache_read_tokens":null,"prompt_tokens_details":{"cached_tokens":null},"prompt_cache_hit_tokens":null`, wantPrompt: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var usage map[string]any
+			if err := json.Unmarshal([]byte(`{`+test.usage+`}`), &usage); err != nil {
+				t.Fatal(err)
+			}
+			out, err := outcomeFromAggregate(map[string]any{"model": "test", "usage": usage})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.PromptTokens != test.wantPrompt {
+				t.Fatalf("prompt tokens=%d want=%d", out.PromptTokens, test.wantPrompt)
+			}
+			if test.wantRead == nil {
+				if out.CacheReadTokens != nil {
+					t.Fatalf("cache read fabricated=%v", *out.CacheReadTokens)
+				}
+			} else if out.CacheReadTokens == nil || *out.CacheReadTokens != *test.wantRead {
+				t.Fatalf("cache read=%v want=%d", out.CacheReadTokens, *test.wantRead)
+			}
+			if test.wantWrite == nil {
+				if out.CacheWriteTokens != nil {
+					t.Fatalf("cache write fabricated=%v", *out.CacheWriteTokens)
+				}
+			} else if out.CacheWriteTokens == nil || *out.CacheWriteTokens != *test.wantWrite {
+				t.Fatalf("cache write=%v want=%d", out.CacheWriteTokens, *test.wantWrite)
+			}
+		})
+	}
+}
+
+func workbuddyTestIntPtr(value int) *int { return &value }
 
 func TestOutcomeFromAggregateMissingCreditStaysNil(t *testing.T) {
 	aggregate, err := Aggregate(strings.NewReader(strings.Join([]string{

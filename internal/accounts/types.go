@@ -137,6 +137,24 @@ type CooldownRow struct {
 	Kind         string
 	Message      string
 	ModelKind    string
+	Evidence     CooldownEvidence
+}
+
+// CooldownEvidence contains the latest bounded classification facts retained
+// for one account or model restriction. It intentionally excludes request,
+// response, prompt, tool, and credential data.
+// Empty fields on legacy rows remain unknown; they are never reconstructed
+// from Message or migration time.
+type CooldownEvidence struct {
+	FirstObservedAt   time.Time
+	LastObservedAt    time.Time
+	Code              string
+	Source            string
+	Scope             string
+	ReportedScope     string
+	UpstreamResetAt   *time.Time
+	LocalBackoffUntil time.Time
+	Message           string `json:"-"`
 }
 
 func NormalizeWorkBuddyCheckinTime(value string) (string, error) {

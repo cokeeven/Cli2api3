@@ -23,16 +23,47 @@ type ModelCapabilities struct {
 	// MaxMode tiers: when a model declares a second (Max/Max-mode) tier, these
 	// carry the Max-tier prompt/output ceilings so the console can show the
 	// value that matches the max-mode toggle instead of the default tier.
-	PromptMaxTokensMax int      `json:"prompt_max_tokens_max,omitempty"`
-	MaxOutputMax       int      `json:"max_output_tokens_max,omitempty"`
-	MaxMode            bool     `json:"max_mode,omitempty"`
-	Tools              bool     `json:"tools"`
-	Images             bool     `json:"images"`
-	Reasoning          bool     `json:"reasoning"`
-	ReasoningOptions   []string `json:"reasoning_options,omitempty"`
-	ReasoningDefault   string   `json:"reasoning_default,omitempty"`
-	ReasoningType      string   `json:"reasoning_type,omitempty"`
-	CanDisableThinking bool     `json:"can_disable_thinking,omitempty"`
+	PromptMaxTokensMax   int                   `json:"prompt_max_tokens_max,omitempty"`
+	MaxOutputMax         int                   `json:"max_output_tokens_max,omitempty"`
+	MaxMode              bool                  `json:"max_mode,omitempty"`
+	Tools                bool                  `json:"tools"`
+	Images               bool                  `json:"images"`
+	Reasoning            bool                  `json:"reasoning"`
+	ReasoningOptions     []string              `json:"reasoning_options,omitempty"`
+	ReasoningDefault     string                `json:"reasoning_default,omitempty"`
+	ReasoningType        string                `json:"reasoning_type,omitempty"`
+	CanDisableThinking   bool                  `json:"can_disable_thinking,omitempty"`
+	OutputBudgetEvidence *OutputBudgetEvidence `json:"output_budget_evidence,omitempty"`
+}
+
+// OutputBudgetEvidence is narrowly-scoped provider evidence. It describes an
+// observed behavior for one provider path/client version; it is not a promise
+// about untested models or future upstream behavior.
+type OutputBudgetEvidence struct {
+	Status           string `json:"status"`
+	Provider         string `json:"provider"`
+	Region           string `json:"region"`
+	EndpointPath     string `json:"endpoint_path"`
+	Function         string `json:"function"`
+	RequestParameter string `json:"request_parameter"`
+	TokenBasis       string `json:"token_basis"`
+	EvidenceDate     string `json:"evidence_date"`
+	EvidenceSource   string `json:"evidence_source,omitempty"`
+	ClientVersion    string `json:"client_version"`
+	ClientBuild      string `json:"client_build"`
+	AppVersion       string `json:"app_version"`
+	EffectiveCeiling *int   `json:"effective_ceiling,omitempty"`
+}
+
+// FirstIntPointer returns the first reported integer value, preserving an
+// explicit zero while allowing absent/null aliases to fall through.
+func FirstIntPointer(values ...*int) *int {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 type ModelInfo struct {
@@ -52,6 +83,17 @@ type ModelInfo struct {
 // CredentialCodec validates and stores provider credentials.
 type CredentialCodec interface {
 	Validate(payload []byte) error
+}
+
+type CredentialMaintainer interface {
+	Keepalive(context.Context, string) error
+}
+
+// CredentialPayloadCASStore persists a refreshed credential only when the
+// stored payload still matches the snapshot used for the refresh. This keeps a
+// late token rotation from overwriting a newer login or refresh result.
+type CredentialPayloadCASStore interface {
+	SaveCredentialPayloadIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte) (bool, error)
 }
 
 // LoginSession describes one browser-login round for an account.
@@ -74,20 +116,31 @@ type LoginCompleter interface {
 
 // ChatOutcome is the provider-neutral non-stream result.
 type ChatOutcome struct {
-	Model            string
-	Content          string
-	Reasoning        string
-	ToolCalls        json.RawMessage
-	FinishReason     string
-	PromptTokens     int
-	CompletionTokens int
-	CacheReadTokens  *int
-	CacheWriteTokens *int
-	UsageSource      string
-	Credits          *float64
+	Model                    string
+	Content                  string
+	Reasoning                string
+	ToolCalls                json.RawMessage
+	FinishReason             string
+	FinishReasonSource       string
+	PromptTokens             int
+	CompletionTokens         int
+	ReportedPromptTokens     *int
+	ReportedCompletionTokens *int
+	UsageExtensions          map[string]any
+	CacheReadTokens          *int
+	CacheWriteTokens         *int
+	CachedTokens             *int
+	UsageSource              string
+	Credits                  *float64
 	// ReasoningLevel is the clamped reasoning level actually sent upstream,
 	// empty when the provider did not include one in the payload.
 	ReasoningLevel string
+	// OutputLimit and OutputLimitSource describe the actual max_tokens value
+	// placed in the provider request. A nil limit means the adapter left the
+	// provider default in control; its numeric value is unknown.
+	OutputLimit          *int
+	OutputLimitSource    string
+	OutputBudgetEvidence *OutputBudgetEvidence
 }
 
 // ResolvedChat carries provider-side metadata for a stream request that the
@@ -95,7 +148,14 @@ type ChatOutcome struct {
 type ResolvedChat struct {
 	// ReasoningLevel is the clamped reasoning level actually sent upstream,
 	// empty when the provider did not include one in the payload.
-	ReasoningLevel string
+	ReasoningLevel       string
+	OutputLimit          *int
+	OutputLimitSource    string
+	OutputBudgetEvidence *OutputBudgetEvidence
+}
+
+func (r ResolvedChat) OutcomeMetadata() ChatOutcome {
+	return ChatOutcome{ReasoningLevel: r.ReasoningLevel, OutputLimit: r.OutputLimit, OutputLimitSource: r.OutputLimitSource, OutputBudgetEvidence: r.OutputBudgetEvidence, UsageSource: "unknown"}
 }
 
 // ProviderChat executes chat for one account. Stream implementations return
@@ -162,11 +222,12 @@ type ImportExporter interface {
 // AccountHealth is the provider-neutral readiness snapshot for in-process
 // accounts that have no child-process /health endpoint.
 type AccountHealth struct {
-	Ready     bool
-	Hot       bool
-	UID       string
-	InFlight  int
-	LastError string
+	Ready         bool
+	Hot           bool
+	UID           string
+	InFlight      int
+	LastError     string
+	LastErrorKind string
 }
 
 // QuotaWindow is one provider-native usage period. Console cards may render
@@ -236,14 +297,27 @@ type AccountProber interface {
 type Error struct {
 	// Scope and RetrySafe describe an explicit upstream rejection. Empty
 	// scope means unknown; transports must never infer billability from it.
-	Scope      string
-	RetrySafe  bool
-	Kind       string
-	Status     int
-	Message    string
-	Code       string
-	Type       string
-	RetryAfter time.Duration
+	Scope            string
+	RetrySafe        bool
+	Kind             string
+	Status           int
+	Message          string
+	Code             string
+	Type             string
+	RetryAfter       time.Duration
+	RetryAfterHeader string
+	// UpstreamResetAt is the explicit provider-supplied reset instant when the
+	// adapter could parse one. Local cooldowns are never written here.
+	UpstreamResetAt *time.Time
+}
+
+// WithRetryAfterHeader leaves cooldown parsing/policy in the executor.
+func WithRetryAfterHeader(err error, header string) error {
+	var upstream *Error
+	if errors.As(err, &upstream) && len(header) <= 1024 {
+		upstream.RetryAfterHeader = header
+	}
+	return err
 }
 
 func (e *Error) Error() string {
@@ -259,15 +333,16 @@ func (e *Error) Error() string {
 // Adapter bundles the optional capability interfaces. Every field may be nil;
 // use Supports() before calling so unsupported paths fail explicitly.
 type Adapter struct {
-	ID           string
-	Credential   CredentialCodec
-	Login        LoginSessionProvider
-	Chat         ProviderChat
-	Models       ModelCatalogProvider
-	Classifier   ErrorClassifier
-	ImportExport ImportExporter
-	Prober       AccountProber
-	Checkin      AccountCheckiner
+	ID                    string
+	Credential            CredentialCodec
+	Login                 LoginSessionProvider
+	Chat                  ProviderChat
+	Models                ModelCatalogProvider
+	Classifier            ErrorClassifier
+	ImportExport          ImportExporter
+	Prober                AccountProber
+	Checkin               AccountCheckiner
+	CredentialMaintenance CredentialMaintainer
 	// StreamFormat declares the SSE dialect ChatStream returns (see
 	// StreamFormat* constants). Empty means chat-completions deltas.
 	StreamFormat string

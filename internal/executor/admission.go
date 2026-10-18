@@ -118,6 +118,7 @@ func (p *Pool) acquireRoute(q RouteQuery, identity routingIdentity) (Item, func(
 		return Item{}, nil, false
 	}
 	item, ok := p.pickRouteLocked(q)
+	item = item.clone()
 	if !ok {
 		return Item{}, nil, false
 	}
@@ -143,7 +144,6 @@ func (p *Pool) acquireRoute(q RouteQuery, identity routingIdentity) (Item, func(
 	return item, func() {
 		once.Do(func() {
 			p.mu.Lock()
-			defer p.mu.Unlock()
 			if p.keyPlatformLive[key] > 1 {
 				p.keyPlatformLive[key]--
 			} else {
@@ -160,6 +160,8 @@ func (p *Pool) acquireRoute(q RouteQuery, identity routingIdentity) (Item, func(
 					break
 				}
 			}
+			p.mu.Unlock()
+			p.signalCapacityChanged()
 		})
 	}, true
 }

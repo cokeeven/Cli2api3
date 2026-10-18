@@ -71,3 +71,19 @@ func ResolveReasoningLevel(level string, caps ModelCapabilities) string {
 	}
 	return caps.ReasoningOptions[0]
 }
+
+// SupportsReasoningLevel reports whether the catalog explicitly advertises a
+// reasoning level. Callers may use this before applying the compatibility
+// fallback in ResolveReasoningLevel when a caller supplied an explicit value.
+func SupportsReasoningLevel(level string, caps ModelCapabilities) bool {
+	normalized := NormalizeReasoningLevel(level)
+	if normalized == "" {
+		return false
+	}
+	for _, option := range caps.ReasoningOptions {
+		if NormalizeReasoningLevel(option) == normalized {
+			return true
+		}
+	}
+	return false
+}

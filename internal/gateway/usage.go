@@ -15,18 +15,48 @@ func BuildChatUsage(res executor.ChatResult) map[string]any {
 		"total_tokens":      res.PromptTokens + res.CompletionTokens,
 		"source":            firstNonEmpty(res.UsageSource, "estimate"),
 	}
+	for key, value := range res.UsageExtensions {
+		if _, exists := out[key]; !exists {
+			out[key] = value
+		}
+	}
+	if res.ReportedPromptTokens != nil || res.ReportedCompletionTokens != nil {
+		if res.ReportedPromptTokens == nil {
+			delete(out, "prompt_tokens")
+			delete(out, "total_tokens")
+		}
+		if res.ReportedCompletionTokens == nil {
+			delete(out, "completion_tokens")
+			delete(out, "total_tokens")
+		}
+	}
 	if res.CacheReadTokens != nil {
 		out["cache_read_tokens"] = *res.CacheReadTokens
 	}
 	if res.CacheWriteTokens != nil {
 		out["cache_write_tokens"] = *res.CacheWriteTokens
 	}
+	details := map[string]any{}
+	if existing, ok := out["prompt_tokens_details"].(map[string]any); ok {
+		for key, value := range existing {
+			details[key] = value
+		}
+	}
 	cachedTokens := res.CachedTokens
 	if cachedTokens == nil {
 		cachedTokens = res.CacheReadTokens
 	}
 	if cachedTokens != nil {
-		out["prompt_tokens_details"] = map[string]any{"cached_tokens": *cachedTokens}
+		details["cached_tokens"] = *cachedTokens
+	}
+	if res.CacheWriteTokens != nil {
+		// Current DSH's OpenAI Completions parser reads the cache-write
+		// extension from prompt_tokens_details, while other clients may use
+		// the existing top-level compatibility field above.
+		details["cache_write_tokens"] = *res.CacheWriteTokens
+	}
+	if len(details) > 0 {
+		out["prompt_tokens_details"] = details
 	}
 	if res.Credits != nil {
 		out["credits"] = *res.Credits

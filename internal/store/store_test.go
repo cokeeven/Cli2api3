@@ -519,9 +519,19 @@ func TestCooldownsSurviveReopen(t *testing.T) {
 	}
 	future := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
 	past := time.Now().UTC().Add(-time.Hour)
+	firstObserved := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	lastObserved := firstObserved.Add(2 * time.Minute)
+	upstreamReset := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
 	rows := []accounts.CooldownRow{
-		{AccountID: account.ID, DownUntil: future, BackoffLevel: 3, Kind: accounts.KindRateLimit, Message: "slow down"},
-		{AccountID: account.ID, Model: "glm-5.3", DownUntil: future, BackoffLevel: 2, Kind: accounts.KindQuota, Message: "out of quota"},
+		{AccountID: account.ID, DownUntil: future, BackoffLevel: 3, Kind: accounts.KindRateLimit, Message: "slow down", Evidence: accounts.CooldownEvidence{
+			FirstObservedAt: firstObserved, LastObservedAt: lastObserved, Code: "SYNTHETIC_ACCOUNT",
+			Source: "provider_adapter_error", Scope: "account", ReportedScope: "account",
+			UpstreamResetAt: &upstreamReset, LocalBackoffUntil: future,
+		}},
+		{AccountID: account.ID, Model: "glm-5.3", DownUntil: future, BackoffLevel: 2, Kind: accounts.KindQuota, Message: "out of quota", Evidence: accounts.CooldownEvidence{
+			FirstObservedAt: firstObserved, LastObservedAt: lastObserved, Code: "SYNTHETIC_MODEL",
+			Source: "provider_adapter_error", Scope: "model", ReportedScope: "model", LocalBackoffUntil: future,
+		}},
 		{AccountID: account.ID, Model: "expired-model", DownUntil: past, Kind: accounts.KindRateLimit},
 	}
 	if err := store.SaveCooldowns(ctx, account.ID, rows); err != nil {
@@ -552,9 +562,69 @@ func TestCooldownsSurviveReopen(t *testing.T) {
 	if !ok || accountWide.BackoffLevel != 3 || !accountWide.DownUntil.Equal(future) {
 		t.Fatalf("account cooldown lost: %+v", accountWide)
 	}
+	if accountWide.Evidence.Code != "SYNTHETIC_ACCOUNT" || accountWide.Evidence.Scope != "account" || accountWide.Evidence.Source != "provider_adapter_error" ||
+		!accountWide.Evidence.FirstObservedAt.Equal(firstObserved) || !accountWide.Evidence.LastObservedAt.Equal(lastObserved) ||
+		accountWide.Evidence.UpstreamResetAt == nil || !accountWide.Evidence.UpstreamResetAt.Equal(upstreamReset) || !accountWide.Evidence.LocalBackoffUntil.Equal(future) {
+		t.Fatalf("account cooldown evidence lost across reopen: %+v", accountWide.Evidence)
+	}
 	scoped, ok := byModel["glm-5.3"]
 	if !ok || scoped.BackoffLevel != 2 || scoped.Kind != accounts.KindQuota {
 		t.Fatalf("model cooldown lost: %+v", scoped)
+	}
+	if scoped.Evidence.Code != "SYNTHETIC_MODEL" || scoped.Evidence.Scope != "model" || scoped.Evidence.UpstreamResetAt != nil || !scoped.Evidence.LocalBackoffUntil.Equal(future) {
+		t.Fatalf("model cooldown evidence or unknown reset changed across reopen: %+v", scoped.Evidence)
+	}
+}
+
+func TestCooldownEvidenceMigrationLeavesLegacyFieldsUnknown(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy-cooldowns.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	legacy := &Store{db: db}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schemaMigrationsDDL); err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range sqliteMigrations[:len(sqliteMigrations)-1] {
+		if err := legacy.applyMigration(ctx, migration); err != nil {
+			t.Fatalf("apply legacy schema %s: %v", migration.filename, err)
+		}
+	}
+	account, err := legacy.Create(ctx, accounts.CreateAccount{Name: "Legacy cooldown", Enabled: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMessage := "preserved legacy message"
+	legacyUntil := formatTime(time.Now().UTC().Add(time.Hour))
+	if _, err := db.Exec(`INSERT INTO account_cooldowns (account_id, model, down_until, backoff_level, kind, message, model_kind, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, account.ID, "glm-5.3", legacyUntil, 2, accounts.KindRateLimit, legacyMessage, accounts.KindRateLimit, formatTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	rows, err := upgraded.LoadCooldowns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Message != legacyMessage || rows[0].Model != "glm-5.3" {
+		t.Fatalf("legacy cooldown row was not preserved: %+v", rows)
+	}
+	evidence := rows[0].Evidence
+	if !evidence.FirstObservedAt.IsZero() || !evidence.LastObservedAt.IsZero() || evidence.Code != "" || evidence.Source != "" || evidence.Scope != "" || evidence.ReportedScope != "" || evidence.UpstreamResetAt != nil || !evidence.LocalBackoffUntil.IsZero() {
+		t.Fatalf("migration guessed historical cooldown evidence: %+v", evidence)
 	}
 }
 

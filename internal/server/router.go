@@ -30,6 +30,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/accounts/", s.withConsoleKey(s.consoleHandler().HandleAccountByID))
 	s.mux.HandleFunc("/api/logs", s.withConsoleKey(s.consoleHandler().HandleLogs))
 	s.mux.HandleFunc("/api/logs/", s.withConsoleKey(s.consoleHandler().HandleLogs))
+	s.mux.HandleFunc("/api/model-usage", s.withConsoleKey(s.consoleHandler().HandleModelUsage))
+	s.mux.HandleFunc("/api/model-usage/", s.withConsoleKey(s.consoleHandler().HandleModelUsage))
 	s.mux.HandleFunc("/api/chat", s.withConsoleKey(s.consoleHandler().HandleChat))
 	s.mux.HandleFunc(endpoint.ModelsPath, s.withAPIKey(s.gatewayHandler().HandleModels))
 	s.mux.HandleFunc(endpoint.ChatCompletionsPath, s.withAPIKey(s.gatewayHandler().HandleChatCompletions))
@@ -52,7 +54,7 @@ func (s *Server) routes() {
 			r.URL.Path != "/og-card.svg" &&
 			r.URL.Path != "/site.webmanifest" {
 			switch r.URL.Path {
-			case "/login", "/auth", "/providers", "/access", "/accounts", "/system", "/logs", "/keys":
+			case "/login", "/auth", "/providers", "/access", "/accounts", "/system", "/logs", "/keys", "/model-usage":
 			default:
 				http.NotFound(w, r)
 				return

@@ -2,10 +2,12 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/executor"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/proxy"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,21 +23,25 @@ type System struct {
 	Mu                *sync.Mutex
 }
 type SystemSettingsPatch struct {
-	AutomationMaintenanceEnabled *bool             `json:"automation_maintenance_enabled"`
-	CrossProviderModelPool       *bool             `json:"cross_provider_model_pool"`
-	CheckinDisabledAccounts      *bool             `json:"checkin_disabled_accounts"`
-	RoutingStrategy              *string           `json:"routing_strategy"`
-	ProxyURL                     *string           `json:"proxy_url"`
-	WorkBuddyCheckinTime         *string           `json:"workbuddy_checkin_time"`
-	CheckinTimes                 map[string]string `json:"checkin_times"`
+	MaintenanceSchedule          *accounts.MaintenanceSchedule `json:"maintenance_schedule"`
+	AutomationMaintenanceEnabled *bool                         `json:"automation_maintenance_enabled"`
+	CrossProviderModelPool       *bool                         `json:"cross_provider_model_pool"`
+	CheckinDisabledAccounts      *bool                         `json:"checkin_disabled_accounts"`
+	RoutingStrategy              *string                       `json:"routing_strategy"`
+	ProxyURL                     *string                       `json:"proxy_url"`
+	WorkBuddyCheckinTime         *string                       `json:"workbuddy_checkin_time"`
+	QuotaRefreshIntervalMinutes  *int                          `json:"quota_refresh_interval_minutes"`
+	CheckinTimes                 map[string]string             `json:"checkin_times"`
 }
 type SystemSettings struct {
+	MaintenanceSchedule          accounts.MaintenanceSchedule  `json:"maintenance_schedule"`
 	AutomationMaintenanceEnabled bool                          `json:"automation_maintenance_enabled"`
 	CrossProviderModelPool       bool                          `json:"cross_provider_model_pool"`
 	CheckinDisabledAccounts      bool                          `json:"checkin_disabled_accounts"`
 	RoutingStrategy              string                        `json:"routing_strategy"`
 	ProxyURL                     string                        `json:"proxy_url"`
 	WorkBuddyCheckinTime         string                        `json:"workbuddy_checkin_time"`
+	QuotaRefreshIntervalMinutes  int                           `json:"quota_refresh_interval_minutes"`
 	CheckinTimes                 map[string]string             `json:"checkin_times"`
 	Timezone                     string                        `json:"timezone"`
 	SessionAffinity              executor.SessionAffinityStats `json:"session_affinity"`
@@ -46,6 +52,7 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 	checkin := ""
 	checkinDisabledAccounts := false
 	automationMaintenanceEnabled := false
+	quotaRefreshIntervalMinutes := accounts.DefaultQuotaRefreshIntervalMinutes
 	if h.Settings != nil {
 		automationMaintenanceEnabled, _ = accounts.AutomationMaintenanceEnabled(ctx, h.Settings)
 		proxyURL, _, _ = h.Settings.GetSecret(ctx, proxyURLSecret)
@@ -54,15 +61,25 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 		if ok && err == nil {
 			checkinDisabledAccounts, _ = parseSettingBool(value)
 		}
+		if interval, err := accounts.QuotaRefreshIntervalMinutes(ctx, h.Settings); err == nil {
+			quotaRefreshIntervalMinutes = interval
+		}
 	}
 	settings := SystemSettings{
+		MaintenanceSchedule:          accounts.DefaultMaintenanceSchedule(),
 		AutomationMaintenanceEnabled: automationMaintenanceEnabled,
 		CrossProviderModelPool:       h.CrossProviderPool.Load(),
 		CheckinDisabledAccounts:      checkinDisabledAccounts,
 		ProxyURL:                     proxy.Redact(proxyURL),
 		WorkBuddyCheckinTime:         checkin,
+		QuotaRefreshIntervalMinutes:  quotaRefreshIntervalMinutes,
 		CheckinTimes:                 map[string]string{},
 		Timezone:                     time.Now().Format("MST -07:00"),
+	}
+	if h.Settings != nil {
+		if schedule, err := accounts.LoadMaintenanceSchedule(ctx, h.Settings); err == nil {
+			settings.MaintenanceSchedule = schedule
+		}
 	}
 	for _, descriptor := range providers.List() {
 		if descriptor.SupportsCheckin() && h.Settings != nil {
@@ -79,8 +96,16 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 }
 
 func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
-	if input.AutomationMaintenanceEnabled == nil && input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && len(input.CheckinTimes) == 0 {
+	if input.MaintenanceSchedule == nil && input.AutomationMaintenanceEnabled == nil && input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && input.QuotaRefreshIntervalMinutes == nil && len(input.CheckinTimes) == 0 {
 		return operationError("invalid_request", "a system setting is required")
+	}
+	if input.MaintenanceSchedule != nil {
+		if err := input.MaintenanceSchedule.Validate(); err != nil {
+			return operationError("invalid_maintenance_schedule", err.Error())
+		}
+	}
+	if input.QuotaRefreshIntervalMinutes != nil && (*input.QuotaRefreshIntervalMinutes < accounts.MinQuotaRefreshIntervalMinutes || *input.QuotaRefreshIntervalMinutes > accounts.MaxQuotaRefreshIntervalMinutes) {
+		return operationError("invalid_quota_refresh_interval", "quota_refresh_interval_minutes must be between 5 and 1440")
 	}
 	var strategy string
 	if input.RoutingStrategy != nil {
@@ -186,6 +211,17 @@ func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
 					return operationError("system_settings_apply_failed", err.Error())
 				}
 			}
+		}
+	}
+	if input.QuotaRefreshIntervalMinutes != nil {
+		if err := h.Settings.SetSecret(ctx, accounts.QuotaRefreshIntervalSecret, strconv.Itoa(*input.QuotaRefreshIntervalMinutes)); err != nil {
+			return operationError("system_settings_save_failed", err.Error())
+		}
+	}
+	if input.MaintenanceSchedule != nil {
+		payload, _ := json.Marshal(input.MaintenanceSchedule)
+		if err := h.Settings.SetSecret(ctx, accounts.MaintenanceScheduleSecret, string(payload)); err != nil {
+			return operationError("system_settings_save_failed", "maintenance schedule could not be saved")
 		}
 	}
 	if input.RoutingStrategy != nil {

@@ -44,7 +44,8 @@ type ChatMessage struct {
 func DropSystemMessages(req ChatRequest) ChatRequest {
 	kept := make([]ChatMessage, 0, len(req.Messages))
 	for _, message := range req.Messages {
-		if message.Role == "system" || message.Role == "developer" {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role == "system" || role == "developer" {
 			continue
 		}
 		kept = append(kept, message)

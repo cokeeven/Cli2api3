@@ -40,3 +40,50 @@ func TestSystemAutomationSwitchPreservesAccountSettings(t *testing.T) {
 		t.Fatal("corrupt switch must fail closed")
 	}
 }
+
+func TestSystemQuotaRefreshIntervalSetting(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, _ := newTestServices()
+	var cross atomic.Bool
+	sys := &System{Settings: svc.Settings, CrossProviderPool: &cross, Mu: &sync.Mutex{}}
+	if got := sys.Current(ctx).QuotaRefreshIntervalMinutes; got != accounts.DefaultQuotaRefreshIntervalMinutes {
+		t.Fatalf("default quota refresh interval=%d", got)
+	}
+	interval := 60
+	if err := sys.Patch(ctx, SystemSettingsPatch{QuotaRefreshIntervalMinutes: &interval}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sys.Current(ctx).QuotaRefreshIntervalMinutes; got != interval {
+		t.Fatalf("quota refresh interval=%d, want %d", got, interval)
+	}
+	for _, invalid := range []int{0, 4, 1441} {
+		if err := sys.Patch(ctx, SystemSettingsPatch{QuotaRefreshIntervalMinutes: &invalid}); err == nil {
+			t.Errorf("accepted invalid quota refresh interval %d", invalid)
+		}
+	}
+}
+
+func TestSystemMaintenanceScheduleRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	svc, _, store, _ := newTestServices()
+	var cross atomic.Bool
+	sys := &System{Settings: svc.Settings, CrossProviderPool: &cross, Mu: &sync.Mutex{}}
+	before := sys.Current(ctx).MaintenanceSchedule
+	if before != accounts.DefaultMaintenanceSchedule() {
+		t.Fatal("defaults changed")
+	}
+	schedule := accounts.MaintenanceSchedule{CredentialEnabled: false, CredentialIntervalMinutes: 60, QuotaEnabled: false, DailyEnabled: false, DailyTime: "23:10"}
+	if err := sys.Patch(ctx, SystemSettingsPatch{MaintenanceSchedule: &schedule}); err != nil {
+		t.Fatal(err)
+	}
+	if sys.Current(ctx).MaintenanceSchedule != schedule || len(store.accounts) != 0 {
+		t.Fatal("setting round trip or account isolation failed")
+	}
+	schedule.DailyTime = "25:00"
+	if err := sys.Patch(ctx, SystemSettingsPatch{MaintenanceSchedule: &schedule}); err == nil {
+		t.Fatal("invalid clock accepted")
+	}
+	if sys.Current(ctx).MaintenanceSchedule.DailyTime != "23:10" {
+		t.Fatal("invalid patch partially persisted")
+	}
+}

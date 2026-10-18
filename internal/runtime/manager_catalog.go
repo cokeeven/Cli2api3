@@ -128,6 +128,7 @@ func (m *Manager) startCatalogRefresh(state *catalogRefreshState, item Item) {
 		return
 	}
 	m.maintenanceDone.Add(1)
+	epoch := m.accountEpoch[item.ID]
 	m.mu.Unlock()
 	go func(it Item) {
 		defer m.maintenanceDone.Done()
@@ -142,12 +143,16 @@ func (m *Manager) startCatalogRefresh(state *catalogRefreshState, item Item) {
 		case <-m.runCtx.Done():
 			return
 		}
-		if !m.fetchAccountModels(m.runCtx, it) {
+		if !m.fetchAccountModelsAt(m.runCtx, it, epoch) {
 			// Refresh failed upstream; back off so request-paced callers
 			// cannot hammer one broken account on every call.
-			state.mu.Lock()
-			state.failures[it.ID] = time.Now().Add(modelCatalogBackoff)
-			state.mu.Unlock()
+			m.mu.Lock()
+			if m.catalogGenerationCurrentLocked(m.runCtx, it, epoch) {
+				state.mu.Lock()
+				state.failures[it.ID] = time.Now().Add(modelCatalogBackoff)
+				state.mu.Unlock()
+			}
+			m.mu.Unlock()
 		}
 	}(item)
 }
@@ -160,12 +165,47 @@ func (m *Manager) fetchAccountModels(ctx context.Context, item Item) bool {
 	if m == nil || m.pool == nil || item.ID == "" {
 		return true
 	}
+	m.mu.Lock()
+	epoch := m.accountEpoch[item.ID]
+	m.mu.Unlock()
+	return m.fetchAccountModelsAt(ctx, item, epoch)
+}
+
+// A catalog belongs to the lifecycle generation which queued it. An upstream
+// may ignore cancellation, so both queue admission and the merge need a check.
+func (m *Manager) catalogGenerationCurrentLocked(ctx context.Context, item Item, epoch uint64) bool {
+	if ctx.Err() != nil || (m.runCtx != nil && m.runCtx.Err() != nil) || m.accountEpoch[item.ID] != epoch {
+		return false
+	}
+	current, ok := m.pool.ByID(item.ID)
+	return ok && current.Provider == item.Provider && current.Region == item.Region && current.URL == item.URL && current.Runtime == item.Runtime
+}
+
+func (m *Manager) withCurrentCatalog(ctx context.Context, item Item, epoch uint64, apply func()) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.catalogGenerationCurrentLocked(ctx, item, epoch) {
+		return false
+	}
+	if apply != nil {
+		apply()
+	}
+	return true
+}
+
+func (m *Manager) fetchAccountModelsAt(ctx context.Context, item Item, epoch uint64) bool {
+	if !m.withCurrentCatalog(ctx, item, epoch, nil) {
+		return true // obsolete work is neither an upstream failure nor a backoff
+	}
 	if item.Runtime == string(providers.RuntimeInProcess) || strings.TrimSpace(item.URL) == "" {
-		return m.fetchProviderModels(ctx, item)
+		return m.fetchProviderModelsAt(ctx, item, epoch)
 	}
 	if adapter, ok := m.providers.Get(item.Provider); ok && adapter.Models != nil {
 		models, err := adapter.Models.Models(ctx, item.ID)
 		if err != nil {
+			if !m.withCurrentCatalog(ctx, item, epoch, nil) {
+				return true
+			}
 			var transport qoder.TransportError
 			var statusErr qoder.HTTPStatusError
 			switch {
@@ -178,9 +218,11 @@ func (m *Manager) fetchAccountModels(ctx context.Context, item Item) bool {
 			}
 			return false
 		}
-		m.pool.MergeModelsWithPricing(item.ID, qoder.CatalogIDsFromInfos(models), qoder.FreeCatalogIDsFromInfos(models))
-		m.pool.MergeNativeModels(item.ID, qoder.NativeCatalogIDsFromInfos(models))
-		m.mergeModelOutputLimits(item.ID, models)
+		m.withCurrentCatalog(ctx, item, epoch, func() {
+			m.pool.MergeModelsWithPricing(item.ID, qoder.CatalogIDsFromInfos(models), qoder.FreeCatalogIDsFromInfos(models))
+			m.pool.MergeNativeModels(item.ID, qoder.NativeCatalogIDsFromInfos(models))
+			m.mergeModelOutputLimits(item.ID, models)
+		})
 		return true
 	}
 	client := qoder.WorkerClient{
@@ -189,10 +231,13 @@ func (m *Manager) fetchAccountModels(ctx context.Context, item Item) bool {
 	}
 	entries, status, rawBody, err := client.Models(ctx, item.URL, false)
 	if err != nil || status >= 300 {
+		if !m.withCurrentCatalog(ctx, item, epoch, nil) {
+			return true
+		}
 		m.logCatalogRefresh(item, status, rawBody, err)
 		return false
 	}
-	m.pool.MergeModels(item.ID, qoder.CatalogIDs(entries, nil))
+	m.withCurrentCatalog(ctx, item, epoch, func() { m.pool.MergeModels(item.ID, qoder.CatalogIDs(entries, nil)) })
 	return true
 }
 
@@ -221,7 +266,7 @@ func (m *Manager) logCatalogRefresh(item Item, status int, rawBody string, err e
 // and reports whether the upstream fetch succeeded. Unsupported providers
 // (no adapter, no Models capability, or in-process qoder stubs) report true:
 // nothing failed, so no backoff is engaged.
-func (m *Manager) fetchProviderModels(ctx context.Context, item Item) bool {
+func (m *Manager) fetchProviderModelsAt(ctx context.Context, item Item, epoch uint64) bool {
 	if m.providers == nil {
 		return true
 	}
@@ -234,15 +279,21 @@ func (m *Manager) fetchProviderModels(ctx context.Context, item Item) bool {
 	}
 	models, err := adapter.Models.Models(ctx, item.ID)
 	if err != nil {
-		log.Printf("catalog fetch failed account=%s provider=%s: %v", item.ID, item.Provider, err)
+		if !m.withCurrentCatalog(ctx, item, epoch, nil) {
+			return true
+		}
+		// No raw provider response or authentication material in runtime logs.
+		log.Printf("catalog fetch failed account=%s provider=%s error_type=%T", item.ID, item.Provider, err)
 		return false
 	}
 	ids := make([]string, 0, len(models)*2)
 	for _, model := range models {
 		ids = append(ids, model.PublicModel, model.NativeModel, model.DisplayName)
 	}
-	m.pool.MergeModels(item.ID, ids)
-	m.mergeFreeModels(item.ID, models)
+	m.withCurrentCatalog(ctx, item, epoch, func() {
+		m.pool.MergeModels(item.ID, ids)
+		m.mergeFreeModels(item.ID, models)
+	})
 	return true
 }
 

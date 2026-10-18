@@ -187,6 +187,7 @@ func (h *Handler) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	required := map[string]string{
+		"maintain":       http.MethodPost,
 		"checkins":       http.MethodGet,
 		"checkin":        http.MethodPost,
 		"daily-tasks":    http.MethodPost,
@@ -244,6 +245,12 @@ func (h *Handler) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch result.Kind {
+	case "maintain":
+		if err := h.Control.Accounts.MaintainCredential(r.Context(), accountID); err != nil {
+			writeOperationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case "checkins":
 		records, err := h.Control.Accounts.ListCheckins(r.Context(), accountID, 20)
 		if err != nil {

@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/caigee-cmd/cli2api/internal/config"
@@ -17,16 +18,18 @@ import (
 // runtime manager; catalog fetch, Qoder worker proxy, and live auth rotation
 // are injected by app.
 type Handler struct {
-	System            *appsvc.System
-	KeyRotation       *appsvc.KeyRotation
-	Control           *appsvc.Services
-	Cfg               *config.Config
-	Executor          *executor.ChatExecutor
-	Pool              *executor.Pool
-	Recorder          *applogs.RequestRecorder
-	Ring              *applogs.Ring
-	CrossProviderPool *atomic.Bool
-	Update            *control.Coordinator
+	modelProbeMu       sync.Mutex
+	modelProbeInflight map[string]*modelProbeCall
+	System             *appsvc.System
+	KeyRotation        *appsvc.KeyRotation
+	Control            *appsvc.Services
+	Cfg                *config.Config
+	Executor           *executor.ChatExecutor
+	Pool               *executor.Pool
+	Recorder           *applogs.RequestRecorder
+	Ring               *applogs.Ring
+	CrossProviderPool  *atomic.Bool
+	Update             *control.Coordinator
 
 	Chat               http.HandlerFunc
 	RequestedAccount   func(*http.Request) string

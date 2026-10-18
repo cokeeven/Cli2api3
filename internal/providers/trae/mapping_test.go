@@ -2,11 +2,30 @@ package trae
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
+
+func TestExplicitUnsupportedReasoningIsRejectedInsteadOfDowngraded(t *testing.T) {
+	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"}
+	for _, raw := range []json.RawMessage{json.RawMessage(`"high"`), json.RawMessage(`"unrecognized"`)} {
+		err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: raw}, caps)
+		var providerErr *providers.Error
+		if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {
+			t.Fatalf("explicit unsupported reasoning=%s error=%v", raw, err)
+		}
+	}
+	if err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: json.RawMessage(`null`)}, caps); err != nil {
+		t.Fatalf("null reasoning should use existing default behavior: %v", err)
+	}
+	on := true
+	if err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: json.RawMessage(`"unrecognized"`), EnableThinking: &on}, caps); err == nil {
+		t.Fatal("valid boolean setting hid an invalid explicit reasoning effort")
+	}
+}
 
 func TestNormalizeReasoningLevelAliases(t *testing.T) {
 	cases := map[string]string{

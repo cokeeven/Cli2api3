@@ -303,6 +303,72 @@ ALTER TABLE request_attempts ADD COLUMN route_reason TEXT NOT NULL DEFAULT '';
 	{filename: "027_usage_balance_reconciliation.sql", sql: `
 ALTER TABLE usage_reservations ADD COLUMN covered_by_snapshot TEXT NOT NULL DEFAULT '';
 `},
+	{filename: "028_request_diagnostics.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN message_shape_known INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_logs ADD COLUMN output_limit_tokens INTEGER;
+ALTER TABLE request_logs ADD COLUMN output_limit_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_logs ADD COLUMN prompt_stripped INTEGER;
+ALTER TABLE request_logs ADD COLUMN client_request_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN content_length_known INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_stream_diagnostics ADD COLUMN upstream_finish_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN upstream_finish_reason_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN external_finish_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN external_finish_reason_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN content_chars INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN reasoning_chars INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN tool_event_count INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN char_count_unit TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN cancellation_stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN prepare_duration_ms INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN upstream_response_duration_ms INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN first_event_duration_ms INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN total_duration_ms INTEGER;
+`},
+	{filename: "029_chat_deadlines.sql", sql: `
+ALTER TABLE request_stream_diagnostics ADD COLUMN first_content_duration_ms INTEGER;
+ALTER TABLE request_stream_diagnostics ADD COLUMN timeout_phase TEXT NOT NULL DEFAULT '';
+`},
+	{filename: "030_request_source_fingerprint.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT '';
+`},
+	{filename: "031_maintenance_task_kinds.sql", sql: `
+ALTER TABLE daily_task_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'daily_tasks';
+CREATE INDEX daily_task_kind_due ON daily_task_runs(account_id, kind, started_at);
+`},
+	{filename: "032_request_routing_diagnostic.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN routing_diagnostic_json TEXT;
+`},
+	{filename: "033_model_usage_observation.sql", sql: `
+ALTER TABLE request_attempts ADD COLUMN provider_region TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_attempts ADD COLUMN error_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_attempts ADD COLUMN upstream_reset_at TEXT;
+ALTER TABLE request_attempts ADD COLUMN provider_plan TEXT NOT NULL DEFAULT '';
+CREATE INDEX request_attempts_model_usage ON request_attempts(provider, provider_region, account_id, model);
+CREATE INDEX request_attempts_error_observation ON request_attempts(provider, error_code, upstream_reset_at);
+`},
+	{filename: "034_request_finish_reason.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN finish_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_logs ADD COLUMN finish_reason_source TEXT NOT NULL DEFAULT '';
+CREATE INDEX request_logs_finish_reason ON request_logs(provider, finish_reason);
+`},
+	{filename: "035_request_path.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN request_path TEXT NOT NULL DEFAULT '';
+CREATE INDEX request_logs_request_path ON request_logs(request_path, created_at DESC);
+`},
+	{filename: "036_output_budget_evidence.sql", sql: `
+ALTER TABLE request_logs ADD COLUMN output_budget_enforcement TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_stream_diagnostics ADD COLUMN output_budget_enforcement TEXT NOT NULL DEFAULT '';
+`},
+	{filename: "037_cooldown_evidence.sql", sql: `
+ALTER TABLE account_cooldowns ADD COLUMN first_observed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN last_observed_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN evidence_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN evidence_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN evidence_scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN reported_scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN upstream_reset_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE account_cooldowns ADD COLUMN local_backoff_until TEXT NOT NULL DEFAULT '';
+`},
 }
 
 const schemaMigrationsDDL = `

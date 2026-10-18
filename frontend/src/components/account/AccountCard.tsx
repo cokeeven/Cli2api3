@@ -22,6 +22,7 @@ import { QuotaMeter } from '@/components/account/QuotaMeter'
 import { RuntimeMeter } from '@/components/account/RuntimeMeter'
 import {
   accountState,
+  accountRoutingFacts,
   cooldownLabel,
   dailyTasksDisabledReason,
   modelCooldownEntries,
@@ -113,6 +114,7 @@ export function AccountCard({
   const lastStateRef = useRef<string | null>(null)
   const [, refreshCooldowns] = useState(0)
   const state = accountState(account)
+  const routingFacts = accountRoutingFacts(account)
   const cooldown = cooldownLabel(account.down_until || account.cooldown_until)
   const restartIn = cooldownLabel(account.next_restart_at)
   const modelCooldowns = modelCooldownEntries(account)
@@ -255,6 +257,13 @@ export function AccountCard({
 
       <Card.Content className="gap-1.5 px-3 pb-2">
         <RuntimeMeter state={state} stateCopy={stateCopy} t={t} />
+        {(account.provider === 'workbuddy' || account.provider === 'trae') ? (
+          <dl className="grid gap-1 text-[11px] text-muted">
+            <div className="flex justify-between gap-2"><dt>{t('authRuntimeStatus')}</dt><dd>{t(routingFacts.authentication)}</dd></div>
+            <div className="flex justify-between gap-2"><dt>{t('quotaSnapshotTime')}</dt><dd className="mono">{routingFacts.quotaTime ? new Date(routingFacts.quotaTime).toLocaleString() : t('logsUnknown')}</dd></div>
+            <div className="flex justify-between gap-2"><dt>{t('routingStatus')}</dt><dd>{stateCopy}</dd></div>
+          </dl>
+        ) : null}
         <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
           <span>{t('usageLiveChats')}</span>
           <span className="mono">{account.in_flight ?? account.inFlight ?? 0} / {account.max_inflight ?? 4}</span>

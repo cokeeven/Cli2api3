@@ -302,6 +302,14 @@ func (a *Accounts) Admin(ctx context.Context, input AccountAdminAction) (Account
 	account, storeErr := a.GetStored(ctx, input.AccountID)
 	inProcess := storeErr == nil && account.Provider != "" && account.Provider != "qoder"
 	switch input.Action {
+	case "maintain":
+		if storeErr != nil {
+			return AccountAdminResult{}, storeErr
+		}
+		if !account.Enabled || (account.Provider != "workbuddy" && !(account.Provider == "trae" && account.ProviderRegion == "cn")) {
+			return AccountAdminResult{}, operationError("provider_unsupported", "credential maintenance unavailable")
+		}
+		return AccountAdminResult{Kind: "maintain"}, nil
 	case "checkins", "checkin":
 		if storeErr != nil {
 			return AccountAdminResult{}, storeErr

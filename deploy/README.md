@@ -134,7 +134,7 @@ console; environment variables cannot replace it.
 |----------|---------|---------|
 | `QODER_DATA_DIR` | `/data` | SQLite database and durable account credentials |
 | `QODER_RUNTIME_DIR` | `/run/cli2api` | Ephemeral per-account runtime homes for providers that use child processes |
-| `QODER_MAX_RETRY_ACCOUNTS` | `4` | Maximum accounts attempted for one request (1-64) |
+| `QODER_MAX_RETRY_ACCOUNTS` | `64` | WorkBuddy/Trae account-attempt cap (1-64), also bounded by initial eligible candidates and the total deadline; routes involving other platforms retain a maximum of 4 |
 | `QODER_SSE_DIAGNOSTIC_MODELS` | empty | Comma-separated Qoder model IDs for redacted SSE diagnostics in Runtime Logs; `*` enables all |
 | `QODER_WORKER_BASE_PORT` | `32100` | Internal child-runtime port range |
 | `QODER_PROXY_URL` | empty | Initial global outbound proxy: `http(s)://`, `direct`, or `none`; saved console settings take precedence |

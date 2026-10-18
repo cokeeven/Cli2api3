@@ -47,9 +47,11 @@ type Client struct {
 
 	transports proxyutil.TransportCache
 
-	mu          sync.Mutex
-	loginStates map[string]string
-	catalog     map[string]providers.ModelInfo
+	mu                   sync.Mutex
+	loginStates          map[string]string
+	catalog              map[string]providers.ModelInfo
+	credentialLocks      map[string]*sync.Mutex
+	credentialRetryAfter map[string]time.Time
 }
 
 const catalogTimeout = 15 * time.Second
@@ -71,7 +73,9 @@ func NewClient(store Store) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		loginStates: map[string]string{},
+		loginStates:          map[string]string{},
+		credentialLocks:      map[string]*sync.Mutex{},
+		credentialRetryAfter: map[string]time.Time{},
 	}
 }
 
@@ -272,8 +276,10 @@ func (c *Client) PollLogin(ctx context.Context, accountID string) (bool, string,
 }
 
 // credential loads and, when nearly expired, refreshes the stored token.
+// Refreshes are serialized per account and saved with a compare-and-swap so a
+// late refresh cannot replace a newer login.
 func (c *Client) credential(ctx context.Context, accountID string) (Credential, error) {
-	_, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -281,14 +287,114 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if err != nil {
 		return Credential{}, err
 	}
-	if credential.ExpiresAt != 0 && time.Now().Add(2*time.Minute).Unix() < credential.ExpiresAt {
+	if !credential.needsRefresh(time.Now()) {
 		return credential, nil
 	}
-	refreshed, err := c.Refresh(ctx, accountID, credential)
+	lock := c.credentialLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+	format, payload, credential, err = c.loadCredential(ctx, accountID)
 	if err != nil {
+		return Credential{}, err
+	}
+	now := time.Now()
+	if !credential.needsRefresh(now) {
 		return credential, nil
 	}
+	if c.credentialRefreshCoolingDown(accountID, now) {
+		return c.useWorkBuddyCredentialFallback(credential, now, fmt.Errorf("credential refresh is cooling down"))
+	}
+	refreshed, err := c.refreshRemote(ctx, accountID, credential)
+	if err != nil {
+		c.recordCredentialRefreshFailure(accountID, err)
+		return c.useWorkBuddyCredentialFallback(credential, now, err)
+	}
+	encoded, err := refreshed.Encode()
+	if err != nil {
+		return Credential{}, err
+	}
+	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	if err != nil {
+		return Credential{}, err
+	}
+	if !saved {
+		_, _, latest, loadErr := c.loadCredential(ctx, accountID)
+		if loadErr != nil {
+			return Credential{}, loadErr
+		}
+		return latest, nil
+	}
+	c.clearCredentialRefreshFailure(accountID)
 	return refreshed, nil
+}
+
+func (c *Client) loadCredential(ctx context.Context, accountID string) (string, []byte, Credential, error) {
+	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	if err != nil {
+		return "", nil, Credential{}, err
+	}
+	credential, err := DecodeCredential(payload)
+	return format, payload, credential, err
+}
+
+func (c *Client) credentialLock(accountID string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.credentialLocks == nil {
+		c.credentialLocks = map[string]*sync.Mutex{}
+	}
+	lock := c.credentialLocks[accountID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.credentialLocks[accountID] = lock
+	}
+	return lock
+}
+
+func (c *Client) credentialRefreshCoolingDown(accountID string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until := c.credentialRetryAfter[accountID]
+	if !now.Before(until) {
+		delete(c.credentialRetryAfter, accountID)
+		return false
+	}
+	return true
+}
+
+func (c *Client) recordCredentialRefreshFailure(accountID string, err error) {
+	delay := 30 * time.Second
+	var classified *providers.Error
+	if errors.As(err, &classified) && classified.RetryAfter > delay {
+		delay = classified.RetryAfter
+	}
+	c.mu.Lock()
+	if c.credentialRetryAfter == nil {
+		c.credentialRetryAfter = map[string]time.Time{}
+	}
+	c.credentialRetryAfter[accountID] = time.Now().Add(delay)
+	c.mu.Unlock()
+}
+
+func (c *Client) clearCredentialRefreshFailure(accountID string) {
+	c.mu.Lock()
+	delete(c.credentialRetryAfter, accountID)
+	c.mu.Unlock()
+}
+
+func (c *Client) useWorkBuddyCredentialFallback(credential Credential, now time.Time, refreshErr error) (Credential, error) {
+	if credential.ExpiresAt > now.Unix() {
+		return credential, nil
+	}
+	return Credential{}, fmt.Errorf("workbuddy access token expired and refresh failed: %w", refreshErr)
+}
+
+func credentialProbeErrorKind(err error) string {
+	var classified *providers.Error
+	if errors.As(err, &classified) && classified.Kind != "" {
+		return classified.Kind
+	}
+	return accounts.KindUnavailable
 }
 
 func (c *Client) overlayRegion(ctx context.Context, accountID string, credential Credential) Credential {
@@ -316,6 +422,47 @@ func (c *Client) resolvedCredential(ctx context.Context, accountID string) (Cred
 // Refresh exchanges the refresh token. Session-dead errors disable the
 // account by surfacing the auth taxonomy to the manager.
 func (c *Client) Refresh(ctx context.Context, accountID string, credential Credential) (Credential, error) {
+	lock := c.credentialLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+	format, payload, current, err := c.loadCredential(ctx, accountID)
+	if err != nil {
+		return Credential{}, err
+	}
+	credential = current
+	refreshed, err := c.refreshRemote(ctx, accountID, credential)
+	if err != nil {
+		c.recordCredentialRefreshFailure(accountID, err)
+		return Credential{}, err
+	}
+	encoded, err := refreshed.Encode()
+	if err != nil {
+		return Credential{}, err
+	}
+	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	if err != nil {
+		return Credential{}, err
+	}
+	if !saved {
+		_, _, latest, loadErr := c.loadCredential(ctx, accountID)
+		if loadErr != nil {
+			return Credential{}, loadErr
+		}
+		return latest, nil
+	}
+	c.clearCredentialRefreshFailure(accountID)
+	return refreshed, nil
+}
+
+func (c *Client) saveCredentialIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte) (bool, error) {
+	store, ok := c.store.(providers.CredentialPayloadCASStore)
+	if !ok {
+		return false, fmt.Errorf("workbuddy credential store does not support compare-and-swap persistence")
+	}
+	return store.SaveCredentialPayloadIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload)
+}
+
+func (c *Client) refreshRemote(ctx context.Context, accountID string, credential Credential) (Credential, error) {
 	credential = c.overlayRegion(ctx, accountID, credential)
 	body, status, err := c.do(ctx, accountID, http.MethodPost, credential.ChatBase()+pathTokenRefresh, []byte("{}"),
 		func(h http.Header) { SetRefreshHeaders(h, credential) })
@@ -324,11 +471,13 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	}
 	classified := Classify(status, string(body))
 	if classified.Kind == accounts.KindAuth {
-		_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "session dead; re-login required", accounts.KindAuth)
-		return credential, fmt.Errorf("workbuddy session dead: re-login required")
+		if credential.ExpiresAt <= time.Now().Unix() {
+			_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "session dead; re-login required", accounts.KindAuth)
+		}
+		return credential, classifiedError(status, body)
 	}
 	if status >= 300 || classified.Kind != "" {
-		return credential, fmt.Errorf("refresh status=%d kind=%s", status, classified.Kind)
+		return credential, classifiedError(status, body)
 	}
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil || env.Code != 0 {
@@ -352,16 +501,25 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	if data.ExpiresIn > 0 {
 		credential.ExpiresAt = time.Now().Add(time.Duration(data.ExpiresIn) * time.Second).Unix()
 	}
+	credential.RefreshAfter = workBuddyRefreshAfter(credential.ExpiresAt, time.Now())
 	credential.AccessToken = data.AccessToken
 	credential = c.overlayRegion(ctx, accountID, credential)
-	payload, err := credential.Encode()
-	if err != nil {
-		return credential, err
-	}
-	if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, payload); err != nil {
-		return credential, err
-	}
 	return credential, nil
+}
+
+func workBuddyRefreshAfter(expiresAt int64, now time.Time) int64 {
+	if expiresAt <= 0 {
+		return now.Add(5 * time.Minute).Unix()
+	}
+	remaining := time.Until(time.Unix(expiresAt, 0))
+	if remaining <= 0 {
+		return now.Unix()
+	}
+	lead := 24 * time.Hour
+	if half := remaining / 2; half < lead {
+		lead = half
+	}
+	return time.Unix(expiresAt, 0).Add(-lead).Unix()
 }
 
 // Models fetches the IDE-parity product config catalog (/v3/config). Failure
@@ -436,6 +594,9 @@ func (c *Client) Models(ctx context.Context, accountID string) ([]providers.Mode
 }
 
 func (c *Client) chatRequest(ctx context.Context, accountID string, credential Credential, req translate.ChatRequest) (*http.Request, providers.ResolvedChat, error) {
+	if err := translate.ValidateChatToolHistory(req); err != nil {
+		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Message: err.Error()}
+	}
 	caps := c.capsFor(req.Model)
 	storedLevel := ""
 	if setter, ok := c.store.(ModelSettingReader); ok {
@@ -452,15 +613,27 @@ func (c *Client) chatRequest(ctx context.Context, accountID string, credential C
 		_, _ = c.Models(ctx, accountID)
 		caps = c.capsFor(req.Model)
 	}
+	if err := validateCallerReasoning(req, caps); err != nil {
+		return nil, providers.ResolvedChat{}, err
+	}
 	body := map[string]any{
 		"model":       c.upstreamModelID(req.Model),
 		"messages":    req.Messages,
-		"max_tokens":  req.MaxTokens,
 		"temperature": req.Temperature,
 		"tools":       req.Tools,
 		"tool_choice": req.ToolChoice,
 	}
-	resolved := providers.ResolvedChat{ReasoningLevel: applyChatReasoning(body, req, storedLevel, caps)}
+	outputLimit, outputSource, err := providers.ResolveOutputLimit(req, caps, false)
+	if err != nil {
+		return nil, providers.ResolvedChat{}, err
+	}
+	if outputLimit != nil {
+		body["max_tokens"] = *outputLimit
+	}
+	resolved := providers.ResolvedChat{
+		ReasoningLevel: applyChatReasoning(body, req, storedLevel, caps),
+		OutputLimit:    outputLimit, OutputLimitSource: outputSource,
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
@@ -487,29 +660,28 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
-	client.Timeout = 0
-	resp, err := client.Do(httpReq)
+	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return providers.ChatOutcome{}, err
+		return resolved.OutcomeMetadata(), err
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if readErr != nil {
-		return providers.ChatOutcome{}, fmt.Errorf("read workbuddy stream: %w", readErr)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
+	if len(body) > 16<<20 {
+		body = body[:16<<20]
+		readErr = fmt.Errorf("workbuddy response exceeds 16 MiB")
 	}
 	if resp.StatusCode >= 300 {
-		return providers.ChatOutcome{}, classifiedError(resp.StatusCode, body)
+		return resolved.OutcomeMetadata(), providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
 	}
-	aggregate, err := Aggregate(bytes.NewReader(body))
-	if err != nil {
-		return providers.ChatOutcome{}, err
-	}
+	aggregate, aggregateErr := Aggregate(bytes.NewReader(body))
 	outcome, err := outcomeFromAggregate(aggregate)
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
 	outcome.ReasoningLevel = resolved.ReasoningLevel
-	return outcome, nil
+	outcome.OutputLimit = resolved.OutputLimit
+	outcome.OutputLimitSource = resolved.OutputLimitSource
+	return outcome, providers.WithRetryAfterHeader(errors.Join(readErr, aggregateErr), resp.Header.Get("Retry-After"))
 }
 
 func (c *Client) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, providers.ResolvedChat, error) {
@@ -525,17 +697,18 @@ func (c *Client) ChatStream(ctx context.Context, accountID string, req translate
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
-	client.Timeout = 0
-	resp, err := client.Do(httpReq)
+	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return nil, providers.ResolvedChat{}, err
+		return nil, resolved, err
 	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, providers.ResolvedChat{}, classifiedError(resp.StatusCode, body)
+		return nil, resolved, providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
 	}
-	return rewriteChatStream(resp), resolved, nil
+	streamResp := rewriteChatStream(resp)
+	streamResp.Body = providers.CarryChatObservation(streamResp.Body, resp.Body, resp.Header.Get("Retry-After"))
+	return streamResp, resolved, nil
 }
 
 func outcomeFromAggregate(aggregate map[string]any) (providers.ChatOutcome, error) {
@@ -546,13 +719,16 @@ func outcomeFromAggregate(aggregate map[string]any) (providers.ChatOutcome, erro
 	var parsed struct {
 		Model string `json:"model"`
 		Usage struct {
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			CacheReadTokens  *int     `json:"cache_read_tokens"`
-			CacheWriteTokens *int     `json:"cache_write_tokens"`
-			Source           string   `json:"source"`
-			Credit           *float64 `json:"credit"`
-			PromptDetails    struct {
+			PromptTokens             *int     `json:"prompt_tokens"`
+			CompletionTokens         *int     `json:"completion_tokens"`
+			CacheReadTokens          *int     `json:"cache_read_tokens"`
+			CacheWriteTokens         *int     `json:"cache_write_tokens"`
+			PromptCacheHitTokens     *int     `json:"prompt_cache_hit_tokens"`
+			CacheReadInputTokens     *int     `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens *int     `json:"cache_creation_input_tokens"`
+			Source                   string   `json:"source"`
+			Credit                   *float64 `json:"credit"`
+			PromptDetails            struct {
 				CachedTokens *int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
@@ -568,13 +744,14 @@ func outcomeFromAggregate(aggregate map[string]any) (providers.ChatOutcome, erro
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return providers.ChatOutcome{}, err
 	}
-	out := providers.ChatOutcome{UsageSource: "unknown", FinishReason: "stop"}
+	out := providers.ChatOutcome{UsageSource: "unknown", FinishReason: "stop", FinishReasonSource: "adapter_default"}
 	if len(parsed.Choices) > 0 {
 		out.Content = parsed.Choices[0].Message.Content
 		out.Reasoning = parsed.Choices[0].Message.ReasoningContent
 		out.ToolCalls = parsed.Choices[0].Message.ToolCalls
 		if parsed.Choices[0].FinishReason != "" {
 			out.FinishReason = parsed.Choices[0].FinishReason
+			out.FinishReasonSource = "upstream"
 		}
 	}
 	out.Model = parsed.Model
@@ -584,17 +761,17 @@ func outcomeFromAggregate(aggregate map[string]any) (providers.ChatOutcome, erro
 	if parsed.Usage.CompletionTokens != nil {
 		out.CompletionTokens = *parsed.Usage.CompletionTokens
 	}
+	out.ReportedPromptTokens, out.ReportedCompletionTokens = parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens
+	out.UsageExtensions = providers.NumericUsageExtensions(aggregate["usage"])
 	if parsed.Usage.PromptTokens != nil && parsed.Usage.CompletionTokens != nil {
 		out.UsageSource = parsed.Usage.Source
 		if out.UsageSource == "" {
 			out.UsageSource = "upstream"
 		}
 	}
-	out.CacheReadTokens = parsed.Usage.CacheReadTokens
-	if out.CacheReadTokens == nil {
-		out.CacheReadTokens = parsed.Usage.PromptDetails.CachedTokens
-	}
-	out.CacheWriteTokens = parsed.Usage.CacheWriteTokens
+	out.CacheReadTokens = providers.FirstIntPointer(parsed.Usage.CacheReadTokens, parsed.Usage.PromptDetails.CachedTokens, parsed.Usage.PromptCacheHitTokens, parsed.Usage.CacheReadInputTokens)
+	out.CachedTokens = out.CacheReadTokens
+	out.CacheWriteTokens = providers.FirstIntPointer(parsed.Usage.CacheWriteTokens, parsed.Usage.CacheCreationInputTokens)
 	out.Credits = parsed.Usage.Credit
 	return out, nil
 }
@@ -603,8 +780,9 @@ func classifiedError(status int, body []byte) error {
 	classified := Classify(status, string(body))
 	out := &providers.Error{Kind: classified.Kind, Status: classified.Status, Message: classified.Message, Scope: classified.Scope, RetrySafe: classified.RetrySafe, Code: classified.Code}
 	if classified.Kind == accounts.KindRateLimit {
-		if reset := parseQuotaReset(string(body), time.Now()); reset > 0 {
-			out.RetryAfter = reset
+		if resetAt, ok := parseQuotaResetAt(string(body), time.Now()); ok {
+			out.UpstreamResetAt = &resetAt
+			out.RetryAfter = resetAt.Sub(time.Now())
 		}
 	}
 	return out
@@ -621,16 +799,24 @@ var quotaResetPattern = regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(
 // is interpreted in that fixed zone and converted to a remaining duration.
 // Returns 0 when no reset time is present, leaving the caller's fallback.
 func parseQuotaReset(body string, now time.Time) time.Duration {
+	resetAt, ok := parseQuotaResetAt(body, now)
+	if !ok {
+		return 0
+	}
+	return resetAt.Sub(now)
+}
+
+func parseQuotaResetAt(body string, now time.Time) (time.Time, bool) {
 	var env struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 	}
 	if err := json.Unmarshal([]byte(body), &env); err != nil || env.Code != rateLimitCode {
-		return 0
+		return time.Time{}, false
 	}
 	match := quotaResetPattern.FindStringSubmatch(env.Msg)
 	if match == nil {
-		return 0
+		return time.Time{}, false
 	}
 	atoi := func(s string) int {
 		n, err := strconv.Atoi(s)
@@ -644,20 +830,19 @@ func parseQuotaReset(body string, now time.Time) time.Duration {
 	// time.Date normalizes out-of-range values (month 13 becomes January of
 	// the next year), so reject them explicitly instead of trusting the parse.
 	if year < 0 || month < 1 || month > 12 || day < 1 || day > 31 {
-		return 0
+		return time.Time{}, false
 	}
 	if hour > 23 || minute > 59 || second > 59 {
-		return 0
+		return time.Time{}, false
 	}
 	resetAt := time.Date(year, time.Month(month), day, hour, minute, second, 0, quotaResetLocation)
 	if resetAt.Day() != day || int(resetAt.Month()) != month || resetAt.Year() != year {
-		return 0
+		return time.Time{}, false
 	}
-	remaining := resetAt.Sub(now)
-	if remaining <= 0 {
-		return 0
+	if resetAt.Sub(now) <= 0 {
+		return time.Time{}, false
 	}
-	return remaining
+	return resetAt.UTC(), true
 }
 
 // ClassifiedError is the historical WorkBuddy alias for providers.Error.
@@ -665,6 +850,17 @@ type ClassifiedError = providers.Error
 
 // Classify maps WorkBuddy HTTP/error bodies onto the internal taxonomy.
 func Classify(status int, body string) providers.ClassifiedError {
+	classified := classifyWorkBuddy(status, body)
+	if rawCode := workBuddyBusinessCode(body); rawCode != "" {
+		// Keep the provider's scalar code as diagnostic data. The taxonomy above
+		// remains responsible for Kind, Scope, and retry safety; unknown codes do
+		// not acquire semantics merely because their value was preserved.
+		classified.Code = rawCode
+	}
+	return classified
+}
+
+func classifyWorkBuddy(status int, body string) providers.ClassifiedError {
 	text := strings.ToLower(body)
 	if accounts.IsPromptLimitText(body) {
 		return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: 400, Message: strings.TrimSpace(body)}
@@ -706,6 +902,33 @@ func Classify(status int, body string) providers.ClassifiedError {
 		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: 502, Message: env.Msg}
 	}
 	return providers.ClassifiedError{}
+}
+
+// workBuddyBusinessCode preserves a safe scalar business code even when this
+// version does not know its meaning. The code remains diagnostic data; callers
+// must not infer scope or retry safety from an unrecognized value.
+func workBuddyBusinessCode(body string) string {
+	var envelope struct {
+		Code json.RawMessage `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &envelope) != nil || len(envelope.Code) == 0 {
+		return ""
+	}
+	raw := bytes.TrimSpace(envelope.Code)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	if raw[0] == '"' {
+		var code string
+		if json.Unmarshal(raw, &code) != nil {
+			return ""
+		}
+		return strings.TrimSpace(code)
+	}
+	if !json.Valid(raw) || bytes.ContainsAny(raw, "{}[]") {
+		return ""
+	}
+	return string(raw)
 }
 
 func firstNonEmptyStatus(status, fallback int) int {
@@ -758,11 +981,11 @@ func catalogErrorBody(body []byte) string {
 func (c *Client) Probe(ctx context.Context, accountID string) (providers.AccountHealth, error) {
 	credential, err := c.resolvedCredential(ctx, accountID)
 	if err != nil {
-		return providers.AccountHealth{LastError: err.Error()}, nil
+		return providers.AccountHealth{LastError: err.Error(), LastErrorKind: credentialProbeErrorKind(err)}, nil
 	}
 	if !credential.Ready() {
 		msg := "workbuddy credential incomplete; re-login required"
-		return providers.AccountHealth{UID: credential.UID, LastError: msg}, nil
+		return providers.AccountHealth{UID: credential.UID, LastError: msg, LastErrorKind: accounts.KindAuth}, nil
 	}
 	return providers.AccountHealth{
 		Ready: true,
@@ -931,18 +1154,10 @@ func checkinRequestProcessing(body []byte) bool {
 		strings.Contains(lower, "request processing")
 }
 
-// Keepalive forces a token refresh for the account. Session-dead uses the
-// existing Refresh Observe(auth) path.
+// Keepalive performs an expiry-aware credential check. It only exchanges a
+// token when the stored credential has reached its proactive refresh window.
 func (c *Client) Keepalive(ctx context.Context, accountID string) error {
-	_, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	credential, err := DecodeCredential(payload)
-	if err != nil {
-		return err
-	}
-	_, err = c.Refresh(ctx, accountID, credential)
+	_, err := c.credential(ctx, accountID)
 	return err
 }
 
@@ -1105,14 +1320,15 @@ func aggregateUserResource(packages []resourcePackage, totalDosage int64) (remai
 // Adapter returns the provider capability bundle for registration.
 func (c *Client) Adapter() providers.Adapter {
 	return providers.Adapter{
-		ID:         "workbuddy",
-		Credential: credentialCodec{},
-		Login:      c,
-		Chat:       c,
-		Models:     c,
-		Classifier: classifier{},
-		Prober:     c,
-		Checkin:    c,
+		ID:                    "workbuddy",
+		Credential:            credentialCodec{},
+		Login:                 c,
+		Chat:                  c,
+		Models:                c,
+		Classifier:            classifier{},
+		Prober:                c,
+		Checkin:               c,
+		CredentialMaintenance: c,
 	}
 }
 

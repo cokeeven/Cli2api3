@@ -352,7 +352,7 @@ func TestAttemptAndBudgetIDsMatchAndSettleRealUsage(t *testing.T) {
 	}
 }
 
-func TestRetriesAreCappedAtFourAndNeverRepeatAnAccount(t *testing.T) {
+func TestConfiguredFourAttemptLimitNeverRepeatsAnAccount(t *testing.T) {
 	var seen []string
 	e := admittedExecutor(admissionChat{run: func(_ context.Context, id string) (providers.ChatOutcome, error) {
 		seen = append(seen, id)
@@ -361,7 +361,7 @@ func TestRetriesAreCappedAtFourAndNeverRepeatAnAccount(t *testing.T) {
 	for _, id := range []string{"c", "d", "e", "f"} {
 		e.Pool.Upsert(Item{ID: id, Provider: "workbuddy", Region: "cn", Runtime: "in_process", Models: []string{"m"}})
 	}
-	e.MaxAttempts = 99
+	e.MaxAttempts = 4
 	result, err := e.ChatNonStream(context.Background(), translate.ChatRequest{Model: "m"}, "", "workbuddy")
 	if err == nil || result.AttemptCount != 4 || len(seen) != 4 {
 		t.Fatalf("result=%+v err=%v seen=%v", result, err, seen)

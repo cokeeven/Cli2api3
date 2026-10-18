@@ -13,12 +13,14 @@ export function FilterSelect({
   ariaLabel,
   options,
   className,
+  width = 'fit',
 }: {
   value: string
   onChange: (value: string) => void
   ariaLabel: string
   options: FilterSelectOption[]
   className?: string
+  width?: 'fit' | 'full'
 }) {
   const items = options.map((option) => ({
     id: option.id || ALL_VALUE,
@@ -29,7 +31,7 @@ export function FilterSelect({
 
   return (
     <Select
-      className={['w-fit', className].filter(Boolean).join(' ')}
+      className={[width === 'full' ? 'w-full' : 'w-fit', className].filter(Boolean).join(' ')}
       aria-label={ariaLabel}
       value={selectedId}
       onChange={(next) => {

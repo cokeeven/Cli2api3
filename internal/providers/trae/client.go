@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -73,9 +74,11 @@ type Client struct {
 	// matching code_challenge. The callback echoes loginTraceID, so a pasted
 	// callback can be matched to its exact verifier even when a newer login has
 	// replaced the account's current pending entry.
-	pendingTraces map[string]*loginPending
-	listener      net.Listener
-	catalog       map[string]providers.ModelInfo
+	pendingTraces        map[string]*loginPending
+	listener             net.Listener
+	catalog              map[string]providers.ModelInfo
+	credentialLocks      map[string]*sync.Mutex
+	credentialRetryAfter map[string]time.Time
 }
 
 const catalogTimeout = 15 * time.Second
@@ -89,8 +92,10 @@ func NewClient(store Store) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		pending:       map[string]*loginPending{},
-		pendingTraces: map[string]*loginPending{},
+		pending:              map[string]*loginPending{},
+		pendingTraces:        map[string]*loginPending{},
+		credentialLocks:      map[string]*sync.Mutex{},
+		credentialRetryAfter: map[string]time.Time{},
 	}
 }
 
@@ -588,6 +593,7 @@ func (c *Client) ExchangeToken(ctx context.Context, accountID string, credential
 // applyTokenResult parses the shared token response shape and fills the
 // credential's access/refresh tokens and expiry timestamps.
 func (c *Client) applyTokenResult(credential Credential, payload []byte) (Credential, error) {
+	refreshedAt := time.Now()
 	var env struct {
 		Result struct {
 			Token               string `json:"Token"`
@@ -610,7 +616,23 @@ func (c *Client) applyTokenResult(credential Credential, payload []byte) (Creden
 	if env.Result.TokenExpireAt != 0 {
 		credential.ExpiresAt = unixSeconds(env.Result.TokenExpireAt)
 	} else if env.Result.TokenExpireDuration > 0 {
-		credential.ExpiresAt = time.Now().Add(time.Duration(env.Result.TokenExpireDuration) * time.Second).Unix()
+		credential.ExpiresAt = refreshedAt.Add(time.Duration(env.Result.TokenExpireDuration) * time.Second).Unix()
+	}
+	if credential.ExpiresAt > 0 {
+		remaining := time.Until(time.Unix(credential.ExpiresAt, 0))
+		if remaining <= 0 {
+			credential.RefreshAfter = refreshedAt.Unix()
+		} else {
+			lead := refreshLead
+			if half := remaining / 2; half < lead {
+				lead = half
+			}
+			credential.RefreshAfter = time.Unix(credential.ExpiresAt, 0).Add(-lead).Unix()
+		}
+	} else {
+		// Unknown expiry must not turn every concurrent request into another
+		// rotating-token exchange. Retry after a short bounded interval.
+		credential.RefreshAfter = refreshedAt.Add(5 * time.Minute).Unix()
 	}
 	if env.Result.RefreshExpireAt != 0 {
 		credential.RefreshExpiresAt = unixSeconds(env.Result.RefreshExpireAt)
@@ -756,35 +778,139 @@ func (c *Client) GetUserInfo(ctx context.Context, accountID string, credential C
 }
 
 func (c *Client) credential(ctx context.Context, accountID string) (Credential, error) {
-	_, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
-	if err != nil {
-		return Credential{}, err
-	}
-	credential, err := DecodeCredential(payload)
+	format, payload, credential, err := c.loadCredential(ctx, accountID)
 	if err != nil {
 		return Credential{}, err
 	}
 	now := time.Now()
 	if credential.refreshExpired(now) {
-		_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "refresh token expired; re-login required", accounts.KindAuth)
-		return credential, fmt.Errorf("trae refresh token expired; re-login required")
+		return c.useTraeCredentialFallback(ctx, accountID, credential, now, fmt.Errorf("trae refresh token expired; re-login required"), true)
 	}
 	if !credential.needsRefresh(now) {
 		return credential, nil
 	}
+	lock := c.credentialLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+	format, payload, credential, err = c.loadCredential(ctx, accountID)
+	if err != nil {
+		return Credential{}, err
+	}
+	now = time.Now()
+	if credential.refreshExpired(now) {
+		return c.useTraeCredentialFallback(ctx, accountID, credential, now, fmt.Errorf("trae refresh token expired; re-login required"), true)
+	}
+	if !credential.needsRefresh(now) {
+		return credential, nil
+	}
+	if c.credentialRefreshCoolingDown(accountID, now) {
+		return c.useTraeCredentialFallback(ctx, accountID, credential, now, fmt.Errorf("credential refresh is cooling down"), false)
+	}
 	refreshed, err := c.ExchangeToken(ctx, accountID, credential)
 	if err != nil {
-		_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", err.Error(), accounts.KindAuth)
-		return credential, err
+		c.recordCredentialRefreshFailure(accountID, err)
+		return c.useTraeCredentialFallback(ctx, accountID, credential, now, err, isCredentialAuthError(err))
 	}
 	encoded, err := refreshed.Encode()
 	if err != nil {
-		return refreshed, err
+		return Credential{}, err
 	}
-	if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, encoded); err != nil {
-		return refreshed, err
+	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	if err != nil {
+		return Credential{}, err
 	}
+	if !saved {
+		_, _, latest, loadErr := c.loadCredential(ctx, accountID)
+		if loadErr != nil {
+			return Credential{}, loadErr
+		}
+		return latest, nil
+	}
+	c.clearCredentialRefreshFailure(accountID)
 	return refreshed, nil
+}
+
+func (c *Client) loadCredential(ctx context.Context, accountID string) (string, []byte, Credential, error) {
+	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	if err != nil {
+		return "", nil, Credential{}, err
+	}
+	credential, err := DecodeCredential(payload)
+	return format, payload, credential, err
+}
+
+func (c *Client) credentialLock(accountID string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.credentialLocks == nil {
+		c.credentialLocks = map[string]*sync.Mutex{}
+	}
+	lock := c.credentialLocks[accountID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.credentialLocks[accountID] = lock
+	}
+	return lock
+}
+
+func (c *Client) credentialRefreshCoolingDown(accountID string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until := c.credentialRetryAfter[accountID]
+	if !now.Before(until) {
+		delete(c.credentialRetryAfter, accountID)
+		return false
+	}
+	return true
+}
+
+func (c *Client) recordCredentialRefreshFailure(accountID string, err error) {
+	delay := 30 * time.Second
+	var classified *providers.Error
+	if errors.As(err, &classified) && classified.RetryAfter > delay {
+		delay = classified.RetryAfter
+	}
+	c.mu.Lock()
+	if c.credentialRetryAfter == nil {
+		c.credentialRetryAfter = map[string]time.Time{}
+	}
+	c.credentialRetryAfter[accountID] = time.Now().Add(delay)
+	c.mu.Unlock()
+}
+
+func (c *Client) clearCredentialRefreshFailure(accountID string) {
+	c.mu.Lock()
+	delete(c.credentialRetryAfter, accountID)
+	c.mu.Unlock()
+}
+
+func (c *Client) saveCredentialIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte) (bool, error) {
+	store, ok := c.store.(providers.CredentialPayloadCASStore)
+	if !ok {
+		return false, fmt.Errorf("trae credential store does not support compare-and-swap persistence")
+	}
+	return store.SaveCredentialPayloadIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload)
+}
+
+func (c *Client) useTraeCredentialFallback(ctx context.Context, accountID string, credential Credential, now time.Time, refreshErr error, authFailure bool) (Credential, error) {
+	if credential.ExpiresAt > now.Unix() {
+		return credential, nil
+	}
+	if authFailure {
+		_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "credential expired; re-login required", accounts.KindAuth)
+		return Credential{}, &providers.Error{Kind: accounts.KindAuth, Status: http.StatusUnauthorized, Message: "trae credential expired; re-login required"}
+	}
+	var classified *providers.Error
+	if errors.As(refreshErr, &classified) {
+		return Credential{}, fmt.Errorf("trae access token expired and refresh failed: %w", classified)
+	}
+	return Credential{}, &providers.Error{Kind: accounts.KindUnavailable, Status: http.StatusServiceUnavailable, Message: "trae credential expired and refresh is temporarily unavailable"}
+}
+
+func isCredentialAuthError(err error) bool {
+	var classified *providers.Error
+	return errors.As(err, &classified) && classified.Kind == accounts.KindAuth ||
+		strings.Contains(strings.ToLower(err.Error()), "refresh_failed")
 }
 
 func (c *Client) Models(ctx context.Context, accountID string) ([]providers.ModelInfo, error) {
@@ -893,10 +1019,15 @@ func settingModelKey(model string) string {
 }
 
 func (c *Client) chatRequest(ctx context.Context, credential Credential, req translate.ChatRequest, accountID string) (*http.Request, providers.ResolvedChat, error) {
+	if err := validateCallerResponseFormat(req); err != nil {
+		return nil, providers.ResolvedChat{}, err
+	}
+	if err := translate.ValidateChatToolHistory(req); err != nil {
+		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Message: err.Error()}
+	}
 	payload, err := json.Marshal(map[string]any{
 		"model":       req.Model,
 		"messages":    req.Messages,
-		"max_tokens":  req.MaxTokens,
 		"temperature": req.Temperature,
 		"tools":       req.Tools,
 		"tool_choice": req.ToolChoice,
@@ -904,7 +1035,8 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
-	rewritten := PrepareBody(payload, c.sceneFor(req.Model))
+	scene := c.sceneFor(req.Model)
+	rewritten := PrepareBody(payload, scene)
 	resolved := providers.ResolvedChat{}
 	var obj map[string]any
 	if err := json.Unmarshal(rewritten, &obj); err == nil {
@@ -935,9 +1067,24 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 			_, _ = c.Models(ctx, accountID)
 			caps = c.capsFor(req.Model)
 		}
+		resolved.OutputBudgetEvidence = outputBudgetEvidence(req.Model, scene, caps.MaxOutput)
+		if err := validateCallerReasoning(req, caps); err != nil {
+			return nil, providers.ResolvedChat{}, err
+		}
 		if maxMode && !caps.MaxMode {
 			log.Printf("trae model %q: max mode requested but catalog says unsupported; sending default context window", req.Model)
 		}
+		outputLimit, outputSource, err := providers.ResolveOutputLimit(req, caps, maxMode)
+		if err != nil {
+			return nil, providers.ResolvedChat{}, err
+		}
+		if outputLimit != nil {
+			obj["max_tokens"] = *outputLimit
+		} else {
+			delete(obj, "max_tokens")
+		}
+		resolved.OutputLimit = outputLimit
+		resolved.OutputLimitSource = outputSource
 		applySoloChatFields(obj, req, maxMode, storedLevel, caps)
 		resolved.ReasoningLevel = resolvedReasoningLevel(req, storedLevel, caps)
 		if encoded, err := json.Marshal(obj); err == nil {
@@ -954,6 +1101,9 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 }
 
 func (c *Client) ChatNonStream(ctx context.Context, accountID string, req translate.ChatRequest) (providers.ChatOutcome, error) {
+	if err := validateCallerResponseFormat(req); err != nil {
+		return providers.ChatOutcome{}, err
+	}
 	credential, err := c.credential(ctx, accountID)
 	if err != nil {
 		return providers.ChatOutcome{}, err
@@ -966,29 +1116,35 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
-	client.Timeout = 0
-	resp, err := client.Do(httpReq)
+	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return providers.ChatOutcome{}, err
+		return resolved.OutcomeMetadata(), err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
+	if len(body) > 16<<20 {
+		body = body[:16<<20]
+		readErr = fmt.Errorf("trae response exceeds 16 MiB")
+	}
 	if resp.StatusCode >= 300 {
-		return providers.ChatOutcome{}, classifiedError(resp.StatusCode, body)
+		return resolved.OutcomeMetadata(), providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
 	}
-	aggregate, err := Aggregate(bytes.NewReader(body))
-	if err != nil {
-		return providers.ChatOutcome{}, err
-	}
+	aggregate, aggregateErr := Aggregate(bytes.NewReader(body))
 	outcome, err := outcomeFromAggregate(aggregate, req.Model)
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
 	outcome.ReasoningLevel = resolved.ReasoningLevel
-	return outcome, nil
+	outcome.OutputLimit = resolved.OutputLimit
+	outcome.OutputLimitSource = resolved.OutputLimitSource
+	outcome.OutputBudgetEvidence = resolved.OutputBudgetEvidence
+	return outcome, providers.WithRetryAfterHeader(errors.Join(readErr, aggregateErr), resp.Header.Get("Retry-After"))
 }
 
 func (c *Client) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, providers.ResolvedChat, error) {
+	if err := validateCallerResponseFormat(req); err != nil {
+		return nil, providers.ResolvedChat{}, err
+	}
 	credential, err := c.credential(ctx, accountID)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
@@ -1001,19 +1157,24 @@ func (c *Client) ChatStream(ctx context.Context, accountID string, req translate
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
-	client.Timeout = 0
-	resp, err := client.Do(httpReq)
+	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return nil, providers.ResolvedChat{}, err
+		return nil, resolved, err
 	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, providers.ResolvedChat{}, classifiedError(resp.StatusCode, body)
+		return nil, resolved, providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
 	}
 	streamResp, err := rewriteSoloStream(resp.Body, req.Model)
 	if err != nil {
-		return nil, providers.ResolvedChat{}, err
+		return nil, resolved, providers.WithRetryAfterHeader(err, resp.Header.Get("Retry-After"))
+	}
+	streamResp.Body = providers.CarryChatObservation(streamResp.Body, resp.Body, resp.Header.Get("Retry-After"))
+	for _, key := range []string{"X-Request-ID", "X-Upstream-Request-ID", "Retry-After"} {
+		if value := resp.Header.Get(key); value != "" {
+			streamResp.Header.Set(key, value)
+		}
 	}
 	return streamResp, resolved, nil
 }
@@ -1026,9 +1187,17 @@ func outcomeFromAggregate(aggregate map[string]any, fallbackModel string) (provi
 	var parsed struct {
 		Model string `json:"model"`
 		Usage struct {
-			PromptTokens     *int   `json:"prompt_tokens"`
-			CompletionTokens *int   `json:"completion_tokens"`
-			Source           string `json:"source"`
+			PromptTokens             *int   `json:"prompt_tokens"`
+			CompletionTokens         *int   `json:"completion_tokens"`
+			CacheReadTokens          *int   `json:"cache_read_tokens"`
+			CacheWriteTokens         *int   `json:"cache_write_tokens"`
+			PromptCacheHitTokens     *int   `json:"prompt_cache_hit_tokens"`
+			CacheReadInputTokens     *int   `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens *int   `json:"cache_creation_input_tokens"`
+			Source                   string `json:"source"`
+			PromptDetails            struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
@@ -1042,7 +1211,7 @@ func outcomeFromAggregate(aggregate map[string]any, fallbackModel string) (provi
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return providers.ChatOutcome{}, err
 	}
-	out := providers.ChatOutcome{UsageSource: "unknown", FinishReason: "stop", Model: fallbackModel}
+	out := providers.ChatOutcome{UsageSource: "unknown", FinishReason: "stop", FinishReasonSource: "adapter_default", Model: fallbackModel}
 	if parsed.Model != "" {
 		out.Model = parsed.Model
 	}
@@ -1052,6 +1221,7 @@ func outcomeFromAggregate(aggregate map[string]any, fallbackModel string) (provi
 		out.ToolCalls = parsed.Choices[0].Message.ToolCalls
 		if parsed.Choices[0].FinishReason != "" {
 			out.FinishReason = parsed.Choices[0].FinishReason
+			out.FinishReasonSource = "upstream"
 		}
 	}
 	if parsed.Usage.PromptTokens != nil {
@@ -1060,9 +1230,14 @@ func outcomeFromAggregate(aggregate map[string]any, fallbackModel string) (provi
 	if parsed.Usage.CompletionTokens != nil {
 		out.CompletionTokens = *parsed.Usage.CompletionTokens
 	}
+	out.ReportedPromptTokens, out.ReportedCompletionTokens = parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens
+	out.UsageExtensions = providers.NumericUsageExtensions(aggregate["usage"])
 	if parsed.Usage.PromptTokens != nil && parsed.Usage.CompletionTokens != nil {
 		out.UsageSource = firstNonEmpty(parsed.Usage.Source, "upstream")
 	}
+	out.CacheReadTokens = providers.FirstIntPointer(parsed.Usage.CacheReadTokens, parsed.Usage.PromptDetails.CachedTokens, parsed.Usage.PromptCacheHitTokens, parsed.Usage.CacheReadInputTokens)
+	out.CachedTokens = out.CacheReadTokens
+	out.CacheWriteTokens = providers.FirstIntPointer(parsed.Usage.CacheWriteTokens, parsed.Usage.CacheCreationInputTokens)
 	return out, nil
 }
 
@@ -1072,10 +1247,12 @@ func classifiedError(status int, body []byte) error {
 
 func wrapClassified(classified providers.ClassifiedError, code string) error {
 	return &providers.Error{
-		Kind:    classified.Kind,
-		Status:  classified.Status,
-		Message: classified.Message,
-		Code:    code,
+		Kind:      classified.Kind,
+		Status:    classified.Status,
+		Message:   classified.Message,
+		Code:      firstNonEmpty(code, classified.Code),
+		Scope:     classified.Scope,
+		RetrySafe: classified.RetrySafe,
 	}
 }
 
@@ -1118,6 +1295,8 @@ func Classify(status int, body string) providers.ClassifiedError {
 		return providers.ClassifiedError{Kind: accounts.KindQuota, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "solo credits exhausted")}
 	case code == "4001":
 		return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: 400, Message: firstNonEmpty(strings.TrimSpace(body), "model or ide version mismatch")}
+	case code == "3004":
+		return providers.ClassifiedError{Kind: accounts.KindRateLimit, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "upstream rate limit")}
 	case code == "4011":
 		return providers.ClassifiedError{Kind: accounts.KindRateLimit, Status: 429, Message: firstNonEmpty(strings.TrimSpace(body), "hard rate limit")}
 	case status == 429 || strings.Contains(text, "too many requests"):
@@ -1148,11 +1327,16 @@ func firstNonEmptyStatus(status, fallback int) int {
 func (c *Client) Probe(ctx context.Context, accountID string) (providers.AccountHealth, error) {
 	credential, err := c.credential(ctx, accountID)
 	if err != nil {
-		return providers.AccountHealth{LastError: err.Error()}, nil
+		var classified *providers.Error
+		kind := accounts.KindUnavailable
+		if errors.As(err, &classified) && classified.Kind != "" {
+			kind = classified.Kind
+		}
+		return providers.AccountHealth{LastError: err.Error(), LastErrorKind: kind}, nil
 	}
 	if !credential.Ready() {
 		msg := "trae credential incomplete; re-login required"
-		return providers.AccountHealth{UID: credential.UID, LastError: msg}, nil
+		return providers.AccountHealth{UID: credential.UID, LastError: msg, LastErrorKind: accounts.KindAuth}, nil
 	}
 	return providers.AccountHealth{
 		Ready: true,
@@ -1363,16 +1547,23 @@ func (c *Client) CheckinClaim(ctx context.Context, accountID string, credential 
 
 func (c *Client) Adapter() providers.Adapter {
 	return providers.Adapter{
-		ID:           "trae",
-		Credential:   credentialCodec{},
-		Login:        c,
-		Chat:         c,
-		Models:       c,
-		Classifier:   classifier{},
-		ImportExport: importer{},
-		Prober:       c,
-		Checkin:      c,
+		ID:                    "trae",
+		Credential:            credentialCodec{},
+		Login:                 c,
+		Chat:                  c,
+		Models:                c,
+		Classifier:            classifier{},
+		ImportExport:          importer{},
+		Prober:                c,
+		Checkin:               c,
+		CredentialMaintenance: c,
 	}
+}
+
+// Keepalive checks expiry using the same credential lock/CAS path as chat.
+func (c *Client) Keepalive(ctx context.Context, accountID string) error {
+	_, err := c.credential(ctx, accountID)
+	return err
 }
 
 type credentialCodec struct{}

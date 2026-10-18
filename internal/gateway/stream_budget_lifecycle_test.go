@@ -50,6 +50,37 @@ type lifecycleChat struct {
 	opened chan struct{}
 }
 
+type usageThenBlockingBody struct {
+	data      []byte
+	readOnce  bool
+	waiting   chan struct{}
+	closed    chan struct{}
+	waitOnce  sync.Once
+	closeOnce sync.Once
+}
+
+func newUsageThenBlockingBody() *usageThenBlockingBody {
+	return &usageThenBlockingBody{
+		data:    []byte("data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"credits\":2.5}}\n\n"),
+		waiting: make(chan struct{}), closed: make(chan struct{}),
+	}
+}
+
+func (b *usageThenBlockingBody) Read(p []byte) (int, error) {
+	if !b.readOnce {
+		b.readOnce = true
+		return copy(p, b.data), nil
+	}
+	b.waitOnce.Do(func() { close(b.waiting) })
+	<-b.closed
+	return 0, context.Canceled
+}
+
+func (b *usageThenBlockingBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
 func (c lifecycleChat) ChatNonStream(context.Context, string, translate.ChatRequest) (providers.ChatOutcome, error) {
 	return providers.ChatOutcome{}, errors.New("unexpected non-stream")
 }
@@ -76,12 +107,10 @@ func TestPublicStreamBudgetSettlesExactlyOnceOnSuccessTruncationAndCancellation(
 				if outcome == "truncated" {
 					body = io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
 				}
-				var pipeWriter *io.PipeWriter
+				var cancelBody *usageThenBlockingBody
 				if outcome == "canceled" {
-					var reader *io.PipeReader
-					reader, pipeWriter = io.Pipe()
-					body = reader
-					defer pipeWriter.Close()
+					cancelBody = newUsageThenBlockingBody()
+					body = cancelBody
 				}
 				defer body.Close()
 				opened := make(chan struct{})
@@ -117,6 +146,11 @@ func TestPublicStreamBudgetSettlesExactlyOnceOnSuccessTruncationAndCancellation(
 					t.Fatal("adapter did not open")
 				}
 				if outcome == "canceled" {
+					select {
+					case <-cancelBody.waiting:
+					case <-time.After(5 * time.Second):
+						t.Fatal("relay did not consume the partial usage snapshot")
+					}
 					cancel()
 				}
 				select {
@@ -156,6 +190,10 @@ func TestPublicStreamBudgetSettlesExactlyOnceOnSuccessTruncationAndCancellation(
 					if s.ActualTokens == nil || *s.ActualTokens != 4 || s.ActualCredits == nil || *s.ActualCredits != 2.5 {
 						t.Fatalf("actual usage lost: %+v", s)
 					}
+				} else if outcome == "canceled" {
+					if s.ActualTokens == nil || *s.ActualTokens != 4 || s.ActualCredits == nil || *s.ActualCredits != 2.5 {
+						t.Fatalf("confirmed usage lost on cancellation: %+v", s)
+					}
 				} else if s.ActualTokens != nil || s.ActualCredits != nil {
 					t.Fatalf("unreported usage fabricated: %+v", s)
 				}
@@ -171,7 +209,13 @@ func TestPublicStreamBudgetSettlesExactlyOnceOnSuccessTruncationAndCancellation(
 				if len(attempts) != 1 {
 					t.Fatalf("terminal attempts=%d", len(attempts))
 				}
-				if (attempts[0].Status == accounts.AttemptStatusOK) != (outcome == "complete") {
+				wantAttemptStatus := accounts.AttemptStatusError
+				if outcome == "complete" {
+					wantAttemptStatus = accounts.AttemptStatusOK
+				} else if outcome == "canceled" {
+					wantAttemptStatus = accounts.AttemptStatusCanceled
+				}
+				if attempts[0].Status != wantAttemptStatus {
 					t.Fatalf("wrong terminal attempt: %+v", attempts[0])
 				}
 			})

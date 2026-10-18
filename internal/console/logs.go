@@ -44,7 +44,7 @@ func (h *Handler) handleMaintenanceLogs(w http.ResponseWriter, r *http.Request) 
 		Kind: query.Get("kind"), Trigger: query.Get("trigger"), Status: query.Get("status"),
 		From: ParseQueryTime(query.Get("from"), false), To: ParseQueryTime(query.Get("to"), true),
 	}
-	if (filter.Kind != "" && filter.Kind != "checkin" && filter.Kind != "daily_tasks") ||
+	if (filter.Kind != "" && filter.Kind != "checkin" && filter.Kind != "daily_tasks" && filter.Kind != "credential" && filter.Kind != "quota") ||
 		(filter.Trigger != "" && filter.Trigger != "manual" && filter.Trigger != "scheduled" && filter.Trigger != "retry" && filter.Trigger != "unknown") {
 		writeErr(w, http.StatusBadRequest, "invalid_filter", "invalid maintenance kind or trigger")
 		return

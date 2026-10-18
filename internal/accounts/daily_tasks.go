@@ -13,6 +13,7 @@ var ErrDailyTasksNotDue = errors.New("daily tasks are not due")
 var ErrDailyTasksLeaseLost = errors.New("daily task execution lease expired or was replaced")
 
 type DailyTaskRun struct {
+	Kind        string                     `json:"kind"`
 	ID          string                     `json:"id"`
 	AccountID   string                     `json:"account_id"`
 	RunDate     string                     `json:"run_date"`

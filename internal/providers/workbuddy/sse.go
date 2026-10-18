@@ -24,6 +24,7 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 	var content, reasoning strings.Builder
 	var order []int
 	sawDone := false
+	var streamErr error
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -41,10 +42,11 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			break
 		}
 		var chunk struct {
-			ID      string `json:"id"`
-			Model   string `json:"model"`
-			Created int64  `json:"created"`
-			Usage   any    `json:"usage"`
+			Error   json.RawMessage `json:"error"`
+			ID      string          `json:"id"`
+			Model   string          `json:"model"`
+			Created int64           `json:"created"`
+			Usage   any             `json:"usage"`
 			Choices []struct {
 				FinishReason string `json:"finish_reason"`
 				Delta        struct {
@@ -58,6 +60,13 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			if chunk.Usage != nil {
+				result["usage"] = chunk.Usage
+			}
+			streamErr = classifiedError(http.StatusBadGateway, []byte(payload))
+			break
 		}
 		if chunk.ID != "" {
 			result["id"] = chunk.ID
@@ -87,12 +96,6 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			mergeToolCalls(toolCalls, &order, choice.Delta.ToolCalls)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if !sawDone {
-		return nil, fmt.Errorf("workbuddy stream ended before [DONE]")
-	}
 
 	message["content"] = content.String()
 	if reasoning.Len() > 0 {
@@ -117,6 +120,15 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 		"message":       message,
 		"finish_reason": finishReason,
 	}}
+	if err := scanner.Err(); err != nil {
+		return result, err
+	}
+	if streamErr != nil {
+		return result, streamErr
+	}
+	if !sawDone {
+		return result, fmt.Errorf("workbuddy stream ended before [DONE]")
+	}
 	return result, nil
 }
 
@@ -208,6 +220,16 @@ func copySanitizedSSE(src io.Reader, dst io.Writer) error {
 			continue
 		}
 		cleaned, ok := sanitizeSSEPayload(payload, &sentRole)
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal([]byte(payload), &envelope) == nil && len(envelope["error"]) > 0 && string(envelope["error"]) != "null" {
+			if usage := envelope["usage"]; len(usage) > 0 && string(usage) != "null" {
+				encoded, _ := json.Marshal(map[string]any{"usage": usage})
+				if _, err := fmt.Fprintf(dst, "data: %s\n\n", encoded); err != nil {
+					return err
+				}
+			}
+			return classifiedError(http.StatusBadGateway, []byte(payload))
+		}
 		if !ok {
 			continue
 		}
@@ -228,7 +250,7 @@ func sanitizeSSEPayload(payload string, sentRole *bool) (string, bool) {
 	if err := decoder.Decode(&chunk); err != nil {
 		return payload, true
 	}
-	keep := chunk["usage"] != nil
+	keep := chunk["usage"] != nil || chunk["error"] != nil
 	if choices, ok := chunk["choices"].([]any); ok {
 		for _, raw := range choices {
 			choice, _ := raw.(map[string]any)

@@ -123,6 +123,9 @@ func ModelCapabilitiesEntry(model providers.ModelInfo) map[string]any {
 	if model.Capabilities.CanDisableThinking {
 		entry["can_disable_thinking"] = true
 	}
+	if model.Capabilities.OutputBudgetEvidence != nil {
+		entry["output_budget_evidence"] = model.Capabilities.OutputBudgetEvidence
+	}
 	return entry
 }
 
@@ -147,6 +150,13 @@ func ProviderModelEntry(model providers.ModelInfo, provider string) map[string]a
 	}
 	if credits := strings.TrimSpace(model.Credits); credits != "" {
 		entry["credits"] = credits
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "trae") {
+		if model.Capabilities.OutputBudgetEvidence != nil {
+			entry["output_budget_evidence"] = model.Capabilities.OutputBudgetEvidence
+		} else {
+			entry["output_budget_evidence"] = map[string]any{"status": "not_tested"}
+		}
 	}
 	if model.Free {
 		entry["free"] = true

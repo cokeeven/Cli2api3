@@ -2,6 +2,7 @@ package workbuddy
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
@@ -22,6 +23,29 @@ func TestApplyChatReasoningKeepsNestedObjectForGLM(t *testing.T) {
 		if _, ok := obj[key]; ok {
 			t.Fatalf("glm unexpectedly set %s=%v", key, obj[key])
 		}
+	}
+}
+
+func TestExplicitUnsupportedReasoningIsRejectedInsteadOfDowngraded(t *testing.T) {
+	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"}
+	for _, raw := range []json.RawMessage{json.RawMessage(`"high"`), json.RawMessage(`"unrecognized"`)} {
+		err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: raw}, caps)
+		var providerErr *providers.Error
+		if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {
+			t.Fatalf("explicit unsupported reasoning=%s error=%v", raw, err)
+		}
+	}
+	if err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: json.RawMessage(`null`)}, caps); err != nil {
+		t.Fatalf("null reasoning should use existing default behavior: %v", err)
+	}
+	if err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: json.RawMessage(`"none"`)}, providers.ModelCapabilities{
+		ReasoningOptions: []string{"none", "high"}, CanDisableThinking: false,
+	}); err == nil {
+		t.Fatal("provider that cannot disable thinking accepted an explicit none request")
+	}
+	on := true
+	if err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: json.RawMessage(`"unrecognized"`), EnableThinking: &on}, caps); err == nil {
+		t.Fatal("valid boolean setting hid an invalid explicit reasoning effort")
 	}
 }
 

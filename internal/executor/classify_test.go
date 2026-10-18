@@ -20,6 +20,22 @@ func TestClassifyPromptLimitDoesNotCoolAccount(t *testing.T) {
 	}
 }
 
+func TestClassifyErrorRetainsStructuredCooldownProvenance(t *testing.T) {
+	reset := time.Date(2026, time.October, 18, 20, 30, 0, 0, time.UTC)
+	err := &providers.Error{
+		Kind: accounts.KindRateLimit, Status: http.StatusTooManyRequests, Scope: "model",
+		Code: "SYNTHETIC_LIMIT", Message: "synthetic limit", RetryAfter: time.Minute,
+		UpstreamResetAt: &reset,
+	}
+	got := ClassifyError(err)
+	if got.Code != "SYNTHETIC_LIMIT" || got.Scope != "model" || got.EvidenceSource != "provider_adapter_error" {
+		t.Fatalf("structured provider classification provenance lost: %+v", got)
+	}
+	if got.UpstreamResetAt == nil || !got.UpstreamResetAt.Equal(reset) {
+		t.Fatalf("trusted reset evidence lost: %+v", got.UpstreamResetAt)
+	}
+}
+
 func TestNextLocalMidnightCooldown(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 	now := time.Date(2026, time.September, 4, 23, 45, 0, 0, loc)

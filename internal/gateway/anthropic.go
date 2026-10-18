@@ -13,6 +13,7 @@ import (
 )
 
 func (h *Handler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	r = withGatewayRequestStart(r)
 	if r.Method != http.MethodPost {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "POST only")
 		return
@@ -38,13 +39,17 @@ func (h *Handler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	result, err := h.Executor.ChatNonStream(execution.Context, execution.Request, execution.Prefer, execution.ProviderFilter)
+	if err == nil {
+		err = validateProviderToolOutput(result.Provider, result.ToolCalls)
+	}
 	if err != nil {
-		h.finishCompatibility(execution, result.AccountID, result.Provider, result.Routing, accounts.RequestStatusError, 0, nil, err, result.AttemptCount, result.ReasoningLevel)
+		h.finishCompatibility(execution, result.AccountID, result.Provider, result.Routing, accounts.RequestStatusError, 0, nonstreamFailureUsage(result), err, result.AttemptCount, result.ReasoningLevel)
 		writeAnthropicCompatibilityError(w, err)
 		return
 	}
+	prompt, completion := result.UsageTokenEvidence()
 	h.finishCompatibility(execution, result.AccountID, result.Provider, result.Routing, accounts.RequestStatusOK, 0, &StreamRelayStats{
-		PromptTokens: ptrInt(result.PromptTokens), CompletionTokens: ptrInt(result.CompletionTokens),
+		PromptTokens: prompt, CompletionTokens: completion,
 		CacheReadTokens: result.CacheReadTokens, CacheWriteTokens: result.CacheWriteTokens,
 		CachedTokens: result.CachedTokens, UsageSource: result.UsageSource, Credits: result.Credits,
 		ConsumedCredits: result.ConsumedCredits, Model: result.Model,
@@ -74,7 +79,9 @@ func (h *Handler) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.R
 	logErr := relayErr
 	switch status {
 	case accounts.RequestStatusCanceled:
-		logErr = context.Canceled
+		if logErr == nil || IsStreamClientDisconnect(logErr) {
+			logErr = context.Canceled
+		}
 	case accounts.RequestStatusOK:
 		logErr = nil
 	}

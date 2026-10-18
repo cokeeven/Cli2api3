@@ -23,15 +23,18 @@ func (e *QuotaRefreshError) Unwrap() error { return e.Err }
 // Quota snapshots: pool MergeQuota then Store.SaveQuota. Worker JSON is Qoder-only;
 // in-process providers use AccountProber.Quota.
 
-func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prober providers.AccountProber, expectedEpoch ...uint64) {
+func quotaSnapshotFromProvider(ctx context.Context, accountID string, prober providers.AccountProber) (*QuotaSnapshot, error) {
 	if prober == nil {
-		return
+		return nil, nil
 	}
 	info, err := prober.Quota(ctx, accountID)
-	if err != nil || info == nil || !quotaInfoHasWindows(info) {
+	if err != nil {
+		return nil, err
+	}
+	if info == nil || !quotaInfoHasWindows(info) {
 		// An empty snapshot is "not fetched yet", not a zero balance. Saving it
 		// makes the account card render 0/0 and hides a later real reading.
-		return
+		return nil, fmt.Errorf("provider returned no quota snapshot")
 	}
 	unit := info.Unit
 	if unit == "" {
@@ -58,14 +61,10 @@ func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prob
 	if info.ProviderID == "codex" {
 		quota.Plan = strings.TrimSpace(info.Plan)
 	}
-	if len(expectedEpoch) > 0 {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if ctx.Err() != nil || m.runCtx.Err() != nil || m.accountEpoch[accountID] != expectedEpoch[0] {
-			return
-		}
+	if strings.TrimSpace(quota.FetchedAt) == "" {
+		quota.FetchedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	m.persistQuota(ctx, accountID, quota)
+	return quota, nil
 }
 
 func quotaPackagesFromInfo(packages []providers.QuotaPackage) []accounts.QuotaPackage {
@@ -143,14 +142,22 @@ func (m *Manager) persistQuota(ctx context.Context, accountID string, quota *Quo
 		}
 	}
 	m.pool.MergeQuota(accountID, quota)
-	if err := m.store.SaveQuota(ctx, accountID, quota); err != nil {
+	// MergeQuota carries forward local restriction evidence because provider
+	// refresh payloads do not include gateway observations. Persist the merged
+	// pool snapshot rather than the raw provider response so a routine refresh
+	// cannot erase the evidence before the async pool-state writer drains.
+	persistedQuota := quota
+	if item, ok := m.pool.ByID(accountID); ok && item.Quota != nil {
+		persistedQuota = item.Quota
+	}
+	if err := m.store.SaveQuota(ctx, accountID, persistedQuota); err != nil {
 		log.Printf("persist quota account=%s: %v", accountID, err)
 	}
 }
 
-func (m *Manager) fetchQuota(ctx context.Context, accountID, workerURL string, force bool) error {
+func (m *Manager) fetchQuotaSnapshot(ctx context.Context, accountID, workerURL string, force bool) (*QuotaSnapshot, error) {
 	if strings.TrimSpace(workerURL) == "" {
-		return fmt.Errorf("quota worker URL is empty")
+		return nil, fmt.Errorf("quota worker URL is empty")
 	}
 	client := qoder.WorkerClient{
 		HTTP:        &http.Client{Timeout: 5 * time.Second},
@@ -159,10 +166,12 @@ func (m *Manager) fetchQuota(ctx context.Context, accountID, workerURL string, f
 	quota, err := client.Quota(ctx, workerURL, force)
 	if err != nil || quota == nil {
 		if err != nil {
-			return &QuotaRefreshError{Err: fmt.Errorf("fetch quota account=%s: %w", accountID, err)}
+			return nil, fmt.Errorf("fetch quota account=%s: %w", accountID, err)
 		}
-		return &QuotaRefreshError{Err: fmt.Errorf("fetch quota account=%s: empty response", accountID)}
+		return nil, fmt.Errorf("fetch quota account=%s: empty response", accountID)
 	}
-	m.persistQuota(ctx, accountID, quota)
-	return nil
+	if strings.TrimSpace(quota.FetchedAt) == "" {
+		quota.FetchedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	return quota, nil
 }

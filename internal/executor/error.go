@@ -46,7 +46,9 @@ func NewExecutionError(classified Classified, err error) *ExecutionError {
 
 // ClassifyUpstreamBody classifies an upstream HTTP/SSE error body once.
 func ClassifyUpstreamBody(status int, body string) error {
-	return NewExecutionError(Classify(status, body, "", "", ""), nil)
+	classified := Classify(status, body, "", "", "")
+	classified.EvidenceSource = "upstream_error_body"
+	return NewExecutionError(classified, nil)
 }
 
 // StreamIncompleteError is a mid-body stream that ended without [DONE].
@@ -76,6 +78,7 @@ func newUnavailableStreamError(code, message string, status int, cause error) er
 	classified.Message = message
 	classified.Status = status
 	classified.Type = "api_error"
+	classified.EvidenceSource = "local_stream_guard"
 	return NewExecutionError(classified, cause)
 }
 
@@ -87,6 +90,10 @@ func ClassifyError(err error) Classified {
 	var execErr *ExecutionError
 	if errors.As(err, &execErr) && execErr != nil {
 		return execErr.Classified
+	}
+	var phase interface{ TimeoutPhase() string }
+	if errors.As(err, &phase) {
+		return Classified{Kind: accounts.KindCanceled, Status: 504, Failover: false, Scope: "request", Code: "request_timeout_" + phase.TimeoutPhase(), Type: "timeout_error", Message: err.Error()}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return Classified{
@@ -111,6 +118,11 @@ func ClassifyError(err error) Classified {
 	if providerErr.Code != "" {
 		classified.Code = providerErr.Code
 	}
+	classified.EvidenceSource = "provider_adapter_error"
+	if providerErr.UpstreamResetAt != nil {
+		reset := providerErr.UpstreamResetAt.UTC()
+		classified.UpstreamResetAt = &reset
+	}
 	if providerErr.Type != "" {
 		classified.Type = providerErr.Type
 	}
@@ -128,6 +140,11 @@ func ClassifyError(err error) Classified {
 	switch classified.Kind {
 	case accounts.KindRateLimit:
 		switch {
+		case providerErr.RetryAfterHeader != "":
+			classified.Cooldown = ParseRetryAfterHint(providerErr.Message, providerErr.RetryAfterHeader, classified.Cooldown)
+			if classified.Cooldown < minRateLimitCooldown {
+				classified.Cooldown = minRateLimitCooldown
+			}
 		case providerErr.Code == "4011" && providerErr.RetryAfter <= 0:
 			classified.Cooldown = 5 * time.Minute
 		case providerErr.RetryAfter > 0:
@@ -138,7 +155,9 @@ func ClassifyError(err error) Classified {
 		}
 	case accounts.KindQuota:
 		// Use only a reset actually provided by the upstream.
-		if providerErr.RetryAfter > 0 {
+		if providerErr.RetryAfterHeader != "" {
+			classified.Cooldown = ParseRetryAfterHint(providerErr.Message, providerErr.RetryAfterHeader, classified.Cooldown)
+		} else if providerErr.RetryAfter > 0 {
 			classified.Cooldown = providerErr.RetryAfter
 		}
 	}

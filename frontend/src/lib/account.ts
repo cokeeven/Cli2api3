@@ -52,6 +52,15 @@ export function isAvailable(account: AccountRow) {
   return state === 'hot' || state === 'ready'
 }
 
+// Runtime readiness, quota collection time and scheduling status are separate
+// observations. Readiness does not prove a fresh upstream authentication.
+export function accountRoutingFacts(account: AccountRow) {
+  const authentication = account.status === 'auth_failed' || account.runtime_state === 'auth_failed' || account.status === 'login_required'
+    ? 'authNeedsLogin' : account.ready || account.hot ? 'authRuntimeReady' : 'authUnknown'
+  const quotaTime = account.quota?.fetched_at
+  return { authentication, quotaTime: quotaTime && Number.isFinite(Date.parse(quotaTime)) ? quotaTime : null, scheduling: accountState(account) }
+}
+
 // WorkBuddy stores credentials outside auth_type. Runtime readiness is the
 // credential signal exposed by the overview; chat quota/cooldowns do not block
 // account maintenance. Manual maintenance also permits disabled accounts.

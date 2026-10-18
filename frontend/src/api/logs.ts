@@ -6,7 +6,7 @@ export type MaintenanceLog = {
   account_name: string
   provider: string
   region?: string
-  kind: 'checkin' | 'daily_tasks'
+  kind: 'checkin' | 'daily_tasks' | 'credential' | 'quota'
   trigger: string
   status: string
   summary: string
@@ -65,9 +65,25 @@ export type RequestStreamDiagnostic = {
   relay_error?: string
   sse_event_count: number
   bytes_read: number
-  content_length: number
+  content_length?: number | null
   last_event?: string
   saw_done: boolean
+  upstream_finish_reason?: string
+  upstream_finish_reason_source?: string
+  external_finish_reason?: string
+  external_finish_reason_source?: string
+  content_chars?: number | null
+  reasoning_chars?: number | null
+  tool_event_count?: number | null
+  char_count_unit?: string
+  cancellation_stage?: string
+  prepare_duration_ms?: number | null
+  upstream_response_duration_ms?: number | null
+  first_event_duration_ms?: number | null
+  first_content_duration_ms?: number | null
+  timeout_phase?: string
+  total_duration_ms?: number | null
+  output_budget_enforcement?: string
 }
 
 export type RequestUsageDetail = {
@@ -79,6 +95,14 @@ export type RequestUsageDetail = {
 }
 
 export type RequestLog = {
+	routing_diagnostic?: {
+	  initial_candidates: number; attempt_budget: number; attempted: number; stop_reason: string
+	  final_selection_kind?: string; final_selection_code?: string
+	  last_upstream_kind?: string; last_upstream_code?: string; last_upstream_scope?: string; last_account_id?: string
+	  capacity_queue_status?: string; capacity_queue_wait_ms?: number; capacity_queue_position?: number
+	  accounts_complete: boolean
+	  accounts: { account_id: string; provider: string; region: string; reason: string; catalog_known: boolean; catalog_at?: string; quota_known: boolean; quota_at?: string; failure_kind?: string; failure_code?: string; failure_scope?: string }[]
+	}
   id: string
   created_at: string
   finished_at?: string | null
@@ -103,7 +127,14 @@ export type RequestLog = {
   error_code?: string
   error_message?: string
   attempt_count: number
+  client_request_id?: string
+  source_fingerprint?: string
+  output_limit_tokens?: number | null
+  output_limit_source?: string
+  output_budget_enforcement?: string
+  prompt_stripped?: boolean | null
   message_count?: number
+  message_shape_known: boolean
   empty_message_indexes?: number[]
   message_roles?: string[]
   attempts?: RequestAttempt[]

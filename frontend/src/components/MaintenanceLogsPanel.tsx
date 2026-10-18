@@ -17,6 +17,7 @@ import { PageAlert } from '@/components/ui/PageAlert'
 import { LogsRequestListSkeleton, SkeletonBlock } from '@/components/ui/PageSkeletons'
 import { useI18n } from '@/hooks/useI18n'
 import { accountProviderFamilyLabel, accountProviderLabel } from '@/lib/provider'
+import { MaintenanceTaskCenter } from '@/components/MaintenanceTaskCenter'
 
 type DateRange = { start: DateValue; end: DateValue }
 type RangePreset = 'all' | '1h' | '24h' | '7d' | 'custom'
@@ -114,6 +115,8 @@ export function MaintenanceLogsPanel() {
         {settingsError ? <Card.Content><PageAlert title={settingsError} /></Card.Content> : settings?.automation_maintenance_enabled === false ? <Card.Content><PageAlert status="default" title={t('maintenancePaused')} description={t('maintenanceManualHint')} /></Card.Content> : null}
       </Card>
 
+      <MaintenanceTaskCenter settings={settings} onSaved={setSettings} selected={accounts.find((row) => row.id === account)} onExecuted={() => setRefresh((value) => value + 1)} />
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-3xl text-sm text-muted">{t('maintenanceLogsHint')}</p>
         <Button size="sm" variant="secondary" isPending={loading} isDisabled={saving} onPress={() => { setSettingsLoading(true); setRefresh((value) => value + 1) }}><ArrowClockwise size={15} />{t('refresh')}</Button>
@@ -121,7 +124,7 @@ export function MaintenanceLogsPanel() {
       <div className="flex flex-wrap gap-2">
         <FilterSelect ariaLabel={t('logsColProvider')} value={provider} onChange={setProvider} options={[{ id: '', label: t('maintenanceAllProviders') }, ...providerOptions]} />
         <FilterSearchSelect ariaLabel={t('logsColAccount')} value={account} onChange={setAccount} options={accounts.map((row) => ({ id: row.id, label: row.name || row.id }))} allLabel={t('logsFilterAccountAll')} searchPlaceholder={t('logsSearchAccount')} emptyLabel={t('logsNoFilterOptions')} />
-        <FilterSelect ariaLabel={t('maintenanceKind')} value={kind} onChange={setKind} options={[{ id: '', label: t('maintenanceAllKinds') }, ...['checkin', 'daily_tasks'].map((id) => ({ id, label: t(`maintenanceKind_${id}`) }))]} />
+        <FilterSelect ariaLabel={t('maintenanceKind')} value={kind} onChange={setKind} options={[{ id: '', label: t('maintenanceAllKinds') }, ...['checkin', 'daily_tasks', 'credential', 'quota'].map((id) => ({ id, label: t(`maintenanceKind_${id}`) }))]} />
         <FilterSelect ariaLabel={t('logsColStatus')} value={status} onChange={setStatus} options={[{ id: '', label: t('logsFilterAll') }, ...['success', 'already', 'partial', 'error', 'skipped', 'running', 'interrupted'].map((id) => ({ id, label: t(`dailyStatus_${id}`) }))]} />
         <FilterSelect ariaLabel={t('maintenanceTrigger')} value={trigger} onChange={setTrigger} options={[{ id: '', label: t('maintenanceAllTriggers') }, ...['manual', 'scheduled', 'retry', 'unknown'].map((id) => ({ id, label: t(`dailyTrigger_${id}`) }))]} />
       </div>

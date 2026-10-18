@@ -148,6 +148,10 @@ func New(cfg config.Config) *App {
 		agent = appupdate.NewHTTPAgentClient(cfg.UpdateAgentURL, cfg.UpdateAgentToken)
 	}
 	chatExecutor := executor.NewChatExecutor(pool, proxyAPIKey)
+	chatExecutor.RequestTimeout = cfg.ChatTotalTimeout
+	chatExecutor.CapacityQueueMaxWaiters = cfg.ChatCapacityQueueMaxWaiters
+	chatExecutor.CapacityQueueWait = cfg.ChatCapacityQueueWait
+	chatExecutor.ChatTimeouts = providers.ChatTimeouts{Headers: cfg.ChatHeadersTimeout, FirstEvent: cfg.ChatFirstEventTimeout, Idle: cfg.ChatIdleTimeout}
 	chatExecutor.MaxAttempts = cfg.MaxRetryAccounts
 	chatExecutor.Providers = providerReg
 	chatExecutor.OnAttempt = recorder.Attempt
@@ -175,6 +179,7 @@ func New(cfg config.Config) *App {
 	// Auth copies and all executor copies read the same atomic live key.
 	// Cfg.ProxyAPIKey and Executor.WorkerKey remain bootstrap snapshots.
 	a.Executor.WorkerKeySource = a.Auth.ConsoleKey
+	a.Executor.OnRoute = a.recordRoutingDiagnostic
 	a.Update = a.newUpdateCoordinator(checker, agent)
 	a.Gateway = a.newGateway()
 	a.Console = a.newConsole()
@@ -184,6 +189,9 @@ func New(cfg config.Config) *App {
 }
 
 func (a *App) Close() error {
+	if a.Pool != nil {
+		a.Pool.CloseCapacityWaitQueue()
+	}
 	if a.stopLogs != nil {
 		a.stopLogsOnce.Do(func() { close(a.stopLogs) })
 	}

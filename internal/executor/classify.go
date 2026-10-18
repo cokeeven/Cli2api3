@@ -22,6 +22,11 @@ type Classified struct {
 	Type       string
 	Message    string
 	RetryAfter time.Duration
+	// EvidenceSource describes which in-process boundary supplied the
+	// classification. It is provenance, not a claim that raw upstream traffic
+	// was captured.
+	EvidenceSource  string
+	UpstreamResetAt *time.Time
 	// Model scopes the cooldown to one public model. When set, only that
 	// model is cooled; the account keeps serving everything else.
 	Model string
@@ -201,6 +206,14 @@ func Classify(status int, body, retryAfter, kindHint, failoverHint string) Class
 
 	out := Classified{Kind: kind, Message: strings.TrimSpace(msg), Code: firstNonEmpty(code, kind), Type: firstNonEmpty(typ, "api_error")}
 	switch kind {
+	case KindConcurrencyCapacity:
+		out.Status = 429
+		out.Failover = false
+		out.Cooldown = 0
+		out.RetryAfter = 0
+		out.Scope = "local_capacity"
+		out.Code = firstNonEmpty(code, "concurrency_capacity")
+		out.Type = "api_error"
 	case KindQuota:
 		out.Status = 429
 		out.Failover = false

@@ -1,6 +1,7 @@
 package workbuddy
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -8,6 +9,33 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
+
+func validateCallerReasoning(req translate.ChatRequest, caps providers.ModelCapabilities) error {
+	raw := bytes.TrimSpace(req.ReasoningEffort)
+	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		level := requestedReasoningEffort(req.ReasoningEffort)
+		if !providers.SupportsReasoningLevel(level, caps) || (level == "none" && !caps.CanDisableThinking) {
+			return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
+		}
+		return nil
+	}
+	if !hasExplicitReasoning(req) {
+		return nil
+	}
+	level := requestedReasoningLevel(req)
+	if !providers.SupportsReasoningLevel(level, caps) || (level == "none" && !caps.CanDisableThinking) {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
+	}
+	return nil
+}
+
+func hasExplicitReasoning(req translate.ChatRequest) bool {
+	raw := bytes.TrimSpace(req.ReasoningEffort)
+	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		return true
+	}
+	return req.EnableThinking != nil || req.EnableReasoning != nil || req.IsReasoning != nil
+}
 
 // officialTopLevelReasoningModels need the 2.132.0 CLI field names. The
 // nested reasoning object that GLM / Hy4 still accept returns no thinking
@@ -23,24 +51,8 @@ var officialTopLevelReasoningModels = map[string]struct{}{
 }
 
 func requestedReasoningLevel(req translate.ChatRequest) string {
-	if len(req.ReasoningEffort) > 0 {
-		var value any
-		if json.Unmarshal(req.ReasoningEffort, &value) == nil {
-			switch typed := value.(type) {
-			case string:
-				if level := providers.NormalizeReasoningLevel(typed); level != "" {
-					return level
-				}
-			case map[string]any:
-				for _, key := range []string{"effort", "level", "type"} {
-					if text, ok := typed[key].(string); ok {
-						if level := providers.NormalizeReasoningLevel(text); level != "" {
-							return level
-						}
-					}
-				}
-			}
-		}
+	if level := requestedReasoningEffort(req.ReasoningEffort); level != "" {
+		return level
 	}
 	if req.EnableThinking != nil {
 		if *req.EnableThinking {
@@ -59,6 +71,29 @@ func requestedReasoningLevel(req translate.ChatRequest) string {
 			return "medium"
 		}
 		return "none"
+	}
+	return ""
+}
+
+func requestedReasoningEffort(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ""
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return providers.NormalizeReasoningLevel(typed)
+	case map[string]any:
+		for _, key := range []string{"effort", "level", "type"} {
+			if text, ok := typed[key].(string); ok {
+				if level := providers.NormalizeReasoningLevel(text); level != "" {
+					return level
+				}
+			}
+		}
 	}
 	return ""
 }

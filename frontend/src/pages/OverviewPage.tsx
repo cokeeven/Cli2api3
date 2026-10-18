@@ -55,6 +55,7 @@ function errorLabel(kind: string, t: (key: string) => string) {
   const keys: Record<string, string> = {
     quota: 'logsKindQuota',
     rate_limit: 'logsKindRateLimit',
+    concurrency_capacity: 'logsKindConcurrencyCapacity',
     auth: 'logsKindAuth',
     not_ready: 'logsKindNotReady',
     unavailable: 'logsKindUnavailable',

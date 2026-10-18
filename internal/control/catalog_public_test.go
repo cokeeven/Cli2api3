@@ -3,7 +3,32 @@ package control
 import (
 	"reflect"
 	"testing"
+
+	"github.com/caigee-cmd/cli2api/internal/providers"
 )
+
+func TestTraeBudgetEvidencePublicModelScope(t *testing.T) {
+	evidence := providers.OutputBudgetEvidence{
+		Status: "observed_ignored", Provider: "trae", Region: "cn",
+		EndpointPath: "/api/agent/v3/llm_utils_chat", Function: "chat_v3",
+		RequestParameter: "max_tokens", TokenBasis: "completion_tokens",
+		EvidenceDate: "2026-10-18", ClientVersion: "3.4.4", ClientBuild: "2.3.93438", AppVersion: "1.107.1",
+	}
+	known := ProviderModelEntry(providers.ModelInfo{PublicModel: "glm-5.3", Capabilities: providers.ModelCapabilities{OutputBudgetEvidence: &evidence}}, "trae")
+	knownEvidence, ok := known["output_budget_evidence"].(*providers.OutputBudgetEvidence)
+	if !ok || knownEvidence.Status != "observed_ignored" || knownEvidence.EndpointPath != evidence.EndpointPath {
+		t.Fatalf("known model evidence = %#v", known["output_budget_evidence"])
+	}
+	unknown := ProviderModelEntry(providers.ModelInfo{PublicModel: "future-model"}, "trae")
+	unknownEvidence, ok := unknown["output_budget_evidence"].(map[string]any)
+	if !ok || unknownEvidence["status"] != "not_tested" {
+		t.Fatalf("untested Trae model evidence = %#v", unknown["output_budget_evidence"])
+	}
+	workbuddy := ProviderModelEntry(providers.ModelInfo{PublicModel: "glm-5.3"}, "workbuddy")
+	if _, exists := workbuddy["output_budget_evidence"]; exists {
+		t.Fatalf("Trae evidence leaked to WorkBuddy: %#v", workbuddy["output_budget_evidence"])
+	}
+}
 
 func TestPublicModelCatalogPreservesAliasesAndDoesNotMutateCache(t *testing.T) {
 	models := []map[string]any{

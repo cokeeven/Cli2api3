@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/auth"
@@ -12,6 +13,15 @@ import (
 )
 
 type chatHTTPError = executor.PrepareError
+
+type requestEnteredKey struct{}
+
+func withGatewayRequestStart(r *http.Request) *http.Request {
+	if _, ok := r.Context().Value(requestEnteredKey{}).(time.Time); ok {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), requestEnteredKey{}, time.Now().UTC()))
+}
 
 type Execution struct {
 	Context            context.Context
@@ -40,6 +50,12 @@ func (h *Handler) PrepareChatExecution(r *http.Request, request translate.ChatRe
 }
 
 func (h *Handler) prepareExecution(r *http.Request, request translate.ChatRequest, native *translate.NativeResponsesRequest) (Execution, error) {
+	enteredAt := time.Now().UTC()
+	if r != nil {
+		if entered, ok := r.Context().Value(requestEnteredKey{}).(time.Time); ok {
+			enteredAt = entered
+		}
+	}
 	var identity auth.Identity
 	if r != nil {
 		identity = h.requestIdentity(r)
@@ -47,10 +63,18 @@ func (h *Handler) prepareExecution(r *http.Request, request translate.ChatReques
 	sessionHeader := ""
 	prefer := ""
 	ctx := context.Background()
+	clientRequestID := ""
+	sourceFingerprint := ""
+	requestPath := ""
 	if r != nil {
 		sessionHeader = r.Header.Get("X-CLI2API-Session")
 		prefer = h.requestedAccount(r)
 		ctx = r.Context()
+		clientRequestID = requestCorrelationID(r)
+		requestPath = normalizedRequestPath(r.URL.Path)
+		if h.SourceFingerprint != nil {
+			sourceFingerprint = h.SourceFingerprint(r)
+		}
 	}
 	var logs executor.RequestStarter
 	if h != nil && h.Logs != nil {
@@ -67,10 +91,14 @@ func (h *Handler) prepareExecution(r *http.Request, request translate.ChatReques
 		catalogs = h.Catalogs
 	}
 	got, err := h.Executor.Prepare(executor.PrepareInput{
-		Context:       ctx,
-		Request:       request,
-		NativeRequest: native,
-		Identity:      identity,
+		Now:               enteredAt,
+		Context:           ctx,
+		Request:           request,
+		NativeRequest:     native,
+		Identity:          identity,
+		ClientRequestID:   clientRequestID,
+		SourceFingerprint: sourceFingerprint,
+		RequestPath:       requestPath,
 
 		PreferAccount:     prefer,
 		SessionHeader:     sessionHeader,
@@ -93,6 +121,40 @@ func (h *Handler) prepareExecution(r *http.Request, request translate.ChatReques
 		ProviderFilter: got.ProviderFilter,
 		Prefer:         got.Prefer,
 	}, nil
+}
+
+// normalizedRequestPath stores only the public protocol route, without query
+// parameters or an arbitrary client-provided path. Unknown routes stay unknown.
+func normalizedRequestPath(path string) string {
+	switch strings.TrimSuffix(strings.TrimSpace(path), "/") {
+	case "/v1/chat/completions":
+		return "openai_chat_completions"
+	case "/v1/responses":
+		return "openai_responses"
+	case "/v1/messages":
+		return "anthropic_messages"
+	default:
+		return ""
+	}
+}
+
+func requestCorrelationID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	value := strings.TrimSpace(r.Header.Get("X-Client-Request-ID"))
+	if value == "" {
+		value = strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	}
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || strings.ContainsRune("-._:", char)) {
+			return ""
+		}
+	}
+	return value
 }
 
 func writeChatHTTPError(w http.ResponseWriter, err error) {

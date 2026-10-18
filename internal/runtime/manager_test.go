@@ -1271,13 +1271,15 @@ func TestStateVersionOrdersAcrossDelayedObserver(t *testing.T) {
 	// Fire A (version 1, message "old"); the observer will block on blockA.
 	go manager.Pool().MarkClassified(account.ID, executor.Classified{
 		Kind: accounts.KindRateLimit, Cooldown: time.Hour,
-		Failover: true, Model: "glm-5.3", Message: "old-snapshot",
+		Failover: true, Model: "glm-5.3", Scope: "model", Code: "SYNTHETIC_OLD",
+		EvidenceSource: "provider_adapter_error", Message: "old-snapshot",
 	})
 	<-startedA
 	// Fire B (version 2, message "new"); it enqueues immediately while A is held.
 	manager.Pool().MarkClassified(account.ID, executor.Classified{
 		Kind: accounts.KindRateLimit, Cooldown: time.Hour,
-		Failover: true, Model: "glm-5.3", Message: "new-snapshot",
+		Failover: true, Model: "glm-5.3", Scope: "model", Code: "SYNTHETIC_NEW",
+		EvidenceSource: "provider_adapter_error", Message: "new-snapshot",
 	})
 	// Release A; its stale snapshot is now enqueued after B's.
 	close(blockA)
@@ -1291,6 +1293,9 @@ func TestStateVersionOrdersAcrossDelayedObserver(t *testing.T) {
 		if row.AccountID == account.ID && row.Model == "glm-5.3" {
 			if row.Message != "new-snapshot" {
 				t.Fatalf("stale snapshot A must be discarded; SQLite has %q, want %q", row.Message, "new-snapshot")
+			}
+			if row.Evidence.Code != "SYNTHETIC_NEW" || row.Evidence.Source != "provider_adapter_error" || row.Evidence.Scope != "model" {
+				t.Fatalf("stale snapshot A overwrote scoped evidence: %+v", row.Evidence)
 			}
 			return
 		}

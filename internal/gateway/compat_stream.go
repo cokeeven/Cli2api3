@@ -188,9 +188,14 @@ func (o *streamedChatOutput) calls() []proxyToolCall {
 	return calls
 }
 
-func consumeOpenAIStream(body io.Reader, handle func(json.RawMessage, *streamedChatOutput) error) (StreamRelayStats, streamedChatOutput, error) {
-	var stats StreamRelayStats
-	var output streamedChatOutput
+func consumeOpenAIStream(body io.Reader, handle func(json.RawMessage, *streamedChatOutput) error) (stats StreamRelayStats, output streamedChatOutput, returnErr error) {
+	contentChars, reasoningChars, toolEventCount := 0, 0, 0
+	defer func() {
+		stats.ContentChars = &contentChars
+		stats.ReasoningChars = &reasoningChars
+		stats.ToolEventCount = &toolEventCount
+		stats.CharCountUnit = "unicode_code_points"
+	}()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSSELineSize)
 	var frame []string
@@ -201,28 +206,37 @@ func consumeOpenAIStream(body io.Reader, handle func(json.RawMessage, *streamedC
 		}
 		eventName, data := parseSSEFrame(frame)
 		frame = nil
+		stats.SSEEventCount++
+		stats.LastEvent = eventName
 		if classified := classifyStreamSSEError(eventName, data); classified != nil {
 			return classified
 		}
 		if strings.TrimSpace(data) == "[DONE]" {
 			sawDone = true
+			stats.SawDone = true
 			return nil
 		}
 		payload := json.RawMessage(strings.TrimSpace(data))
 		if !json.Valid(payload) {
 			return nil
 		}
-		if usage, ok := ParseStreamUsageLine("data: " + string(payload)); ok {
-			usage.FirstTokenAt = stats.FirstTokenAt
-			usage.SawDone = stats.SawDone
-			stats = usage
+		line := "data: " + string(payload)
+		if usage, ok := ParseStreamUsageLine(line); ok {
+			stats = mergeStreamUsage(stats, usage)
 		}
-		beforeContent := output.content.Len()
-		output.add(payload)
-		if stats.FirstTokenAt == nil && output.content.Len() > beforeContent {
+		if finish, ok := ParseStreamFinishReasonLine(line); ok {
+			stats.FinishReason = finish
+			stats.FinishReasonSource = "openai_choice_finish_reason"
+		}
+		contentDelta, reasoningDelta, toolDelta := streamDeltaMetrics(line)
+		contentChars += contentDelta
+		reasoningChars += reasoningDelta
+		toolEventCount += toolDelta
+		if stats.FirstTokenAt == nil && SSEDeltaHasToken(line) {
 			now := time.Now()
 			stats.FirstTokenAt = &now
 		}
+		output.add(payload)
 		return handle(payload, &output)
 	}
 	for scanner.Scan() {

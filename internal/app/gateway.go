@@ -30,6 +30,11 @@ func (a *App) newGateway() *apigateway.Handler {
 			return a.fetchDisplayModels(refresh, accountID, control.CatalogModeMerge)
 		},
 	}
+	fingerprint, err := apigateway.NewSourceFingerprinter(a.Cfg.SourceFingerprintEnabled, a.Cfg.TrustedProxyCIDRs)
+	if err != nil {
+		panic(err)
+	}
+	h.SourceFingerprint = fingerprint
 	if a.Control != nil {
 		h.ModelContexts = a.Control.Settings
 	}

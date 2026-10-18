@@ -53,7 +53,7 @@ type RequestFilter = 'all' | 'ok' | 'incomplete' | 'error' | 'canceled'
 type RuntimeFilter = 'all' | 'info' | 'warn' | 'error'
 type StreamFilter = 'all' | 'stream' | 'sync'
 type TimeRange = 'all' | '1h' | '24h' | '7d' | 'custom'
-type ErrorKindFilter = 'all' | 'quota' | 'rate_limit' | 'auth' | 'not_ready' | 'unavailable' | 'invalid_request' | 'model_not_available'
+type ErrorKindFilter = 'all' | 'quota' | 'rate_limit' | 'concurrency_capacity' | 'auth' | 'not_ready' | 'unavailable' | 'invalid_request' | 'model_not_available'
 
 type DateRangeValue = { start: DateValue; end: DateValue }
 
@@ -189,6 +189,17 @@ function rangeFromPreset(preset: TimeRange) {
 
 export function LogsPage() {
   const { t, lang } = useI18n()
+  const outputBudgetLabel = (status?: string) => {
+    switch (status) {
+      case 'not_tested': return t('logsBudgetNotTested')
+      case 'not_requested': return t('logsBudgetNotRequested')
+      case 'unknown': return t('logsBudgetUnknown')
+      case 'non_comparable': return t('logsBudgetNonComparable')
+      case 'observed_ignored': return t('logsBudgetObservedIgnored')
+      case 'not_exceeded': return t('logsBudgetNotExceeded')
+      default: return t('logsUnknown')
+    }
+  }
   const [accounts, setAccounts] = useState<NonNullable<Overview['accounts']>>([])
   const [models, setModels] = useState<NonNullable<Overview['models']>>([])
   const [tab, setTab] = useState<PageTab>('requests')
@@ -197,7 +208,7 @@ export function LogsPage() {
   const [error, setError] = useState('')
   const [requestFilter, setRequestFilter] = useState<RequestFilter>('all')
   const [runtimeFilter, setRuntimeFilter] = useState<RuntimeFilter>('all')
-  const [requestId, setRequestId] = useState('')
+  const [requestId, setRequestId] = useState(() => new URLSearchParams(window.location.search).get('id') || '')
   const [runtimeQuery, setRuntimeQuery] = useState('')
   const [accountFilter, setAccountFilter] = useState('')
   const [runtimeAccount, setRuntimeAccount] = useState('')
@@ -579,6 +590,7 @@ export function LogsPage() {
                   { id: '', label: t('logsFilterKindAll') },
                   { id: 'quota', label: t('logsKindQuota') },
                   { id: 'rate_limit', label: t('logsKindRateLimit') },
+                  { id: 'concurrency_capacity', label: t('logsKindConcurrencyCapacity') },
                   { id: 'auth', label: t('logsKindAuth') },
                   { id: 'not_ready', label: t('logsKindNotReady') },
                   { id: 'unavailable', label: t('logsKindUnavailable') },
@@ -760,7 +772,7 @@ export function LogsPage() {
                           </Table.Cell>
                           <Table.Cell>
                             <Chip size="sm" variant="soft" color={statusColor(item.status)}>{item.status}</Chip>
-                            {item.error_kind ? <div className="mono mt-1 text-[10px] text-muted">{item.error_kind}</div> : null}
+                            {item.error_kind ? <div className="mono mt-1 text-[10px] text-muted">{item.error_kind === 'concurrency_capacity' ? t('logsKindConcurrencyCapacity') : item.error_kind}</div> : null}
                           </Table.Cell>
                           <Table.Cell><span className="text-xs text-muted">{item.stream ? t('logsStreamYes') : t('logsStreamNo')}</span></Table.Cell>
                           <Table.Cell><span className="mono text-xs">{formatLatency(item.latency_ms)}</span></Table.Cell>
@@ -981,6 +993,14 @@ export function LogsPage() {
                     [t('logsColTTFT'), formatLatency(selected?.ttfb_ms)],
                     [t('logsColStream'), selected?.stream ? t('logsStreamYes') : t('logsStreamNo')],
                     [t('logsRouting'), selected ? routingLabel(selected.routing) : '—'],
+                    [t('logsClientRequestId'), selected?.client_request_id || t('logsUnknown')],
+                    [t('logsSourceFingerprint'), selected?.source_fingerprint || t('logsUnknown')],
+                    [t('logsReasoningRequested'), selected?.requested_reasoning || t('logsUnknown')],
+                    [t('logsReasoningResolved'), selected?.resolved_reasoning || t('logsUnknown')],
+                    [t('logsOutputLimit'), selected?.output_limit_tokens == null ? t('logsUnknown') : selected.output_limit_tokens],
+                    [t('logsOutputLimitSource'), selected?.output_limit_source || t('logsUnknown')],
+                    [t('logsOutputBudgetEnforcement'), outputBudgetLabel(selected?.output_budget_enforcement)],
+                    [t('logsPromptStripped'), selected?.prompt_stripped == null ? t('logsUnknown') : selected.prompt_stripped ? t('logsYes') : t('logsNo')],
                   ].map(([label, value]) => (
                     <div key={String(label)}>
                       <dt className="text-[11px] text-muted">{label}</dt>
@@ -1001,19 +1021,38 @@ export function LogsPage() {
                     </dd>
                   </div>
                 </dl>
-                {selected && selected.message_count ? (
+                {selected ? (
                   <div className="rounded-lg bg-surface-secondary px-3 py-3 text-xs">
                     <div className="font-medium text-muted">{t('logsMessageShape')}</div>
+                    {selected.message_shape_known ? (
+                      <dl className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <div><dt className="text-[10px] text-muted">{t('logsMessageCount')}</dt><dd className="mono mt-0.5">{selected.message_count ?? 0}</dd></div>
+                        <div><dt className="text-[10px] text-muted">{t('logsEmptyMessageIndexes')}</dt><dd className="mono mt-0.5 break-all">{selected.empty_message_indexes?.length ? selected.empty_message_indexes.join(', ') : '—'}</dd></div>
+                        <div className="sm:col-span-2"><dt className="text-[10px] text-muted">{t('logsMessageRoles')}</dt><dd className="mono mt-0.5 break-all">{selected.message_roles?.join(' → ') || '—'}</dd></div>
+                      </dl>
+                    ) : <div className="mt-2 text-muted">{t('logsUnknown')}</div>}
+                  </div>
+                ) : null}
+                {selected?.routing_diagnostic ? (
+                  <div className="rounded-lg bg-surface-secondary px-3 py-3 text-xs">
+                    <div className="font-medium text-muted">{t('logsRouteDiagnostics')}</div>
+                    <div className="mono mt-2">{t('logsRouteCounts', { candidates: selected.routing_diagnostic.initial_candidates, budget: selected.routing_diagnostic.attempt_budget, attempted: selected.routing_diagnostic.attempted })}</div>
+                    <div className="mono mt-1 break-all">{selected.routing_diagnostic.stop_reason} · {selected.routing_diagnostic.final_selection_code || '—'}</div>
+                    {selected.routing_diagnostic.capacity_queue_status ? <div className="mono mt-1">{t('logsCapacityQueue')}: {selected.routing_diagnostic.capacity_queue_status} · {t('logsCapacityQueueWait')}: {selected.routing_diagnostic.capacity_queue_wait_ms ?? 0} ms{selected.routing_diagnostic.capacity_queue_position ? ` · ${t('logsCapacityQueuePosition')}: ${selected.routing_diagnostic.capacity_queue_position}` : ''}</div> : null}
+                    {selected.routing_diagnostic.last_upstream_kind ? <div className="mono mt-1">{t('logsLastUpstreamFailure')}: {selected.routing_diagnostic.last_upstream_kind} / {selected.routing_diagnostic.last_upstream_code} / {selected.routing_diagnostic.last_upstream_scope || t('logsUnknown')}</div> : null}
+                    {!selected.routing_diagnostic.accounts_complete ? <div className="mt-1 text-muted">{t('logsRouteSnapshotIncomplete')}</div> : null}
                     <dl className="mt-2 grid gap-2 sm:grid-cols-2">
-                      <div><dt className="text-[10px] text-muted">{t('logsMessageCount')}</dt><dd className="mono mt-0.5">{selected.message_count}</dd></div>
-                      <div><dt className="text-[10px] text-muted">{t('logsEmptyMessageIndexes')}</dt><dd className="mono mt-0.5 break-all">{selected.empty_message_indexes?.length ? selected.empty_message_indexes.join(', ') : '—'}</dd></div>
-                      <div className="sm:col-span-2"><dt className="text-[10px] text-muted">{t('logsMessageRoles')}</dt><dd className="mono mt-0.5 break-all">{selected.message_roles?.join(' → ') || '—'}</dd></div>
+                      {selected.routing_diagnostic.accounts.map((row) => <div key={row.account_id}>
+                        <dt className="mono text-[10px] text-muted">{row.account_id} · {row.provider}/{row.region}</dt>
+                        <dd className="mono mt-0.5 break-all">{row.reason}{row.failure_kind ? ` · ${row.failure_kind}/${row.failure_code || '—'}` : ''}</dd>
+                        <dd className="mt-0.5 text-muted">{t('logsRouteCatalog')}: {row.catalog_known ? row.catalog_at || t('logsUnknown') : t('logsUnknown')} · {t('quotaSnapshotTime')}: {row.quota_known ? row.quota_at || t('logsUnknown') : t('logsUnknown')}</dd>
+                      </div>)}
                     </dl>
                   </div>
                 ) : null}
                 {selected?.error_message ? (
                   <div className="rounded-lg bg-surface-secondary px-3 py-2 text-xs leading-5 text-muted">
-                    {selected.error_kind ? <span className="mono mr-2 text-muted">{selected.error_kind}</span> : null}
+                    {selected.error_kind ? <span className="mono mr-2 text-muted">{selected.error_kind === 'concurrency_capacity' ? t('logsKindConcurrencyCapacity') : selected.error_kind}</span> : null}
                     {selected.error_message}
                   </div>
                 ) : null}
@@ -1022,12 +1061,30 @@ export function LogsPage() {
                     <div className="font-medium text-muted">{t('logsStreamDiagnostics')}</div>
                     <dl className="mt-2 grid gap-2 sm:grid-cols-2">
                       {[
-                        [t('logsCancellationSource'), selected.stream_diagnostic.cancellation_source || '—'],
-                        [t('logsUpstreamStatus'), selected.stream_diagnostic.upstream_status ?? '—'],
+                        [t('logsCancellationSource'), selected.stream_diagnostic.cancellation_source || t('logsUnknown')],
+                        [t('logsCancellationStage'), selected.stream_diagnostic.cancellation_stage || t('logsUnknown')],
+                        [t('logsTimeoutPhase'), selected.stream_diagnostic.timeout_phase || t('logsUnknown')],
+                        [t('logsUpstreamStatus'), selected.stream_diagnostic.upstream_status ?? t('logsUnknown')],
+                        [t('logsUpstreamFinishReason'), selected.stream_diagnostic.upstream_finish_reason || t('logsUnknown')],
+                        [t('logsOutputBudgetEnforcement'), outputBudgetLabel(selected.stream_diagnostic.output_budget_enforcement)],
+                        [t('logsUpstreamFinishSource'), selected.stream_diagnostic.upstream_finish_reason_source || t('logsUnknown')],
+                        [t('logsExternalFinishReason'), selected.stream_diagnostic.external_finish_reason || t('logsUnknown')],
+                        [t('logsExternalFinishSource'), selected.stream_diagnostic.external_finish_reason_source || t('logsUnknown')],
+                        [t('logsContentChars'), selected.stream_diagnostic.content_chars ?? t('logsUnknown')],
+                        [t('logsReasoningChars'), selected.stream_diagnostic.reasoning_chars ?? t('logsUnknown')],
+                        [t('logsToolEvents'), selected.stream_diagnostic.tool_event_count ?? t('logsUnknown')],
+                        [t('logsCharCountUnit'), selected.stream_diagnostic.char_count_unit || t('logsUnknown')],
+                        [t('logsContentLength'), selected.stream_diagnostic.content_length ?? t('logsUnknown')],
+                        [t('logsPrepareDuration'), formatLatency(selected.stream_diagnostic.prepare_duration_ms)],
+                        [t('logsUpstreamResponseDuration'), formatLatency(selected.stream_diagnostic.upstream_response_duration_ms)],
+                        [t('logsFirstContentDuration'), formatLatency(selected.stream_diagnostic.first_content_duration_ms)],
+                        [t('logsFirstEventDuration'), formatLatency(selected.stream_diagnostic.first_event_duration_ms)],
+                        [t('logsTotalDuration'), formatLatency(selected.stream_diagnostic.total_duration_ms)],
+                        [t('logsUpstreamRequestId'), selected.stream_diagnostic.upstream_request_id || t('logsUnknown')],
                         [t('logsSSEEvents'), selected.stream_diagnostic.sse_event_count],
                         [t('logsBytesRead'), selected.stream_diagnostic.bytes_read],
                         [t('logsLastEvent'), selected.stream_diagnostic.last_event || '—'],
-                        [t('logsStreamComplete'), selected.stream_diagnostic.saw_done ? 'yes' : 'no'],
+                        [t('logsStreamComplete'), selected.stream_diagnostic.saw_done ? t('logsYes') : t('logsNo')],
                       ].map(([label, value]) => (
                         <div key={String(label)}>
                           <dt className="text-[10px] text-muted">{label}</dt>

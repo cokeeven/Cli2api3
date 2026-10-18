@@ -69,9 +69,12 @@ const (
 
 // Credential is the canonical storage payload shape.
 type Credential struct {
-	AccessToken      string `json:"access_token"`
-	RefreshToken     string `json:"refresh_token"`
-	ExpiresAt        int64  `json:"expires_at"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"`
+	// RefreshAfter prevents short-lived tokens from being exchanged repeatedly
+	// when the proactive refresh lead is longer than the token lifetime.
+	RefreshAfter     int64  `json:"refresh_after,omitempty"`
 	RefreshExpiresAt int64  `json:"refresh_expires_at,omitempty"`
 	Domain           string `json:"domain"`
 	APIHost          string `json:"api_host"`
@@ -207,6 +210,12 @@ func (c Credential) needsRefresh(now time.Time) bool {
 	}
 	if c.ExpiresAt <= 0 {
 		return true
+	}
+	if now.Unix() >= c.ExpiresAt {
+		return true
+	}
+	if c.RefreshAfter > now.Unix() {
+		return false
 	}
 	return now.Add(refreshLead).Unix() >= c.ExpiresAt
 }

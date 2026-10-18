@@ -22,6 +22,7 @@ import { SystemPageSkeleton } from '@/components/ui/PageSkeletons'
 import { useI18n } from '@/hooks/useI18n'
 import { CompactSwitch } from '@/components/ui/CompactSwitch'
 import { CheckinDefaults } from '@/components/checkin/CheckinDefaults'
+import { QuotaRefreshSettings } from '@/components/QuotaRefreshSettings'
 import { VersionHistory } from '@/components/VersionHistory'
 import { buildVersionHistory } from '@/lib/versionHistory'
 
@@ -447,6 +448,8 @@ export function SystemPage() {
           </Card>
 
           <CheckinDefaults settings={settings} onSaved={setSettings} />
+
+          <QuotaRefreshSettings settings={settings} onSaved={setSettings} />
 
           <Card data-gsap-reveal>
             <div className="flex items-start justify-between gap-4">

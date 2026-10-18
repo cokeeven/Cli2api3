@@ -309,28 +309,34 @@ func TestNewChatExecutorUsesProxyKeyForInternalDaemon(t *testing.T) {
 	}
 }
 
-// P1#4: when every eligible account is concurrency-saturated, pick must
-// return a rate-limit error (429) so the client gets a clean Retry-After
-// rather than a round-trip into the worker's own 429.
-func TestChatNonStreamAllSaturatedReturnsRateLimit(t *testing.T) {
+// Local admission saturation is not an upstream rate limit and must not
+// create cooldown state on an account.
+func TestChatNonStreamAllSaturatedReturnsLocalCapacity(t *testing.T) {
 	pool := NewPool([]string{"http://127.0.0.1:1", "http://127.0.0.1:2"}, []string{"a", "b"})
 	pool.Upsert(Item{ID: "a", URL: "http://127.0.0.1:1", MaxInFlight: 1})
 	pool.Upsert(Item{ID: "b", URL: "http://127.0.0.1:2", MaxInFlight: 1})
 	pool.MergeHealth("a", true, false, 1, 0, "")
 	pool.MergeHealth("b", true, false, 1, 0, "")
 	ex := NewChatExecutor(pool, "")
+	ex.CapacityQueueMaxWaiters = 0
+	ex.CapacityQueueWait = 0
 	_, err := ex.ChatNonStream(context.Background(), translate.ChatRequest{
 		Model: "glm-5.3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}},
 	}, "", "")
 	if err == nil {
-		t.Fatal("expected a rate-limit error when all accounts are saturated")
+		t.Fatal("expected a local-capacity error when all accounts are saturated")
 	}
 	var classified *ExecutionError
-	if !errors.As(err, &classified) || classified.Classified.Kind != accounts.KindRateLimit || classified.Classified.Status != 429 {
-		t.Fatalf("expected *ExecutionError{rate_limit,429}, got %#v", err)
+	if !errors.As(err, &classified) || classified.Classified.Kind != accounts.KindConcurrencyCapacity || classified.Classified.Status != 429 || classified.Classified.Code != "concurrency_capacity" || classified.Classified.Scope != "local_capacity" {
+		t.Fatalf("expected *ExecutionError{concurrency_capacity,429}, got %#v", err)
 	}
-	if classified.Classified.RetryAfter != 5*time.Second {
-		t.Fatalf("capacity retry-after=%s", classified.Classified.RetryAfter)
+	if classified.Classified.Cooldown != 0 {
+		t.Fatalf("local capacity created cooldown %s", classified.Classified.Cooldown)
+	}
+	for _, item := range pool.Items() {
+		if item.LastKind == accounts.KindRateLimit || len(item.ModelDownUntil) > 0 || !item.DownUntil.IsZero() {
+			t.Fatalf("local capacity affected account state: %+v", item)
+		}
 	}
 }
 

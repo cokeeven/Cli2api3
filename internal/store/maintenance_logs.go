@@ -21,9 +21,10 @@ FROM checkin_records c JOIN accounts a ON a.id=c.account_id
 WHERE c.daily_task_run_id=''
 UNION ALL
 SELECT d.id,d.account_id,a.name,a.provider,a.provider_region,
- 'daily_tasks',CASE WHEN d.trigger='scheduled' AND d.attempt>1 THEN 'retry' ELSE d.trigger END,
+ d.kind,CASE WHEN d.trigger='scheduled' AND d.attempt>1 THEN 'retry' ELSE d.trigger END,
  d.status,'',d.started_at,d.finished_at,d.next_retry_at,d.attempt,d.report_json
 FROM daily_task_runs d JOIN accounts a ON a.id=d.account_id
+WHERE d.kind <> 'checkin'
 `
 
 func (s *Store) RecordCheckinAttempt(ctx context.Context, id, status, message string, at time.Time) error {
@@ -99,7 +100,7 @@ func (s *Store) ListMaintenanceLogs(ctx context.Context, filter accounts.Mainten
 			at := time.Unix(0, retry).UTC()
 			item.NextRetryAt = &at
 		}
-		if item.Kind == "daily_tasks" {
+		if item.Kind != "checkin" {
 			var report providers.DailyTasksReport
 			if err = json.Unmarshal([]byte(payload), &report); err != nil {
 				rows.Close()

@@ -5,14 +5,15 @@ import (
 )
 
 const (
-	KindQuota             = "quota"
-	KindRateLimit         = "rate_limit"
-	KindAuth              = "auth"
-	KindNotReady          = "not_ready"
-	KindUnavailable       = "unavailable"
-	KindInvalidRequest    = "invalid_request"
-	KindModelNotAvailable = "model_not_available"
-	KindCanceled          = "canceled"
+	KindQuota               = "quota"
+	KindRateLimit           = "rate_limit"
+	KindAuth                = "auth"
+	KindNotReady            = "not_ready"
+	KindUnavailable         = "unavailable"
+	KindInvalidRequest      = "invalid_request"
+	KindModelNotAvailable   = "model_not_available"
+	KindCanceled            = "canceled"
+	KindConcurrencyCapacity = "concurrency_capacity"
 )
 
 // BackoffMaxLevel caps the exponential backoff ladder applied to repeated

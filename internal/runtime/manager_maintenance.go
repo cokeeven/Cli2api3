@@ -78,6 +78,10 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 		}
 		return updated, err
 	}
+	run, leaseErr := manager.claimMaintenance(ctx, accountID, "checkin", manual)
+	if leaseErr != nil {
+		return account, leaseErr
+	}
 	result, checkErr := adapter.Checkin.Checkin(ctx, accountID)
 	if checkErr == nil && !result.Valid() {
 		checkErr = fmt.Errorf("provider returned an invalid check-in result")
@@ -85,6 +89,7 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 	if checkErr != nil {
 		result = providers.CheckinResult{Status: "error", Message: checkErr.Error()}
 	}
+	checkErr = manager.finishMaintenance(ctx, run, checkErr, 0)
 	recordCtx, stopRecording := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	recordErr := manager.store.RecordCheckin(recordCtx, accountID, result.Status, result.Message, time.Now().UTC())
 	stopRecording()
@@ -104,10 +109,12 @@ func (manager *Manager) refreshCheckinQuota(ctx context.Context, accountID strin
 	if ctx.Err() != nil {
 		return
 	}
-	if adapter.Prober != nil {
-		manager.fetchProviderQuota(ctx, accountID, adapter.Prober)
-	} else if workerURL, found := manager.AccountURL(accountID); found {
-		manager.fetchQuota(ctx, accountID, workerURL, true)
+	if item, found := manager.pool.ByID(accountID); found {
+		if adapter.ID == "" || adapter.ID == item.Provider {
+			if err := manager.refreshQuota(ctx, item, true, true); err != nil {
+				log.Printf("check-in quota refresh failed account=%s provider=%s", accountID, item.Provider)
+			}
+		}
 	}
 }
 
@@ -297,6 +304,15 @@ func (manager *Manager) KeepaliveWorkBuddy(ctx context.Context, onlyOptIn bool) 
 	if manager == nil || manager.workbuddy == nil {
 		return
 	}
+	ctx, cancel, enabled := manager.automaticMaintenanceContext(ctx)
+	if !enabled {
+		return
+	}
+	defer cancel()
+	schedule, scheduleErr := accounts.LoadMaintenanceSchedule(ctx, manager.store)
+	if scheduleErr != nil || !schedule.CredentialEnabled {
+		return
+	}
 	items, err := manager.store.List(ctx)
 	if err != nil {
 		log.Printf("workbuddy keepalive list: %v", err)
@@ -309,8 +325,8 @@ func (manager *Manager) KeepaliveWorkBuddy(ctx context.Context, onlyOptIn bool) 
 		if account.Provider != "workbuddy" || !account.Enabled || (onlyOptIn && !account.AutoCheckin) {
 			continue
 		}
-		if err := manager.workbuddy.Keepalive(ctx, account.ID); err != nil {
-			log.Printf("workbuddy keepalive account=%s: %v", account.ID, err)
+		if err := manager.maintainCredential(ctx, account.ID, false); err != nil && !errors.Is(err, accounts.ErrDailyTasksNotDue) && !errors.Is(err, accounts.ErrDailyTasksBusy) {
+			log.Printf("workbuddy keepalive account=%s failed", account.ID)
 		}
 	}
 }
@@ -327,23 +343,18 @@ func (manager *Manager) RunMaintenanceLoop(stop <-chan struct{}) {
 	}()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	lastKeepaliveDay := ""
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		now := time.Now()
 		manager.runScheduledCheckins(ctx, now)
-		day := now.Format("2006-01-02")
-		if now.Hour() >= 22 && lastKeepaliveDay != day {
-			keepaliveCtx, stopKeepalive := context.WithTimeout(ctx, 2*time.Minute)
-			manager.KeepaliveWorkBuddy(keepaliveCtx, true)
-			stopKeepalive()
-			lastKeepaliveDay = day
-		}
-		if now.Hour() >= 22 {
+		manager.maintainDueCredentials(ctx)
+		schedule, scheduleErr := accounts.LoadMaintenanceSchedule(ctx, manager.store)
+		if scheduleErr == nil && schedule.DailyEnabled && now.Format("15:04") >= schedule.DailyTime {
 			manager.startDailyWorkBuddyBatch()
 		}
+		manager.refreshDueQuotas(ctx, now)
 		manager.sampleResources()
 		select {
 		case <-ctx.Done():

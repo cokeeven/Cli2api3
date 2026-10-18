@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
 
@@ -37,7 +38,7 @@ func (e ChatExecutor) executionContext(ctx context.Context) (context.Context, co
 	if duration <= 0 {
 		duration = 5 * time.Minute
 	}
-	return context.WithTimeout(ctx, duration)
+	return context.WithTimeoutCause(providers.WithChatTimeouts(ctx, e.ChatTimeouts), duration, &providers.ChatTimeoutError{Phase: "total"})
 }
 func (l *routeLoop) routeReason(e ChatExecutor) string {
 	if l.routing.Source == routingStickyEscape {
@@ -182,8 +183,11 @@ func (l *routeLoop) finishAttempt(e ChatExecutor, result *ChatResult, completion
 	l.reservation = ""
 	if result != nil {
 		if result.UsageSource == "upstream" || result.UsageSource == "provider" {
-			tokens := int64(result.PromptTokens + result.CompletionTokens)
-			settlement.ActualTokens = &tokens
+			prompt, completion := result.UsageTokenEvidence()
+			if prompt != nil && completion != nil {
+				tokens := int64(*prompt + *completion)
+				settlement.ActualTokens = &tokens
+			}
 		}
 		settlement.ActualCredits = result.ConsumedCredits
 		if settlement.ActualCredits == nil {
@@ -212,6 +216,7 @@ func (l *routeLoop) finishAttempt(e ChatExecutor, result *ChatResult, completion
 
 type finalizedBody struct {
 	io.ReadCloser
+	ctx           context.Context
 	fallback      func()
 	release       func()
 	once          sync.Once
@@ -221,6 +226,9 @@ type finalizedBody struct {
 
 func (b *finalizedBody) Read(data []byte) (int, error) {
 	n, err := b.ReadCloser.Read(data)
+	if b.ctx != nil {
+		err = providers.ChatContextError(b.ctx, err)
+	}
 	if err != nil {
 		b.release()
 	}
@@ -233,11 +241,33 @@ func (b *finalizedBody) closeTransport() error {
 }
 func (b *finalizedBody) Close() error { err := b.closeTransport(); b.once.Do(b.fallback); return err }
 
+func (b *finalizedBody) ChatStreamObservation() providers.ChatStreamObservation {
+	if observer, ok := b.ReadCloser.(providers.ChatStreamObserver); ok {
+		return observer.ChatStreamObservation()
+	}
+	return providers.ChatStreamObservation{}
+}
+
+func (b *finalizedBody) SoloStreamFinishReason() (string, string, string, string) {
+	metadata, ok := b.ReadCloser.(interface {
+		SoloStreamFinishReason() (string, string, string, string)
+	})
+	if !ok {
+		return "", "", "", ""
+	}
+	return metadata.SoloStreamFinishReason()
+}
+
 func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequest, result *StreamResult, loop *routeLoop, item Item, index int) {
 	lease := *loop
 	loop.release = nil
 	loop.reservation = ""
 	loop.cancel = nil
+	if lease.release != nil {
+		release := lease.release
+		var releaseOnce sync.Once
+		lease.release = func() { releaseOnce.Do(release) }
+	}
 	var once sync.Once
 	var body *finalizedBody
 	var stopCancel atomic.Pointer[func() bool]
@@ -246,7 +276,14 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 			if lease.cancel != nil {
 				defer lease.cancel()
 			}
-			defer func() { lease.finishAttempt(e, nil, &completion, completion.Completed && completion.Err == nil) }()
+			defer func() {
+				lease.finishAttempt(e, nil, &completion, completion.Completed && completion.Err == nil)
+				stop := "stream_completed"
+				if completion.Err != nil || !completion.Completed {
+					stop = "stream_failed"
+				}
+				lease.finishRouting(e, completion.Err, stop)
+			}()
 			if stop := stopCancel.Load(); stop != nil {
 				(*stop)()
 			}
@@ -268,6 +305,10 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 				}
 				lease.lastErr = completion.Err
 				classified := ClassifyError(completion.Err)
+				e.observeFailedRoute(&lease, item, classified)
+				if requestContextDone(ctx, completion.Err) {
+					attempt.Status = accounts.AttemptStatusCanceled
+				}
 				attempt.ErrorScope = classified.Scope
 				attempt.ErrorKind = classified.Kind
 				attempt.ErrorMessage = truncateErr(completion.Err.Error())
@@ -275,7 +316,7 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 					e.ObserveStreamFailure(item.ID, completion.Err, req.Model)
 				}
 			}
-			e.recordAttempt(ctx, attempt)
+			e.recordAttempt(ctx, attempt, completion.Err)
 		})
 	}
 	if result.Response != nil && result.Response.Body != nil {
@@ -283,9 +324,15 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 		if release == nil {
 			release = func() {}
 		}
-		body = &finalizedBody{ReadCloser: result.Response.Body, release: release, fallback: func() { result.Finalize(StreamCompletion{}) }}
+		body = &finalizedBody{ReadCloser: result.Response.Body, ctx: ctx, release: release, fallback: func() { result.Finalize(StreamCompletion{}) }}
 		result.Response.Body = body
-		stop := context.AfterFunc(ctx, func() { _ = body.Close() })
+		// Cancellation must unblock the upstream read without consuming the
+		// one-shot fallback finalizer. The gateway still needs to relay any
+		// usage snapshot already read before it records the canceled result.
+		stop := context.AfterFunc(ctx, func() {
+			_ = body.closeTransport()
+			body.release()
+		})
 		stopCancel.Store(&stop)
 	} else {
 		result.Finalize(StreamCompletion{Err: StreamIncompleteError()})

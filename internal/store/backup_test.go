@@ -286,6 +286,16 @@ func TestPublishedMigrationsKeepOrderedFilenameAndSQLDigest(t *testing.T) {
 		{"025_usage_guards_routing.sql", "520a1df174cb3e7fe6e7d04a8b0c2414d7bde20d22f2dd087f86bf9dad1dd64c"},
 		{"026_attempt_usage_routing.sql", "a6ae5249dd1e2c1727d72e515e07f11ae5702ced9264ad0a7e12d34d0d53760f"},
 		{"027_usage_balance_reconciliation.sql", "2f03c55aa6fe9599a640a522b18c168bae0938c46b55ab738413fb882ff7150c"},
+		{"028_request_diagnostics.sql", "e54efe51bd37b2d8560f7b110c7fba183b7eac8f4b8dbb0ece321bb8729b0cfd"},
+		{"029_chat_deadlines.sql", "531c110a85b992651a27baee72155cf12cfa100504ffc779a7689b4c87960c56"},
+		{"030_request_source_fingerprint.sql", "ba651fcf96b7eab3958d75ba79f1531d15241b47fe0db57e265b3d8a299fd46c"},
+		{"031_maintenance_task_kinds.sql", "51c31a9b310347c9999d2beb74e1dcf15b78771745bed2308f038fde04aac3df"},
+		{"032_request_routing_diagnostic.sql", "d157ad234e7e47f336017a63075d35e02f5bee191fd48cf63e90950ce0800838"},
+		{"033_model_usage_observation.sql", "d7887be18df0fc590fc9745764e52b63de86fe6ba1c507d0b02375b316160629"},
+		{"034_request_finish_reason.sql", "a6a840a8d2230a67abe65c7cdb1acabc6d37c24f78f2be46c3d53f2d1db98228"},
+		{"035_request_path.sql", "5684e4044bd92e4c798db90beef3675ac4a0f963c1315158929328df1dc84f3c"},
+		{"036_output_budget_evidence.sql", "4e6e436579e93835ae84ac4660381de0335a4a2460d0e7b984dfbca39b3b466d"},
+		{"037_cooldown_evidence.sql", "f92849fd2be7ddbedb84df79b85da4f6aa075429658aaeefd0bb151c28a628b2"},
 	}
 	if len(sqliteMigrations) != len(want) {
 		t.Fatalf("migration count = %d, want %d", len(sqliteMigrations), len(want))

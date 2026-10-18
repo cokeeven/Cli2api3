@@ -9,6 +9,19 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 )
 
+func (a *Accounts) MaintainCredential(ctx context.Context, id string) error {
+	runtime, ok := a.runtime.(interface {
+		MaintainCredentialAccount(context.Context, string) error
+	})
+	if !ok {
+		return operationError("provider_unsupported", "credential maintenance unavailable")
+	}
+	if err := runtime.MaintainCredentialAccount(ctx, id); err != nil {
+		return operationError("maintenance_failed", "credential maintenance failed; see maintenance history")
+	}
+	return nil
+}
+
 func (a *Accounts) ListMaintenanceLogs(ctx context.Context, filter accounts.MaintenanceLogFilter) (accounts.MaintenanceLogPage, error) {
 	store, ok := a.store().(accounts.MaintenanceLogStore)
 	if !ok {

@@ -227,6 +227,25 @@ func (a *SessionAffinity) Forget(key string) {
 	}
 }
 
+// ForgetVersion cannot remove a newer concurrent successful migration.
+func (a *SessionAffinity) ForgetVersion(key, accountID string, version uint64) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	element, ok := a.entries[key]
+	if !ok {
+		return false
+	}
+	binding := element.Value.(sessionBinding)
+	if binding.accountID != accountID || binding.version != version {
+		return false
+	}
+	a.remove(element)
+	return true
+}
+
 func (a *SessionAffinity) remove(element *list.Element) {
 	if element == nil {
 		return

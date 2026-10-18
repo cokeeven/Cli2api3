@@ -44,6 +44,11 @@ TypeScript sources directly, and run through `node --test
 --experimental-strip-types`. Add a case there when a change fixes a wizard or
 policy behaviour that would otherwise only be covered by hand.
 
+WorkBuddy/Trae chat limits, timeout phases, usage semantics, optional source
+diagnostics and maintenance controls are described in
+[CHAT_DIAGNOSTICS.md](CHAT_DIAGNOSTICS.md). Local fixture tests and authorized
+real-account evidence must be reported separately.
+
 The Qoder worker pins `undici` in `worker/package.json`. Keep `npm audit` clean:
 the pin is exact, so a security fix means a new exact version in the same major
 plus a worker test run.

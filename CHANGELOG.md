@@ -3,6 +3,16 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.10 - 2026-10-19
+
+### English
+
+- Public `/v1/models` listings expose the enabled Trae Max output and prompt limits through their standard capacity fields while preserving the console's separate default and Max values.
+
+### 中文
+
+- Trae Max 档启用时，公共 `/v1/models` 会通过标准容量字段返回对应的输出与提示词上限，同时保留控制台的默认档和 Max 档数值。
+
 ## 0.1.9 - 2026-10-19
 
 ### English

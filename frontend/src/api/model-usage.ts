@@ -153,7 +153,7 @@ export type ModelUsageResponse = {
   }
   accounts: ModelUsageAccount[]
   routes: { provider: string; region: string; model: string; candidates: RouteCandidate[] }[]
-  workbuddy_budgets: BudgetEstimate[]
+  workbuddy_budgets: BudgetEstimate[] | null
   budget_observation_complete: boolean
   source: string
 }

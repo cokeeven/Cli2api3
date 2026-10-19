@@ -114,7 +114,8 @@ function usageCoverage(row: ModelUsageRow) {
 }
 
 function budgetFor(data: ModelUsageResponse | null, row: ModelUsageRow): BudgetEstimate | undefined {
-	const matches = data?.workbuddy_budgets.filter((item) => item.account_id === row.account_id && item.region === row.region && item.model === row.model) || []
+	if (row.provider !== 'workbuddy') return undefined
+	const matches = (data?.workbuddy_budgets ?? []).filter((item) => item.account_id === row.account_id && item.region === row.region && item.model === row.model)
 	return matches.length === 1 ? matches[0] : undefined
 }
 
@@ -200,6 +201,7 @@ export function ModelUsagePage() {
   const schedulable = candidateList.filter(({ candidate }) => candidate.schedulable).length
   const routeTotal = candidateList.length
   const accountNames = useMemo(() => new Map((data?.accounts || []).map((item) => [item.id, item.name || item.id])), [data])
+  const workbuddyBudgets = data?.workbuddy_budgets ?? []
 
   async function runProbe() {
     if (!account || !model || probeBusy) return
@@ -327,7 +329,7 @@ export function ModelUsagePage() {
         <Card>
           <Card.Header className="px-4 pt-4"><Card.Title>{t('modelUsageBudgetTitle')}</Card.Title><Card.Description>{t('modelUsageBudgetHint')}</Card.Description></Card.Header>
           <Card.Content className="space-y-2 p-4 pt-2">
-            {!provider || provider === 'workbuddy' ? (data?.workbuddy_budgets || []).length ? data?.workbuddy_budgets.map((item) => <BudgetRow key={workbuddyBudgetKey(item)} item={item} accountName={accountNames.get(item.account_id) || item.account_id} lang={lang} t={t} />) : <div className="rounded-xl border border-border bg-surface-secondary p-3 text-sm text-muted">{t('modelUsageBudgetUnknown')}</div> : <div className="rounded-xl border border-border bg-surface-secondary p-3 text-sm text-muted">{t('modelUsageTraeBudgetUnknown')}</div>}
+            {!provider || provider === 'workbuddy' ? workbuddyBudgets.length ? workbuddyBudgets.map((item) => <BudgetRow key={workbuddyBudgetKey(item)} item={item} accountName={accountNames.get(item.account_id) || item.account_id} lang={lang} t={t} />) : <div className="rounded-xl border border-border bg-surface-secondary p-3 text-sm text-muted">{t('modelUsageBudgetUnknown')}</div> : <div className="rounded-xl border border-border bg-surface-secondary p-3 text-sm text-muted">{t('modelUsageTraeBudgetUnknown')}</div>}
             {data?.data.budget_observation_from ? <p className="text-[10px] text-muted">{t('modelUsageObservationRange', { from: formatDate(data.data.budget_observation_from, lang), to: formatDate(data.data.to, lang) })}</p> : null}
             <p className="text-[11px] leading-5 text-muted">{t('modelUsageBudgetCaveat')}</p>
             {data?.data.budget_observations_truncated ? <PageAlert status="warning" title={t('modelUsageBudgetTruncated')} /> : null}

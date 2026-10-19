@@ -72,6 +72,30 @@ func TestModelUsageHandlerReadsBoundedLocalDataAndRouteReasons(t *testing.T) {
 	}
 }
 
+func TestModelUsageBudgetsAreJSONArrayWhenProviderExcludesWorkBuddy(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "usage-trae.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recorder := logs.NewRequestRecorder(db)
+	defer recorder.Close()
+	handler := &Handler{Recorder: recorder}
+	response := httptest.NewRecorder()
+	handler.HandleModelUsage(response, httptest.NewRequest(http.MethodGet, "/api/model-usage?provider=trae", nil).WithContext(ctx))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(body["workbuddy_budgets"])); got != "[]" {
+		t.Fatalf("Trae responses must serialize the inapplicable WorkBuddy budget collection as [], got %q", got)
+	}
+}
+
 func TestModelUsageRoutesIncludeCurrentCatalogWithoutRequestHistory(t *testing.T) {
 	ready := true
 	pool := executor.NewPool(nil, nil)

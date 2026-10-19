@@ -100,7 +100,7 @@ func (h *Handler) HandleModelUsage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "model_usage_failed", "读取模型用量失败")
 		return
 	}
-	var budgets []accounts.WorkBuddyBudgetEstimate
+	budgets := make([]accounts.WorkBuddyBudgetEstimate, 0)
 	if !strings.EqualFold(provider, "trae") {
 		allBudgets := accounts.EstimateWorkBuddyBudgetsInRange(data.BudgetObservations, data.To, data.BudgetObservationFrom, data.BudgetObservationsTruncated)
 		for _, budget := range allBudgets {

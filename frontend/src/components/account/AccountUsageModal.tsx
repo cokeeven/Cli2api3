@@ -10,6 +10,7 @@ import { FormRow } from '@/components/ui/FormRow'
 import { PageAlert } from '@/components/ui/PageAlert'
 import { SkeletonBlock } from '@/components/ui/PageSkeletons'
 import { formatQuotaAmount, type AccountRow } from '@/lib/account'
+import { gatewayConfirmedCredits, officialAccountCredits, type CreditsDisplay } from '@/lib/usageCredits'
 import { usagePolicyWithModels, validateUsagePolicy, type ModelTokenLimit } from '@/lib/usagePolicy'
 import { UsageAnalysisDetails } from './UsageAnalysisDetails'
 
@@ -20,6 +21,17 @@ function timeLabel(value?: string | number) {
   if (!value) return '—'
   const date = new Date(typeof value === 'number' ? value * 1000 : value)
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
+}
+
+function creditsLabel(value: CreditsDisplay, t: Translate) {
+  return value.kind === 'unknown' ? t('usageUnknown') : formatQuotaAmount(value.amount)
+}
+
+function creditsStatusLabel(value: CreditsDisplay, t: Translate) {
+  if (value.kind === 'amount') return t('usageCreditsComplete')
+  if (value.kind === 'partial') return t('usageCreditsPartial')
+  if (value.kind === 'stale') return t('usageCreditsStale')
+  return t('usageUnknown')
 }
 
 export function AccountUsageModal({ account, guardrails, t, onClose }: { account: AccountRow; guardrails?: { token_bound: boolean; credit_bound: boolean; note?: string }; t: Translate; onClose: () => void }) {
@@ -34,6 +46,7 @@ export function AccountUsageModal({ account, guardrails, t, onClose }: { account
   const [reconcileOpen, setReconcileOpen] = useState(false)
   const [reconcileNotice, setReconcileNotice] = useState('')
   const [refreshingBalance, setRefreshingBalance] = useState(false)
+  const isTrae = account.provider === 'trae'
 
   async function load(nextDays = days) {
     setLoading(true)
@@ -108,6 +121,9 @@ export function AccountUsageModal({ account, guardrails, t, onClose }: { account
     finally { setRefreshingBalance(false) }
   }
 
+  const officialCredits = officialAccountCredits(usage?.trae_official_credits)
+  const gatewayCredits = usage ? gatewayConfirmedCredits(usage.today) : { kind: 'unknown' as const }
+
   return <Modal.Root isOpen onOpenChange={(open: boolean) => { if (!open && !saving) onClose() }}>
     <Modal.Backdrop variant="blur">
       <Modal.Container size="lg" placement="center" scroll="inside">
@@ -129,15 +145,33 @@ export function AccountUsageModal({ account, guardrails, t, onClose }: { account
             </div>
             {loading ? <div className="space-y-3" aria-busy><SkeletonBlock className="h-24 w-full" /><SkeletonBlock className="h-44 w-full" /></div> : usage ? <>
               <dl className="grid grid-cols-2 gap-3 rounded-lg bg-surface-secondary p-3 sm:grid-cols-3">
-                {[
+                {([
                   [t('usageAvailable'), usage.quota.known ? `${formatQuotaAmount(usage.quota.available)} ${usage.quota.unit || ''}`.trim() : t('usageUnknown')],
                   [t('usageTodayTokens'), formatQuotaAmount(usage.today.tokens_actual)],
-                  [t('usageTodayCredits'), formatQuotaAmount(usage.today.credits_actual)],
+                  ...(isTrae ? [] : [[t('usageTodayCredits'), formatQuotaAmount(usage.today.credits_actual)]]),
                   [t('usageReservedTokens'), formatQuotaAmount(usage.today.tokens_reserved)],
                   [t('usageReservedCredits'), formatQuotaAmount(usage.today.credits_reserved)],
                   [t('usageUnknownAttempts'), String(usage.today.unknown_attempts ?? 0)],
-                ].map(([label, value]) => <div key={label}><dt className="text-[11px] text-muted">{label}</dt><dd className="mono mt-1 text-base font-medium">{value}</dd></div>)}
+                ] as Array<[string, string]>).map(([label, value]) => <div key={label}><dt className="text-[11px] text-muted">{label}</dt><dd className="mono mt-1 text-base font-medium">{value}</dd></div>)}
               </dl>
+              {isTrae ? <section className="space-y-3 rounded-lg border border-border bg-surface p-3" aria-label={t('usageTraeCreditsTitle')}>
+                <h3 className="text-sm font-medium">{t('usageTraeCreditsTitle')}</h3>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <article className="space-y-1.5 rounded-lg bg-surface-secondary p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-xs font-medium">{t('usageTraeOfficialCredits')}</h4><Chip size="sm" variant="soft" color={officialCredits.kind === 'amount' ? 'success' : 'warning'}>{creditsStatusLabel(officialCredits, t)}</Chip></div>
+                    <p className="mono text-base font-medium">{creditsLabel(officialCredits, t)}</p>
+                    <p className="text-[11px] leading-5 text-muted">{officialCredits.kind === 'unknown' ? t('usageTraeOfficialHint') : officialCredits.kind === 'partial' ? t('usageTraeOfficialPartial', { count: officialCredits.unknownCount }) : officialCredits.kind === 'stale' ? t('usageTraeOfficialStaleHint') : t('usageTraeOfficialCompleteHint')}</p>
+                    {usage.trae_official_credits?.fetched_at ? <p className="text-[10px] text-muted">{t('usageTraeOfficialFetchedAt', { time: timeLabel(usage.trae_official_credits.fetched_at) })}</p> : null}
+                  </article>
+                  <article className="space-y-1.5 rounded-lg bg-surface-secondary p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-xs font-medium">{t('usageTraeGatewayCredits')}</h4><Chip size="sm" variant="soft" color={gatewayCredits.kind === 'amount' ? 'success' : 'warning'}>{gatewayCredits.kind === 'amount' ? t('usageCreditsComplete') : gatewayCredits.kind === 'partial' ? t('usageCreditsPartial') : t('usageUnknown')}</Chip></div>
+                    <p className="mono text-base font-medium">{creditsLabel(gatewayCredits, t)}</p>
+                    <p className="text-[11px] leading-5 text-muted">{usage.today.credits_known_attempts + usage.today.credits_unknown_attempts === 0 ? t('usageTraeGatewayNoRows') : t('usageTraeGatewayHint', { known: usage.today.credits_known_attempts, unknown: usage.today.credits_unknown_attempts })}</p>
+                    {gatewayCredits.kind === 'partial' ? <p className="text-[11px] leading-5 text-muted">{t('usageTraeGatewayPartial', { count: gatewayCredits.unknownCount })}</p> : null}
+                  </article>
+                </div>
+                <p className="text-[11px] leading-5 text-muted">{t('usageTraeCreditsWindow', { day: usage.day })}</p>
+              </section> : null}
               <p className="text-xs leading-5 text-muted">{t('usageAccuracyHint', { estimated: usage.today.estimated_attempts ?? 0, unknown: usage.today.unknown_attempts ?? 0 })}</p>
               {usage.quota.unit === 'credits' && ((usage.credit_balance_pending ?? 0) > 0 || (usage.credit_balance_unbounded ?? 0) > 0) ? <section className="space-y-2">
                 <p className="text-xs leading-5 text-muted">{t('usagePendingBalance', { amount: formatQuotaAmount(usage.credit_balance_pending), count: usage.credit_balance_unbounded ?? 0 })}</p>
@@ -158,8 +192,11 @@ export function AccountUsageModal({ account, guardrails, t, onClose }: { account
                 </Table.Content></Table.ScrollContainer></Table> : null}
               </section>
               <Table><Table.ScrollContainer><Table.Content aria-label={t('usageHistory')}>
-                <Table.Header><Table.Column isRowHeader>{t('usageDay')}</Table.Column><Table.Column>{t('usageTokensActual')}</Table.Column><Table.Column>{t('usageCreditsActual')}</Table.Column><Table.Column>{t('usageEstimated')}</Table.Column><Table.Column>{t('usageUnknown')}</Table.Column></Table.Header>
-                <Table.Body>{usage.series.map((row) => <Table.Row key={row.day}><Table.Cell><span className="mono text-xs">{row.day}</span></Table.Cell><Table.Cell><span className="mono text-xs">{formatQuotaAmount(row.tokens_actual)}</span></Table.Cell><Table.Cell><span className="mono text-xs">{formatQuotaAmount(row.credits_actual)}</span></Table.Cell><Table.Cell><span className="mono text-xs">{row.estimated_attempts}</span></Table.Cell><Table.Cell><span className="mono text-xs">{row.unknown_attempts}</span></Table.Cell></Table.Row>)}</Table.Body>
+                <Table.Header><Table.Column isRowHeader>{t('usageDay')}</Table.Column><Table.Column>{t('usageTokensActual')}</Table.Column><Table.Column>{isTrae ? t('usageTraeGatewayCreditsShort') : t('usageCreditsActual')}</Table.Column><Table.Column>{t('usageEstimated')}</Table.Column><Table.Column>{isTrae ? t('usageCreditsUnknownAttempts') : t('usageUnknown')}</Table.Column></Table.Header>
+                <Table.Body>{usage.series.map((row) => {
+                  const rowCredits = gatewayConfirmedCredits(row)
+                  return <Table.Row key={row.day}><Table.Cell><span className="mono text-xs">{row.day}</span></Table.Cell><Table.Cell><span className="mono text-xs">{formatQuotaAmount(row.tokens_actual)}</span></Table.Cell><Table.Cell><span className="mono text-xs">{isTrae ? creditsLabel(rowCredits, t) : formatQuotaAmount(row.credits_actual)}</span>{isTrae && rowCredits.kind === 'partial' ? <p className="text-[10px] text-muted">{t('usageTraeGatewayPartial', { count: rowCredits.unknownCount })}</p> : null}</Table.Cell><Table.Cell><span className="mono text-xs">{row.estimated_attempts}</span></Table.Cell><Table.Cell><span className="mono text-xs">{isTrae ? row.credits_unknown_attempts : row.unknown_attempts}</span></Table.Cell></Table.Row>
+                })}</Table.Body>
               </Table.Content></Table.ScrollContainer></Table>
               <p className="text-[11px] leading-5 text-muted">{usage.recording_since ? t('usageRecordingSince', { time: timeLabel(usage.recording_since) }) : t('usageNotRecorded')}</p>
               <UsageAnalysisDetails usage={usage} t={t} />

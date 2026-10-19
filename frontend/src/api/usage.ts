@@ -14,9 +14,25 @@ export type DailyUsage = {
   tokens_reserved: number
   credits_actual: number
   credits_reserved: number
+  credits_known_attempts: number
+  credits_unknown_attempts: number
+  credits_coverage: 'no_data' | 'unknown' | 'partial' | 'complete' | string
   unknown_attempts: number
   estimated_attempts: number
   attempts: number
+}
+
+export type TraeOfficialCredits = {
+  status: 'unknown' | 'partial' | 'complete' | 'stale' | 'error' | string
+  scope: string
+  day: string
+  time_zone: string
+  unit: string
+  source: string
+  reason?: string
+  credits?: number | null
+  unknown_records?: number
+  fetched_at?: string
 }
 
 export type AccountUsage = {
@@ -26,6 +42,7 @@ export type AccountUsage = {
   policy: AccountUsagePolicy
   day: string
   today: DailyUsage
+  trae_official_credits?: TraeOfficialCredits
   quota: {
     known?: boolean
     unit?: string

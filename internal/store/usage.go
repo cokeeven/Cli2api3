@@ -323,6 +323,18 @@ func (s *Store) GetUsageAnalysis(ctx context.Context, id string, days int) (acco
 	now := time.Now()
 	out := accounts.UsageAnalysis{AccountID: id, Policy: p, Day: accounts.UsageDayKey(now), Quota: analyzeQuota(a.Quota, now), Series: []accounts.UsageDay{}, QuotaHistory: []accounts.QuotaHistoryPoint{}, GuardStates: []accounts.UsageGuardState{}}
 	out.Today.Day = out.Day
+	out.Today.SetCreditsCoverage()
+	if strings.EqualFold(a.Provider, "trae") {
+		out.TraeOfficialCredits = &accounts.TraeOfficialCredits{
+			Status:   "unknown",
+			Scope:    "official_account",
+			Day:      out.Day,
+			TimeZone: "Asia/Shanghai",
+			Unit:     "credits",
+			Source:   "trae_official_daily_ledger",
+			Reason:   "no_verified_daily_ledger",
+		}
+	}
 	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(credit_upper_bound),0),COALESCE(SUM(CASE WHEN credit_upper_bound IS NULL THEN 1 ELSE 0 END),0) FROM usage_reservations WHERE account_id=? AND actual_credits IS NULL AND covered_by_snapshot='' AND state!='abandoned'`, id).Scan(&out.CreditBalancePending, &out.CreditBalanceUnbounded); err != nil {
 		return out, err
 	}
@@ -332,16 +344,17 @@ func (s *Store) GetUsageAnalysis(ctx context.Context, id string, days int) (acco
 		return out, err
 	}
 	out.RecordingSince = since.String
-	rows, err := s.db.QueryContext(ctx, `SELECT day,COALESCE(SUM(actual_tokens),0),COALESCE(SUM(CASE WHEN actual_tokens IS NULL THEN estimated_tokens ELSE 0 END),0),COALESCE(SUM(actual_credits),0),COALESCE(SUM(CASE WHEN actual_credits IS NULL THEN credit_upper_bound ELSE 0 END),0),SUM(CASE WHEN state='unknown' THEN 1 ELSE 0 END),SUM(CASE WHEN usage_source LIKE '%estimat%' THEN 1 ELSE 0 END),COUNT(*) FROM usage_reservations WHERE account_id=? AND day>=? GROUP BY day ORDER BY day`, id, accounts.UsageDayKey(now.AddDate(0, 0, -days+1)))
+	rows, err := s.db.QueryContext(ctx, `SELECT day,COALESCE(SUM(actual_tokens),0),COALESCE(SUM(CASE WHEN actual_tokens IS NULL THEN estimated_tokens ELSE 0 END),0),COALESCE(SUM(CASE WHEN actual_credits IS NOT NULL AND state!='abandoned' THEN actual_credits ELSE 0 END),0),COALESCE(SUM(CASE WHEN actual_credits IS NULL THEN credit_upper_bound ELSE 0 END),0),SUM(CASE WHEN state='unknown' THEN 1 ELSE 0 END),SUM(CASE WHEN usage_source LIKE '%estimat%' THEN 1 ELSE 0 END),COUNT(*),SUM(CASE WHEN actual_credits IS NOT NULL AND state!='abandoned' THEN 1 ELSE 0 END),SUM(CASE WHEN actual_credits IS NULL AND state!='abandoned' THEN 1 ELSE 0 END) FROM usage_reservations WHERE account_id=? AND day>=? GROUP BY day ORDER BY day`, id, accounts.UsageDayKey(now.AddDate(0, 0, -days+1)))
 	if err != nil {
 		return out, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var d accounts.UsageDay
-		if err = rows.Scan(&d.Day, &d.TokensActual, &d.TokensReserved, &d.CreditsActual, &d.CreditsReserved, &d.UnknownAttempts, &d.EstimatedAttempts, &d.Attempts); err != nil {
+		if err = rows.Scan(&d.Day, &d.TokensActual, &d.TokensReserved, &d.CreditsActual, &d.CreditsReserved, &d.UnknownAttempts, &d.EstimatedAttempts, &d.Attempts, &d.CreditsKnownAttempts, &d.CreditsUnknownAttempts); err != nil {
 			return out, err
 		}
+		d.SetCreditsCoverage()
 		out.Series = append(out.Series, d)
 		if d.Day == out.Day {
 			out.Today = d

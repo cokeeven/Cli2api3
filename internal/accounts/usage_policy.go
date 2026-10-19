@@ -134,14 +134,45 @@ type UsageGuardError struct {
 func (e *UsageGuardError) Error() string { return "usage guard: " + e.Reason }
 
 type UsageDay struct {
-	Day               string  `json:"day"`
-	TokensActual      int64   `json:"tokens_actual"`
-	TokensReserved    int64   `json:"tokens_reserved"`
-	CreditsActual     float64 `json:"credits_actual"`
-	CreditsReserved   float64 `json:"credits_reserved"`
-	UnknownAttempts   int     `json:"unknown_attempts"`
-	EstimatedAttempts int     `json:"estimated_attempts"`
-	Attempts          int     `json:"attempts"`
+	Day                    string  `json:"day"`
+	TokensActual           int64   `json:"tokens_actual"`
+	TokensReserved         int64   `json:"tokens_reserved"`
+	CreditsActual          float64 `json:"credits_actual"`
+	CreditsReserved        float64 `json:"credits_reserved"`
+	CreditsKnownAttempts   int     `json:"credits_known_attempts"`
+	CreditsUnknownAttempts int     `json:"credits_unknown_attempts"`
+	CreditsCoverage        string  `json:"credits_coverage"`
+	UnknownAttempts        int     `json:"unknown_attempts"`
+	EstimatedAttempts      int     `json:"estimated_attempts"`
+	Attempts               int     `json:"attempts"`
+}
+
+func (d *UsageDay) SetCreditsCoverage() {
+	switch {
+	case d.CreditsKnownAttempts == 0 && d.CreditsUnknownAttempts == 0:
+		d.CreditsCoverage = "no_data"
+	case d.CreditsKnownAttempts == 0:
+		d.CreditsCoverage = "unknown"
+	case d.CreditsUnknownAttempts > 0:
+		d.CreditsCoverage = "partial"
+	default:
+		d.CreditsCoverage = "complete"
+	}
+}
+
+// TraeOfficialCredits is deliberately unknown until an upstream daily ledger
+// can be read and validated for this account. A nil Credits value is not zero.
+type TraeOfficialCredits struct {
+	Status         string   `json:"status"`
+	Scope          string   `json:"scope"`
+	Day            string   `json:"day"`
+	TimeZone       string   `json:"time_zone"`
+	Unit           string   `json:"unit"`
+	Source         string   `json:"source"`
+	Reason         string   `json:"reason"`
+	Credits        *float64 `json:"credits,omitempty"`
+	UnknownRecords int      `json:"unknown_records,omitempty"`
+	FetchedAt      string   `json:"fetched_at,omitempty"`
 }
 type QuotaAnalysis struct {
 	Unit          string         `json:"unit"`
@@ -155,17 +186,18 @@ type QuotaAnalysis struct {
 	Packages      []QuotaPackage `json:"packages"`
 }
 type UsageAnalysis struct {
-	QuotaHistory           []QuotaHistoryPoint `json:"quota_history"`
-	GuardStates            []UsageGuardState   `json:"guard_states"`
-	CreditBalancePending   float64             `json:"credit_balance_pending"`
-	CreditBalanceUnbounded int                 `json:"credit_balance_unbounded"`
-	AccountID              string              `json:"account_id"`
-	Policy                 UsagePolicy         `json:"policy"`
-	Day                    string              `json:"day"`
-	Today                  UsageDay            `json:"today"`
-	Quota                  QuotaAnalysis       `json:"quota"`
-	Series                 []UsageDay          `json:"series"`
-	RecordingSince         string              `json:"recording_since"`
+	QuotaHistory           []QuotaHistoryPoint  `json:"quota_history"`
+	GuardStates            []UsageGuardState    `json:"guard_states"`
+	CreditBalancePending   float64              `json:"credit_balance_pending"`
+	CreditBalanceUnbounded int                  `json:"credit_balance_unbounded"`
+	AccountID              string               `json:"account_id"`
+	Policy                 UsagePolicy          `json:"policy"`
+	Day                    string               `json:"day"`
+	Today                  UsageDay             `json:"today"`
+	TraeOfficialCredits    *TraeOfficialCredits `json:"trae_official_credits,omitempty"`
+	Quota                  QuotaAnalysis        `json:"quota"`
+	Series                 []UsageDay           `json:"series"`
+	RecordingSince         string               `json:"recording_since"`
 }
 
 type QuotaHistoryPoint struct {

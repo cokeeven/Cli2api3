@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -167,6 +168,111 @@ func TestUsageCSTDayAndModelLimit(t *testing.T) {
 	reserve(t, s, a, "day2", 10, before.Add(2*time.Minute))
 	if err := s.ReserveUsage(ctx, accounts.UsageReservation{ID: "othermodel", AccountID: a.ID, Model: "other", EstimatedTokens: 20, At: before}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTraeUsageAnalysisKeepsUnknownAndConfirmedZeroCreditsDistinct(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	a, err := s.Create(context.Background(), accounts.CreateAccount{Name: "trae usage", Provider: "trae", Region: "cn", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	view, err := s.GetUsageAnalysis(ctx, a.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTraeCreditsView(t, view, "no_data", 0, 0, 0)
+
+	now := time.Now()
+	reserve(t, s, a, "confirmed-zero", 1, now)
+	zero := 0.0
+	if err := s.SettleUsage(ctx, accounts.UsageSettlement{ID: "confirmed-zero", ActualCredits: &zero, UsageSource: "upstream", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = s.GetUsageAnalysis(ctx, a.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTraeCreditsView(t, view, "complete", 1, 0, 0)
+
+	reserve(t, s, a, "unknown-cost", 1, now)
+	if err := s.SettleUsage(ctx, accounts.UsageSettlement{ID: "unknown-cost", UsageSource: "unknown", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = s.GetUsageAnalysis(ctx, a.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTraeCreditsView(t, view, "partial", 1, 1, 0)
+}
+
+func assertTraeCreditsView(t *testing.T, view accounts.UsageAnalysis, coverage string, known, unknown int, amount float64) {
+	t.Helper()
+	raw, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	today, ok := payload["today"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing today usage in %s", raw)
+	}
+	if got := today["credits_coverage"]; got != coverage {
+		t.Fatalf("credits coverage=%v, want %q; payload=%s", got, coverage, raw)
+	}
+	if got := today["credits_known_attempts"]; got != float64(known) {
+		t.Fatalf("known credit attempts=%v, want %d; payload=%s", got, known, raw)
+	}
+	if got := today["credits_unknown_attempts"]; got != float64(unknown) {
+		t.Fatalf("unknown credit attempts=%v, want %d; payload=%s", got, unknown, raw)
+	}
+	if got := today["credits_actual"]; got != amount {
+		t.Fatalf("confirmed credit subtotal=%v, want %v; payload=%s", got, amount, raw)
+	}
+	official, ok := payload["trae_official_credits"].(map[string]any)
+	if !ok || official["status"] != "unknown" {
+		t.Fatalf("official account credits must remain unknown: %s", raw)
+	}
+	if _, gotOfficialAmount := official["credits"]; gotOfficialAmount {
+		t.Fatalf("official account amount must remain unknown; payload=%s", raw)
+	}
+}
+
+func TestTraeOfficialCreditsCanRepresentExplicitZero(t *testing.T) {
+	zero := 0.0
+	raw, err := json.Marshal(accounts.TraeOfficialCredits{Status: "complete", Credits: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := payload["credits"]; !ok || got != float64(0) {
+		t.Fatalf("explicit official zero was not preserved: %s", raw)
+	}
+}
+
+func TestWorkBuddyUsageAnalysisDoesNotExposeTraeLedger(t *testing.T) {
+	s, a := usageStore(t)
+	view, err := s.GetUsageAnalysis(context.Background(), a.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.TraeOfficialCredits != nil {
+		t.Fatalf("WorkBuddy usage unexpectedly contains a Trae ledger: %+v", view.TraeOfficialCredits)
+	}
+	if view.Today.CreditsCoverage != "no_data" {
+		t.Fatalf("empty WorkBuddy usage credit coverage=%q", view.Today.CreditsCoverage)
 	}
 }
 func TestUsageTwoDatabasesRemainIndependent(t *testing.T) {

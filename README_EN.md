@@ -4,7 +4,7 @@
 
 **One API for your Qoder, WorkBuddy and Trae accounts**
 
-A self-hosted AI gateway for personal accounts. Manage logins, models, usage and updates, then connect your preferred AI clients.
+A multi-platform AI reverse proxy for personal use. Manage logins, models, usage and updates, then connect your preferred AI clients.
 
 [![CI](https://github.com/cokeeven/Cli2api3/actions/workflows/ci.yml/badge.svg)](https://github.com/cokeeven/Cli2api3/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cokeeven/Cli2api3)](https://github.com/cokeeven/Cli2api3/releases/latest)
@@ -16,7 +16,35 @@ A self-hosted AI gateway for personal accounts. Manage logins, models, usage and
 
 </div>
 
-Cli2api3 connects accounts you already own to **OpenAI / Anthropic-compatible APIs**, with chat, streaming and tool calls. Use a single endpoint for clients and a web console to inspect account readiness, choose models, create client keys and manage updates.
+Cli2api3 connects upstream accounts you own and are authorized to use to **OpenAI / Anthropic-compatible APIs**, with chat, streaming and tool calls. Use a single endpoint for clients and a web console to inspect account readiness, choose models, create client keys and manage updates.
+
+## Usage and project notice
+
+Cli2api3 is an unofficial AI protocol adapter and reverse proxy for personal use, protocol compatibility research and development testing. Before using it, note the following:
+
+1. **Bring your own accounts and permissions**
+
+   Only connect accounts you own and are authorized to use for the intended purpose. Follow each platform's terms of service, quota limits and usage rules. This project does not provide accounts, subscriptions or model quota.
+
+2. **Unofficial project**
+
+   This project is not officially affiliated with or endorsed by the platforms it connects to. Platform names, trademarks and related services belong to their respective rights holders.
+
+3. **Intended scope**
+
+   The project focuses on personal client access and account management. It does not operate a public relay service or endorse third-party account sales, quota resale, paid access codes or hosted services.
+
+4. **Compatibility and account risks**
+
+   Compatible endpoints do not fully replicate official APIs. Changes to upstream protocols, models, quotas or risk controls may cause features to stop working, requests to be restricted or accounts to face limitations. The project does not guarantee continued availability or that accounts will remain unaffected.
+
+5. **Credentials and data protection**
+
+   The service listens on the local machine by default. Do not directly expose the management console, updater or service ports. Protect account credentials, client keys and database backups, and remove sensitive information before sharing issues or screenshots. Model requests are still sent to the selected upstream service.
+
+6. **Open-source license and origins**
+
+   The project retains the upstream MIT license and copyright notices. The code's open-source license does not grant additional rights to use any upstream accounts, models or services.
 
 ## Features
 
@@ -123,7 +151,7 @@ The Go gateway handles authentication, routing, protocol adaptation and request 
 - [Architecture](docs/ARCHITECTURE_SUMMARY.md) · [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md)
 - [GitHub Issues](https://github.com/cokeeven/Cli2api3/issues) · [LINUX DO community](https://linux.do)
 
-The default console and API bind to `127.0.0.1:3010`. For public access, expose selected routes through an access-controlled reverse proxy and keep administration private. Protect keys, account exports and database backups.
+The service binds only to `127.0.0.1:3010` by default for local clients. Do not directly expose service ports or the management console. Protect account credentials, client keys and data backups. See [Security](SECURITY.md) for detailed guidance and vulnerability reporting.
 
 ## Origins and license
 

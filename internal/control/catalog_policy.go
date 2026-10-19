@@ -210,6 +210,24 @@ func PublicModelCatalog(models []map[string]any) []map[string]any {
 			provider, _ = model["owned_by"].(string)
 		}
 		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "trae" {
+			supportsMax, _ := model["supports_max_mode"].(bool)
+			maxMode, _ := model["max_mode"].(bool)
+			if supportsMax && maxMode {
+				// The console keeps the raw default and *_max fields so its switch
+				// can render both tiers. Public model clients commonly read only
+				// the standard fields, so project the enabled tier onto those fields
+				// without changing the cached catalog or the console response.
+				for _, fields := range [][2]string{
+					{"max_output_tokens", "max_output_tokens_max"},
+					{"prompt_max_tokens", "prompt_max_tokens_max"},
+				} {
+					if value, ok := catalogInt(model[fields[1]]); ok && value > 0 {
+						model[fields[0]] = value
+					}
+				}
+			}
+		}
 		if _, known := providers.Get(provider); !known || id == "" {
 			continue
 		}

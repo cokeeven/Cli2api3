@@ -3,6 +3,16 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.9 - 2026-10-19
+
+### English
+
+- Keep the model-usage page rendering when older gateways return a null WorkBuddy budget list; Trae budgets remain unknown.
+
+### 中文
+
+- 旧版网关将 WorkBuddy 预算列表返回为 null 时，模型用量页仍可正常显示；Trae 预算继续保持未知。
+
 ## 0.1.8 - 2026-10-18
 
 ### English

@@ -3,6 +3,8 @@ package workbuddy
 import (
 	"encoding/json"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
@@ -19,6 +21,7 @@ func PrepareBody(src []byte) []byte {
 	}
 	body["stream"] = true
 	normalizeInstructionRoles(body)
+	rewriteDSHIdentityInSystemText(body)
 	normalizeToolChoice(body)
 	normalizeTools(body)
 	dropEmptyTools(body)
@@ -30,6 +33,77 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	return out
+}
+
+// rewriteDSHIdentityInSystemText applies a narrowly scoped WorkBuddy
+// compatibility rewrite to the exact DSH identity phrase in system text.
+// Only canonical text blocks are inspected; image and unknown block payloads
+// are left untouched.
+func rewriteDSHIdentityInSystemText(body map[string]any) {
+	messages, _ := body["messages"].([]any)
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "system") {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			message["content"] = rewriteDSHIdentityText(content)
+		case []any:
+			for _, rawBlock := range content {
+				block, ok := rawBlock.(map[string]any)
+				if !ok || block["type"] != "text" {
+					continue
+				}
+				text, ok := block["text"].(string)
+				if ok {
+					block["text"] = rewriteDSHIdentityText(text)
+				}
+			}
+		}
+	}
+}
+
+func rewriteDSHIdentityText(text string) string {
+	const identity = "DeepSeek Harness"
+	const replacement = "DeepSeek\u200B Harness"
+	var out strings.Builder
+	searchFrom := 0
+	for searchFrom < len(text) {
+		relative := strings.Index(text[searchFrom:], identity)
+		if relative < 0 {
+			out.WriteString(text[searchFrom:])
+			break
+		}
+		start := searchFrom + relative
+		end := start + len(identity)
+		leftBoundary := start == 0
+		if !leftBoundary {
+			previous, _ := utf8.DecodeLastRuneInString(text[:start])
+			leftBoundary = !isDSHIdentityWordRune(previous)
+		}
+		rightBoundary := end == len(text)
+		if !rightBoundary {
+			next, _ := utf8.DecodeRuneInString(text[end:])
+			rightBoundary = !isDSHIdentityWordRune(next)
+		}
+		if leftBoundary && rightBoundary {
+			out.WriteString(text[searchFrom:start])
+			out.WriteString(replacement)
+		} else {
+			out.WriteString(text[searchFrom:end])
+		}
+		searchFrom = end
+	}
+	return out.String()
+}
+
+func isDSHIdentityWordRune(value rune) bool {
+	return value == '_' || unicode.IsLetter(value) || unicode.IsDigit(value)
 }
 
 // WorkBuddy's legacy chat API supports system instructions, not the newer

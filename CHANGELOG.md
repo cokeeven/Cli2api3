@@ -3,6 +3,32 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.14 - 2026-10-23
+
+### English
+
+- Classify WorkBuddy authentication failures from structured evidence and show sanitized phase, source, and observed HTTP status in request attempt details; the additive schema fields remain unknown for older attempts.
+- Explain missing Trae local credentials and malformed tool history without exposing credential values or repairing incomplete tool arguments.
+- Keep an existing WorkBuddy or Trae upstream authentication failure until an explicit login or credential refresh records recovery; checking only local credential completeness no longer marks the account ready.
+- Preserve the total timeout phase on worker attempts, distinguish it from caller cancellation, and release the attempt slot once. Expired account cooldowns no longer hide current readiness; unknown cooldown deadlines remain unknown.
+- Explain that historical `started` and `streaming` request rows lack a recorded terminal result but do not prove current execution; use the account runtime count for live in-flight requests.
+- Keep credential refresh generations separate from the account modification timestamp. A successful WorkBuddy or Trae token exchange clears an earlier auth marker only when its credential payload and generation still match; this does not prove the chat endpoint is healthy.
+- Show bounded WorkBuddy account/model budget observations with separate progress bars for complete reset-window usage and the 24-hour comparison, plus first-limit samples and weaker peer references; unknown upstream budgets remain unknown and do not affect routing.
+- Keep the selected 24-hour comparison reference fixed when observed use exceeds it, label the overrun, and retain the sample window and estimate time. For WorkBuddy chat availability failures with no provider scope, isolate only the local cooldown to that account/model; explicit account failures such as expired sessions remain account scoped.
+- Offer an explicit local per-account, per-model daily token guard from repeated complete evidence while preserving any existing model limit.
+
+### 中文
+
+- 根据结构化证据分类 WorkBuddy 鉴权失败，并在请求尝试详情显示脱敏后的阶段、来源和实际观察到的 HTTP 状态；新增字段为旧尝试保留未知值。
+- 明确说明 Trae 本地凭据缺失及工具历史格式错误，不暴露凭据，也不自动修补不完整的工具参数。
+- WorkBuddy 或 Trae 已有上游鉴权失败时，本地凭据完整性检查不会再把账号标为就绪；只有显式登录或凭据刷新记录恢复后才重新就绪。
+- 工作进程 attempt 保留总超时阶段并与调用方取消区分，且只释放一次并发槽。过期账号冷却不再遮住当前就绪状态；冷却截止时间未知时仍保持未知。
+- 说明历史 `started` 和 `streaming` 请求仅表示日志未记录终态，不能证明当前仍在执行；实时并发应查看账号运行时请求数。
+- 凭据刷新代次独立于账号修改时间。WorkBuddy 或 Trae 的令牌交换成功后，只有凭据内容和代次仍匹配才会清除先前鉴权标记；这不代表聊天接口已验证可用。
+- 展示有界的 WorkBuddy 账号/模型预算观测，并以独立进度条显示完整重置窗口用量和24小时比较，另行展示首次限额样本及较弱的同类参考；实际上游预算未知时继续显示未知，且不影响路由。
+- 当实际观测超过所选的24小时比较参考时，保留原参考值并明确标记超出，同时展示样本区间和估算时间。WorkBuddy 聊天阶段未提供范围的可用性错误，仅在本地按账号/模型隔离冷却；明确的账号级错误（如会话失效）仍作用于账号。
+- 仅在操作者明确保存时，才可依据重复完整样本设置本地每账号/模型日 Token 护栏；已有模型限额会保留。
+
 ## 0.1.13 - 2026-10-23
 
 ### English

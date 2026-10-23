@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/executor"
 	"github.com/caigee-cmd/cli2api/internal/providers"
@@ -103,5 +104,43 @@ func TestQueuedCatalogRefreshSkipsRemovedAccount(t *testing.T) {
 	m.maintenanceDone.Wait()
 	if catalog.calls.Load() != 0 {
 		t.Fatal("removed account reached upstream after leaving catalog queue")
+	}
+}
+
+func TestTraeCatalogRefreshSkipsKnownAuthFailureAndResumesWhenReady(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m := NewManager(ManagerConfig{DataDir: t.TempDir()}, db, nil)
+	defer m.Close()
+	catalog := &lifecycleCatalog{started: make(chan struct{}), release: make(chan struct{})}
+	reg := providers.NewRegistry()
+	reg.Register(providers.Adapter{ID: "trae", Models: catalog})
+	m.SetProviders(reg)
+	m.pool.Upsert(executor.Item{ID: "synthetic", Provider: "trae", Region: "cn", Runtime: "in_process", RuntimeState: "auth_failed"})
+	m.EnsureModelCatalogs(context.Background(), true)
+	select {
+	case <-catalog.started:
+		close(catalog.release)
+		m.maintenanceDone.Wait()
+		t.Fatal("known auth-failed Trae account retried catalog refresh")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if catalog.calls.Load() != 0 {
+		t.Fatalf("catalog calls while auth failed=%d", catalog.calls.Load())
+	}
+	m.pool.SetRuntimeState("synthetic", "ready", time.Time{}, 0, "")
+	m.EnsureModelCatalogs(context.Background(), true)
+	select {
+	case <-catalog.started:
+		close(catalog.release)
+	case <-time.After(2 * time.Second):
+		t.Fatal("catalog refresh did not resume after readiness returned")
+	}
+	m.maintenanceDone.Wait()
+	if catalog.calls.Load() != 1 {
+		t.Fatalf("catalog call count after recovery=%d, want 1", catalog.calls.Load())
 	}
 }

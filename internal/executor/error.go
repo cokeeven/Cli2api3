@@ -93,13 +93,21 @@ func ClassifyError(err error) Classified {
 	}
 	var phase interface{ TimeoutPhase() string }
 	if errors.As(err, &phase) {
-		return Classified{Kind: accounts.KindCanceled, Status: 504, Failover: false, Scope: "request", Code: "request_timeout_" + phase.TimeoutPhase(), Type: "timeout_error", Message: err.Error()}
+		classified := Classified{
+			Kind: accounts.KindCanceled, Status: 504, Failover: false, Scope: "request",
+			Code: "request_timeout_" + phase.TimeoutPhase(), Type: "timeout_error", Message: err.Error(),
+			ErrorPhase: phase.TimeoutPhase(), ErrorSource: "gateway_chat_deadline",
+		}
+		copyProviderErrorEvidence(&classified, err)
+		return classified
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return Classified{
+		classified := Classified{
 			Kind: accounts.KindCanceled, Status: 499, Failover: false,
 			Code: "request_canceled", Message: err.Error(),
 		}
+		copyProviderErrorEvidence(&classified, err)
+		return classified
 	}
 	var providerErr *providers.Error
 	if !errors.As(err, &providerErr) || providerErr == nil {
@@ -119,6 +127,7 @@ func ClassifyError(err error) Classified {
 		classified.Code = providerErr.Code
 	}
 	classified.EvidenceSource = "provider_adapter_error"
+	copyProviderErrorEvidence(&classified, err)
 	if providerErr.UpstreamResetAt != nil {
 		reset := providerErr.UpstreamResetAt.UTC()
 		classified.UpstreamResetAt = &reset
@@ -163,4 +172,20 @@ func ClassifyError(err error) Classified {
 	}
 	classified.RetryAfter = classified.Cooldown
 	return classified
+}
+
+func copyProviderErrorEvidence(classified *Classified, err error) {
+	if classified == nil || err == nil {
+		return
+	}
+	var providerErr *providers.Error
+	if !errors.As(err, &providerErr) || providerErr == nil {
+		return
+	}
+	classified.ErrorPhase = providerErr.Phase
+	classified.ErrorSource = providerErr.Source
+	if providerErr.HTTPStatus != nil {
+		status := *providerErr.HTTPStatus
+		classified.HTTPStatus = &status
+	}
 }

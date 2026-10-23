@@ -67,11 +67,20 @@ func (s *Store) ReserveUsage(ctx context.Context, r accounts.UsageReservation) e
 		r.At = time.Now()
 	}
 	r.Model = accounts.CanonicalModelID(r.Model)
-	day := accounts.UsageDayKey(r.At)
 	if r.FreeModel {
 		v := 0.0
 		r.CreditUpperBound = &v
 	}
+	return retrySQLiteBusy(ctx, func(attemptCtx context.Context) error {
+		return s.reserveUsageOnce(attemptCtx, r)
+	})
+}
+
+// reserveUsageOnce uses the reservation ID as its idempotency key. Retrying
+// this transaction is safe because a committed first attempt is recognized
+// before any budget is reserved a second time.
+func (s *Store) reserveUsageOnce(ctx context.Context, r accounts.UsageReservation) error {
+	day := accounts.UsageDayKey(r.At)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -160,7 +169,7 @@ func (s *Store) ReserveUsage(ctx context.Context, r accounts.UsageReservation) e
 }
 
 func (s *Store) MarkUsageDispatched(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE usage_reservations SET state='dispatched' WHERE id=? AND state='reserved'`, id)
+	result, err := execSQLiteBusyRetry(ctx, s.db, `UPDATE usage_reservations SET state='dispatched' WHERE id=? AND state='reserved'`, id)
 	if err != nil {
 		return err
 	}
@@ -207,7 +216,7 @@ func (s *Store) SettleUsage(ctx context.Context, u accounts.UsageSettlement) err
 		u.ActualTokens = nil
 		state = "unknown"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE usage_reservations SET state=?,actual_tokens=?,actual_credits=?,usage_source=?,finished_at=? WHERE id=? AND state IN ('reserved','dispatched')`, state, u.ActualTokens, u.ActualCredits, u.UsageSource, formatTime(u.At), u.ID)
+	_, err := execSQLiteBusyRetry(ctx, s.db, `UPDATE usage_reservations SET state=?,actual_tokens=?,actual_credits=?,usage_source=?,finished_at=? WHERE id=? AND state IN ('reserved','dispatched')`, state, u.ActualTokens, u.ActualCredits, u.UsageSource, formatTime(u.At), u.ID)
 	return err
 }
 func (s *Store) RecoverUsageReservations(ctx context.Context) error {

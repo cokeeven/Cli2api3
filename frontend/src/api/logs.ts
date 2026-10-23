@@ -37,6 +37,9 @@ export type RequestAttempt = {
   credits?: number | null
   usage_state?: string
   error_scope?: string
+  error_code?: string
+  error_phase?: string
+  error_source?: string
   route_reason?: string
   id: string
   request_id: string

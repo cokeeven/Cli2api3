@@ -68,7 +68,7 @@ INSERT INTO request_stream_diagnostics (request_id, created_at, finished_at, con
 	if log.MessageCount != 3 || len(log.MessageRoles) != 3 || len(log.EmptyMessageIndexes) != 1 || log.MessageShapeKnown {
 		t.Fatalf("legacy request history changed or guessed as known: %+v", log)
 	}
-	if len(log.Attempts) != 1 || log.Attempts[0].ProviderPlan != "" || log.FinishReason != "" || log.FinishReasonSource != "" || log.OutputBudgetEnforcement != "" || log.StreamDiagnostic == nil || log.StreamDiagnostic.ContentLength != nil || log.StreamDiagnostic.OutputBudgetEnforcement != "" {
+	if len(log.Attempts) != 1 || log.Attempts[0].ProviderPlan != "" || log.Attempts[0].ErrorPhase != "" || log.Attempts[0].ErrorSource != "" || log.FinishReason != "" || log.FinishReasonSource != "" || log.OutputBudgetEnforcement != "" || log.StreamDiagnostic == nil || log.StreamDiagnostic.ContentLength != nil || log.StreamDiagnostic.OutputBudgetEnforcement != "" {
 		t.Fatalf("legacy request children or unknown content length changed: %+v", log)
 	}
 	var migrationCount int
@@ -77,6 +77,42 @@ INSERT INTO request_stream_diagnostics (request_id, created_at, finished_at, con
 	}
 	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE filename = '036_output_budget_evidence.sql'`).Scan(&migrationCount); err != nil || migrationCount != 1 {
 		t.Fatalf("036 migration count=%d err=%v", migrationCount, err)
+	}
+}
+
+func TestRequestAttemptErrorEvidencePersistsAndLegacyValuesStayUnknown(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "attempt-error-evidence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	if err := store.InsertRequestLog(ctx, accounts.RequestLog{
+		ID: "request-synthetic-auth", CreatedAt: now, Status: accounts.RequestStatusError,
+		RequestedModel: "glm-5.3", Provider: "workbuddy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status := 200
+	if err := store.InsertRequestAttempt(ctx, accounts.RequestAttempt{
+		ID: "attempt-synthetic-auth", RequestID: "request-synthetic-auth", AttemptIndex: 0,
+		StartedAt: now, FinishedAt: &now, Status: accounts.AttemptStatusError, HTTPStatus: &status,
+		ErrorKind: accounts.KindAuth, ErrorCode: "12153", ErrorPhase: "chat", ErrorSource: "workbuddy_chat_response",
+		ErrorMessage: "WorkBuddy 会话已被上游拒绝，请检查登录状态。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRequestLog(ctx, "request-synthetic-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attempts) != 1 {
+		t.Fatalf("attempt count=%d", len(got.Attempts))
+	}
+	attempt := got.Attempts[0]
+	if attempt.HTTPStatus == nil || *attempt.HTTPStatus != 200 || attempt.ErrorCode != "12153" || attempt.ErrorPhase != "chat" || attempt.ErrorSource != "workbuddy_chat_response" {
+		t.Fatalf("persisted evidence=%+v", attempt)
 	}
 }
 

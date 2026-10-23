@@ -778,6 +778,31 @@ func TestProbeReadyWithCredential(t *testing.T) {
 	}
 }
 
+func TestReviewerMissingCredentialProbeIsExplicitAndRecoversWhenSupplied(t *testing.T) {
+	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("credential probe must not contact upstream: %s", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	health, err := client.Probe(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.LastErrorKind != accounts.KindAuth || !strings.Contains(health.LastError, "本地登录凭据缺失") {
+		t.Fatalf("missing local credential was not explained as a login repair state: %+v", health)
+	}
+	payload, err := (Credential{AccessToken: "synthetic-access", RefreshToken: "synthetic-refresh", ExpiresAt: 4102444800, Domain: DomainCN, UID: "synthetic-uid"}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentialPayload(context.Background(), "acc1", CredentialFormat, payload); err != nil {
+		t.Fatal(err)
+	}
+	health, err = client.Probe(context.Background(), "acc1")
+	if err != nil || !health.Ready || !health.Hot || health.UID != "synthetic-uid" {
+		t.Fatalf("supplied credential did not restore local readiness: health=%+v err=%v", health, err)
+	}
+}
+
 func TestQuotaUsesEntitlementPackUnit(t *testing.T) {
 	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != pathEntUsage {

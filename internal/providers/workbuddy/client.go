@@ -281,11 +281,11 @@ func (c *Client) PollLogin(ctx context.Context, accountID string) (bool, string,
 func (c *Client) credential(ctx context.Context, accountID string) (Credential, error) {
 	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, c.credentialReadError(ctx, accountID, err, "workbuddy_credential_store")
 	}
 	credential, err := DecodeCredential(payload)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, workBuddyCredentialPayloadError(err)
 	}
 	if !credential.needsRefresh(time.Now()) {
 		return credential, nil
@@ -304,6 +304,10 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if c.credentialRefreshCoolingDown(accountID, now) {
 		return c.useWorkBuddyCredentialFallback(credential, now, fmt.Errorf("credential refresh is cooling down"))
 	}
+	account, err := c.store.Get(ctx, accountID)
+	if err != nil {
+		return Credential{}, fmt.Errorf("load WorkBuddy account before credential refresh: %w", err)
+	}
 	refreshed, err := c.refreshRemote(ctx, accountID, credential)
 	if err != nil {
 		c.recordCredentialRefreshFailure(accountID, err)
@@ -313,7 +317,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -331,9 +335,12 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 func (c *Client) loadCredential(ctx context.Context, accountID string) (string, []byte, Credential, error) {
 	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
 	if err != nil {
-		return "", nil, Credential{}, err
+		return "", nil, Credential{}, c.credentialReadError(ctx, accountID, err, "workbuddy_credential_store")
 	}
 	credential, err := DecodeCredential(payload)
+	if err != nil {
+		err = workBuddyCredentialPayloadError(err)
+	}
 	return format, payload, credential, err
 }
 
@@ -430,6 +437,10 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 		return Credential{}, err
 	}
 	credential = current
+	account, err := c.store.Get(ctx, accountID)
+	if err != nil {
+		return Credential{}, fmt.Errorf("load WorkBuddy account before credential refresh: %w", err)
+	}
 	refreshed, err := c.refreshRemote(ctx, accountID, credential)
 	if err != nil {
 		c.recordCredentialRefreshFailure(accountID, err)
@@ -439,7 +450,7 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -454,12 +465,12 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	return refreshed, nil
 }
 
-func (c *Client) saveCredentialIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte) (bool, error) {
-	store, ok := c.store.(providers.CredentialPayloadCASStore)
+func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64) (bool, error) {
+	store, ok := c.store.(providers.CredentialRefreshCASStore)
 	if !ok {
-		return false, fmt.Errorf("workbuddy credential store does not support compare-and-swap persistence")
+		return false, fmt.Errorf("workbuddy credential store does not support atomic refresh compare-and-swap")
 	}
-	return store.SaveCredentialPayloadIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload)
+	return store.SaveCredentialPayloadAfterRefreshIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload, credentialGeneration)
 }
 
 func (c *Client) refreshRemote(ctx context.Context, accountID string, credential Credential) (Credential, error) {
@@ -467,21 +478,21 @@ func (c *Client) refreshRemote(ctx context.Context, accountID string, credential
 	body, status, err := c.do(ctx, accountID, http.MethodPost, credential.ChatBase()+pathTokenRefresh, []byte("{}"),
 		func(h http.Header) { SetRefreshHeaders(h, credential) })
 	if err != nil {
-		return credential, err
+		return credential, workBuddyTransportError(err, "refresh", "workbuddy_refresh_transport")
 	}
 	classified := Classify(status, string(body))
 	if classified.Kind == accounts.KindAuth {
 		if credential.ExpiresAt <= time.Now().Unix() {
 			_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "session dead; re-login required", accounts.KindAuth)
 		}
-		return credential, classifiedError(status, body)
+		return credential, classifiedErrorWithEvidence(status, &status, body, "refresh", "workbuddy_refresh_response")
 	}
 	if status >= 300 || classified.Kind != "" {
-		return credential, classifiedError(status, body)
+		return credential, classifiedErrorWithEvidence(status, &status, body, "refresh", "workbuddy_refresh_response")
 	}
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil || env.Code != 0 {
-		return credential, fmt.Errorf("refresh envelope code=%d msg=%s", env.Code, env.Msg)
+		return credential, workBuddyRefreshResponseError(status)
 	}
 	var data struct {
 		AccessToken  string `json:"accessToken"`
@@ -490,7 +501,7 @@ func (c *Client) refreshRemote(ctx context.Context, accountID string, credential
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(env.Data, &data); err != nil || data.AccessToken == "" {
-		return credential, fmt.Errorf("refresh response missing accessToken")
+		return credential, workBuddyRefreshResponseError(status)
 	}
 	if data.RefreshToken != "" {
 		credential.RefreshToken = data.RefreshToken
@@ -658,11 +669,11 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 	}
 	client, err := c.httpClient(ctx, accountID)
 	if err != nil {
-		return providers.ChatOutcome{}, err
+		return providers.ChatOutcome{}, workBuddyTransportError(err, "chat", "workbuddy_chat_transport_setup")
 	}
 	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return resolved.OutcomeMetadata(), err
+		return resolved.OutcomeMetadata(), workBuddyTransportError(err, "chat", "workbuddy_chat_transport")
 	}
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
@@ -671,7 +682,7 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 		readErr = fmt.Errorf("workbuddy response exceeds 16 MiB")
 	}
 	if resp.StatusCode >= 300 {
-		return resolved.OutcomeMetadata(), providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
+		return resolved.OutcomeMetadata(), providers.WithRetryAfterHeader(classifiedErrorWithEvidence(resp.StatusCode, &resp.StatusCode, body, "chat", "workbuddy_chat_response"), resp.Header.Get("Retry-After"))
 	}
 	aggregate, aggregateErr := Aggregate(bytes.NewReader(body))
 	outcome, err := outcomeFromAggregate(aggregate)
@@ -681,7 +692,10 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 	outcome.ReasoningLevel = resolved.ReasoningLevel
 	outcome.OutputLimit = resolved.OutputLimit
 	outcome.OutputLimitSource = resolved.OutputLimitSource
-	return outcome, providers.WithRetryAfterHeader(errors.Join(readErr, aggregateErr), resp.Header.Get("Retry-After"))
+	if readErr != nil || aggregateErr != nil {
+		return outcome, providers.WithRetryAfterHeader(workBuddyResponseReadError(errors.Join(readErr, aggregateErr), resp.StatusCode), resp.Header.Get("Retry-After"))
+	}
+	return outcome, nil
 }
 
 func (c *Client) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, providers.ResolvedChat, error) {
@@ -695,16 +709,16 @@ func (c *Client) ChatStream(ctx context.Context, accountID string, req translate
 	}
 	client, err := c.httpClient(ctx, accountID)
 	if err != nil {
-		return nil, providers.ResolvedChat{}, err
+		return nil, providers.ResolvedChat{}, workBuddyTransportError(err, "chat", "workbuddy_chat_transport_setup")
 	}
 	resp, err := providers.DoChatRequest(client, httpReq)
 	if err != nil {
-		return nil, resolved, err
+		return nil, resolved, workBuddyTransportError(err, "chat", "workbuddy_chat_transport")
 	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, resolved, providers.WithRetryAfterHeader(classifiedError(resp.StatusCode, body), resp.Header.Get("Retry-After"))
+		return nil, resolved, providers.WithRetryAfterHeader(classifiedErrorWithEvidence(resp.StatusCode, &resp.StatusCode, body, "chat", "workbuddy_chat_response"), resp.Header.Get("Retry-After"))
 	}
 	streamResp := rewriteChatStream(resp)
 	streamResp.Body = providers.CarryChatObservation(streamResp.Body, resp.Body, resp.Header.Get("Retry-After"))
@@ -777,8 +791,20 @@ func outcomeFromAggregate(aggregate map[string]any) (providers.ChatOutcome, erro
 }
 
 func classifiedError(status int, body []byte) error {
-	classified := Classify(status, string(body))
-	out := &providers.Error{Kind: classified.Kind, Status: classified.Status, Message: classified.Message, Scope: classified.Scope, RetrySafe: classified.RetrySafe, Code: classified.Code}
+	return classifiedErrorWithEvidence(status, &status, body, "chat", "workbuddy_chat_response")
+}
+
+func classifiedErrorWithEvidence(classificationStatus int, httpStatus *int, body []byte, phase, source string) error {
+	classified := Classify(classificationStatus, string(body))
+	out := &providers.Error{
+		Kind: classified.Kind, Status: classified.Status, Message: classified.Message,
+		Scope: classified.Scope, RetrySafe: classified.RetrySafe, Code: classified.Code,
+		Phase: phase, Source: source,
+	}
+	if httpStatus != nil {
+		status := *httpStatus
+		out.HTTPStatus = &status
+	}
 	if classified.Kind == accounts.KindRateLimit {
 		if resetAt, ok := parseQuotaResetAt(string(body), time.Now()); ok {
 			out.UpstreamResetAt = &resetAt
@@ -786,6 +812,88 @@ func classifiedError(status int, body []byte) error {
 		}
 	}
 	return out
+}
+
+func workBuddyCredentialReadError(cause error, source string) error {
+	if cause == nil {
+		return nil
+	}
+	kind := accounts.KindUnavailable
+	message := "WorkBuddy 本地凭据读取失败，请检查账号数据存储。"
+	if errors.Is(cause, accounts.ErrSecretNotFound) {
+		kind = accounts.KindAuth
+		message = "WorkBuddy 本地登录凭据缺失，请重新登录或补齐凭据。"
+	}
+	return &providers.Error{Kind: kind, Scope: "account", Message: message, Phase: "credential_read", Source: source, Cause: cause}
+}
+
+func (c *Client) credentialReadError(ctx context.Context, accountID string, cause error, source string) error {
+	if !errors.Is(cause, accounts.ErrAccountNotFound) {
+		return workBuddyCredentialReadError(cause, source)
+	}
+	if _, err := c.store.Get(ctx, accountID); err == nil {
+		return &providers.Error{
+			Kind: accounts.KindAuth, Scope: "account", Message: "WorkBuddy 本地登录凭据缺失，请重新登录或补齐凭据。",
+			Phase: "credential_read", Source: source, Cause: cause,
+		}
+	} else if errors.Is(err, accounts.ErrAccountNotFound) {
+		return &providers.Error{
+			Kind: accounts.KindUnavailable, Scope: "account", Message: "WorkBuddy 账号记录在本地数据中不存在。",
+			Phase: "credential_read", Source: source, Cause: cause,
+		}
+	} else {
+		return &providers.Error{
+			Kind: accounts.KindUnavailable, Scope: "account", Message: "WorkBuddy 本地凭据读取失败，请检查账号数据存储。",
+			Phase: "credential_read", Source: source, Cause: errors.Join(cause, err),
+		}
+	}
+}
+
+func workBuddyCredentialPayloadError(cause error) error {
+	return &providers.Error{
+		Kind:    accounts.KindAuth,
+		Scope:   "account",
+		Message: "WorkBuddy 本地凭据格式无效，请重新登录或重新导入。",
+		Phase:   "credential_read", Source: "workbuddy_credential_payload", Cause: cause,
+	}
+}
+
+func workBuddyTransportError(cause error, phase, source string) error {
+	return &providers.Error{
+		Kind: accounts.KindUnavailable, Message: "WorkBuddy 上游连接未取得 HTTP 响应。",
+		Phase: phase, Source: source, Cause: cause,
+	}
+}
+
+func workBuddyRefreshResponseError(httpStatus int) error {
+	return &providers.Error{
+		Kind: accounts.KindUnavailable, Status: http.StatusBadGateway,
+		Scope:   "account",
+		Message: "WorkBuddy 凭据刷新响应格式无效。",
+		Phase:   "refresh", Source: "workbuddy_refresh_response", HTTPStatus: &httpStatus,
+	}
+}
+
+func workBuddyResponseReadError(cause error, httpStatus int) error {
+	var upstream *providers.Error
+	if errors.As(cause, &upstream) && upstream != nil {
+		copy := *upstream
+		if copy.Phase == "" {
+			copy.Phase = "chat"
+		}
+		if copy.Source == "" {
+			copy.Source = "workbuddy_chat_response_body"
+		}
+		if copy.HTTPStatus == nil {
+			status := httpStatus
+			copy.HTTPStatus = &status
+		}
+		return &copy
+	}
+	return &providers.Error{
+		Kind: accounts.KindUnavailable, Message: "WorkBuddy 聊天响应读取或解析失败。",
+		Phase: "chat", Source: "workbuddy_chat_response_body", HTTPStatus: &httpStatus, Cause: cause,
+	}
 }
 
 var quotaResetPattern = regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})`)
@@ -876,9 +984,8 @@ func classifyWorkBuddy(status int, body string) providers.ClassifiedError {
 		// A bare payment/quota status does not prove its scope or that retry
 		// cannot duplicate an already accepted operation.
 		return providers.ClassifiedError{Kind: accounts.KindQuota, Status: 402, Message: strings.TrimSpace(body)}
-	case status == 401 || strings.Contains(text, sessionDeadText) ||
-		strings.Contains(text, fmt.Sprintf("%d", sessionDeadCode)):
-		return providers.ClassifiedError{Kind: accounts.KindAuth, Status: 401, Message: "session dead; re-login required"}
+	case isSessionDeadResponse(status, body):
+		return providers.ClassifiedError{Kind: accounts.KindAuth, Status: 401, Scope: "account", Message: "WorkBuddy 会话已被上游拒绝（session dead），请检查登录状态并在需要时重新登录。"}
 	case status == 429 || strings.Contains(text, "soft_rate"):
 		return providers.ClassifiedError{Kind: accounts.KindRateLimit, Status: 429, Message: strings.TrimSpace(body)}
 	case status == 404:
@@ -891,44 +998,98 @@ func classifyWorkBuddy(status int, body string) providers.ClassifiedError {
 	case status >= 500:
 		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: status, Message: strings.TrimSpace(body)}
 	}
-	var env envelope
-	if json.Unmarshal([]byte(body), &env) == nil && env.Code != 0 {
-		if env.Code == sessionDeadCode || strings.Contains(strings.ToLower(env.Msg), sessionDeadText) {
-			return providers.ClassifiedError{Kind: accounts.KindAuth, Status: 401, Message: "session dead; re-login required"}
+	code, message := workBuddyErrorFields(body)
+	if code != "" && code != "0" {
+		codeNumber, _ := strconv.Atoi(code)
+		if codeNumber == sessionDeadCode || strings.Contains(strings.ToLower(message), sessionDeadText) {
+			return providers.ClassifiedError{Kind: accounts.KindAuth, Status: 401, Scope: "account", Message: "WorkBuddy 会话已被上游拒绝（session dead），请检查登录状态并在需要时重新登录。"}
 		}
-		if accounts.IsPromptLimitText(env.Msg) || accounts.IsInvalidRequestText(env.Msg) || isMissingSystemPrompt(env.Msg) || isBrokenToolSequence(env.Msg) || env.Code == missingSystemPromptCode || env.Code == toolCallSequenceCode {
-			return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: firstNonEmptyStatus(status, 400), Message: env.Msg}
+		if accounts.IsPromptLimitText(message) || accounts.IsInvalidRequestText(message) || isMissingSystemPrompt(message) || isBrokenToolSequence(message) || codeNumber == missingSystemPromptCode || codeNumber == toolCallSequenceCode {
+			return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: firstNonEmptyStatus(status, 400), Message: message}
 		}
-		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: 502, Message: env.Msg}
+		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: 502, Message: message}
 	}
 	return providers.ClassifiedError{}
+}
+
+func isSessionDeadResponse(status int, body string) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	code, message, isJSON := workBuddyErrorFieldsDetailed(body)
+	if isJSON {
+		// Numeric business codes must be read from the structured code field.
+		// Searching the whole JSON body lets an unrelated requestId or message
+		// containing "12153" turn an ordinary error into an auth failure.
+		codeNumber, _ := strconv.Atoi(code)
+		if codeNumber == sessionDeadCode {
+			return true
+		}
+		return (code == "" || code != "0") && strings.Contains(strings.ToLower(message), sessionDeadText)
+	}
+	// Some endpoints return a plain-text session error instead of an envelope.
+	return strings.Contains(strings.ToLower(body), sessionDeadText)
 }
 
 // workBuddyBusinessCode preserves a safe scalar business code even when this
 // version does not know its meaning. The code remains diagnostic data; callers
 // must not infer scope or retry safety from an unrecognized value.
 func workBuddyBusinessCode(body string) string {
+	code, _, _ := workBuddyErrorFieldsDetailed(body)
+	return code
+}
+
+func workBuddyErrorFields(body string) (string, string) {
+	code, message, _ := workBuddyErrorFieldsDetailed(body)
+	return code, message
+}
+
+func workBuddyErrorFieldsDetailed(body string) (string, string, bool) {
 	var envelope struct {
-		Code json.RawMessage `json:"code"`
+		Code    json.RawMessage `json:"code"`
+		Msg     string          `json:"msg"`
+		Message string          `json:"message"`
+		Error   struct {
+			Code    json.RawMessage `json:"code"`
+			Msg     string          `json:"msg"`
+			Message string          `json:"message"`
+		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(body), &envelope) != nil || len(envelope.Code) == 0 {
-		return ""
+	if json.Unmarshal([]byte(body), &envelope) != nil {
+		return "", "", false
 	}
-	raw := bytes.TrimSpace(envelope.Code)
+	message := envelope.Msg
+	if message == "" {
+		message = envelope.Message
+	}
+	codeRaw := envelope.Code
+	if len(codeRaw) == 0 || bytes.Equal(bytes.TrimSpace(codeRaw), []byte("null")) {
+		codeRaw = envelope.Error.Code
+		if message == "" {
+			message = envelope.Error.Msg
+		}
+		if message == "" {
+			message = envelope.Error.Message
+		}
+	}
+	if len(codeRaw) == 0 {
+		return "", message, true
+	}
+	raw := bytes.TrimSpace(codeRaw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return ""
+		return "", message, true
 	}
 	if raw[0] == '"' {
 		var code string
 		if json.Unmarshal(raw, &code) != nil {
-			return ""
+			return "", message, true
 		}
-		return strings.TrimSpace(code)
+		return strings.TrimSpace(code), message, true
 	}
 	if !json.Valid(raw) || bytes.ContainsAny(raw, "{}[]") {
-		return ""
+		return "", message, true
 	}
-	return string(raw)
+	return string(raw), message, true
 }
 
 func firstNonEmptyStatus(status, fallback int) int {

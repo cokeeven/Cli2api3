@@ -21,6 +21,7 @@ import { CompactSwitch } from '@/components/ui/CompactSwitch'
 import { QuotaMeter } from '@/components/account/QuotaMeter'
 import { RuntimeMeter } from '@/components/account/RuntimeMeter'
 import {
+  accountCooldownLabel,
   accountState,
   accountRoutingFacts,
   cooldownLabel,
@@ -115,7 +116,7 @@ export function AccountCard({
   const [, refreshCooldowns] = useState(0)
   const state = accountState(account)
   const routingFacts = accountRoutingFacts(account)
-  const cooldown = cooldownLabel(account.down_until || account.cooldown_until)
+  const cooldown = accountCooldownLabel(account)
   const restartIn = cooldownLabel(account.next_restart_at)
   const modelCooldowns = modelCooldownEntries(account)
   const dailyTasksDisabled = dailyTasksDisabledReason(account, busyKind)

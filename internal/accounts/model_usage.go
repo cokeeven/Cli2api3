@@ -69,35 +69,49 @@ type ModelUsageData struct {
 }
 
 type WorkBuddyBudgetEstimate struct {
-	AccountID             string                    `json:"account_id"`
-	Region                string                    `json:"region"`
-	Model                 string                    `json:"model"`
-	Plan                  string                    `json:"plan,omitempty"`
-	RequestPath           string                    `json:"request_path,omitempty"`
-	SampleCount           int                       `json:"sample_count"`
-	CompleteWindows       int                       `json:"complete_windows"`
-	SampleMinTokens       *int64                    `json:"sample_min_tokens"`
-	SampleMaxTokens       *int64                    `json:"sample_max_tokens"`
-	SampleFrom            *time.Time                `json:"sample_from,omitempty"`
-	SampleTo              *time.Time                `json:"sample_to,omitempty"`
-	StatisticalDays       int                       `json:"statistical_days"`
-	StatisticalTimezone   string                    `json:"statistical_timezone"`
-	WeightRule            string                    `json:"weight_rule"`
-	SampleFreshness       string                    `json:"sample_freshness"`
-	EstimatedTokens       *int64                    `json:"estimated_tokens"`
-	ObservedSinceReset    *int64                    `json:"observed_since_reset"`
-	EstimatedRemaining    *int64                    `json:"estimated_remaining"`
-	ResetAt               *time.Time                `json:"reset_at,omitempty"`
-	RestrictionObservedAt *time.Time                `json:"restriction_observed_at,omitempty"`
-	Restricted            bool                      `json:"restricted"`
-	RestrictionSource     string                    `json:"restriction_source,omitempty"`
-	Cooling               bool                      `json:"cooling"`
-	CoverageComplete      bool                      `json:"coverage_complete"`
-	CoverageState         string                    `json:"coverage_state"`
-	MissingAttempts       int                       `json:"missing_attempts"`
-	ObservationTruncated  bool                      `json:"observation_truncated"`
-	Basis                 string                    `json:"basis"`
-	Reference             *WorkBuddyBudgetReference `json:"reference,omitempty"`
+	AccountID                        string                           `json:"account_id"`
+	Region                           string                           `json:"region"`
+	Model                            string                           `json:"model"`
+	Plan                             string                           `json:"plan,omitempty"`
+	RequestPath                      string                           `json:"request_path,omitempty"`
+	SampleCount                      int                              `json:"sample_count"`
+	CompleteWindows                  int                              `json:"complete_windows"`
+	SampleMinTokens                  *int64                           `json:"sample_min_tokens"`
+	SampleMaxTokens                  *int64                           `json:"sample_max_tokens"`
+	SampleFrom                       *time.Time                       `json:"sample_from,omitempty"`
+	SampleTo                         *time.Time                       `json:"sample_to,omitempty"`
+	StatisticalDays                  int                              `json:"statistical_days"`
+	StatisticalTimezone              string                           `json:"statistical_timezone"`
+	WeightRule                       string                           `json:"weight_rule"`
+	SampleFreshness                  string                           `json:"sample_freshness"`
+	EstimatedAt                      *time.Time                       `json:"estimated_at,omitempty"`
+	EstimatedTokens                  *int64                           `json:"estimated_tokens"`
+	ObservedSinceReset               *int64                           `json:"observed_since_reset"`
+	EstimatedRemaining               *int64                           `json:"estimated_remaining"`
+	Observed24hTokens                *int64                           `json:"observed_24h_tokens"`
+	Estimated24hBudgetTokens         *int64                           `json:"estimated_24h_budget_tokens"`
+	Observed24hCoverage              string                           `json:"observed_24h_coverage"`
+	Observed24hMissing               int                              `json:"observed_24h_missing_attempts"`
+	Observed24hFrom                  *time.Time                       `json:"observed_24h_from,omitempty"`
+	Observed24hTo                    *time.Time                       `json:"observed_24h_to,omitempty"`
+	Estimated24hRemaining            *int64                           `json:"estimated_24h_remaining"`
+	Estimated24hBasis                string                           `json:"estimated_24h_basis,omitempty"`
+	FirstLimit24hSample              *WorkBuddyBudgetSample           `json:"first_limit_24h_sample,omitempty"`
+	ResetAt                          *time.Time                       `json:"reset_at,omitempty"`
+	RestrictionObservedAt            *time.Time                       `json:"restriction_observed_at,omitempty"`
+	Restricted                       bool                             `json:"restricted"`
+	RestrictionSource                string                           `json:"restriction_source,omitempty"`
+	Cooling                          bool                             `json:"cooling"`
+	CoverageComplete                 bool                             `json:"coverage_complete"`
+	CoverageState                    string                           `json:"coverage_state"`
+	MissingAttempts                  int                              `json:"missing_attempts"`
+	ObservationTruncated             bool                             `json:"observation_truncated"`
+	Basis                            string                           `json:"basis"`
+	Reference                        *WorkBuddyBudgetReference        `json:"reference,omitempty"`
+	WeakReferences                   []WorkBuddyBudgetReference       `json:"weak_references,omitempty"`
+	WeakReferencesTruncated          bool                             `json:"weak_references_truncated"`
+	LowConfidenceReferences          []WorkBuddyBudgetSampleReference `json:"low_confidence_references,omitempty"`
+	LowConfidenceReferencesTruncated bool                             `json:"low_confidence_references_truncated"`
 }
 
 // WorkBuddyBudgetReference is a historical comparison across other accounts
@@ -110,7 +124,44 @@ type WorkBuddyBudgetReference struct {
 	SampleMaxTokens *int64     `json:"sample_max_tokens"`
 	SampleFrom      *time.Time `json:"sample_from,omitempty"`
 	SampleTo        *time.Time `json:"sample_to,omitempty"`
+	Plan            string     `json:"plan,omitempty"`
+	RequestPath     string     `json:"request_path,omitempty"`
+	Confidence      string     `json:"confidence"`
+	Scope           string     `json:"scope"`
 	Basis           string     `json:"basis"`
+}
+
+// WorkBuddyBudgetSample is an explicitly low-confidence observation, not a
+// verified upstream window. It is kept separate from complete reset windows.
+type WorkBuddyBudgetSample struct {
+	Tokens          *int64     `json:"tokens"`
+	From            *time.Time `json:"from,omitempty"`
+	To              *time.Time `json:"to,omitempty"`
+	MissingAttempts int        `json:"missing_attempts"`
+	Coverage        string     `json:"coverage"`
+	Confidence      string     `json:"confidence"`
+	Source          string     `json:"source"`
+}
+
+// WorkBuddyBudgetSampleReference exposes a first-limit 24h observation as an
+// individual low-confidence sample. It is never averaged into complete-window
+// references or used as an automatic local limit.
+type WorkBuddyBudgetSampleReference struct {
+	AccountID   string                `json:"account_id"`
+	Plan        string                `json:"plan,omitempty"`
+	RequestPath string                `json:"request_path,omitempty"`
+	Scope       string                `json:"scope"`
+	Sample      WorkBuddyBudgetSample `json:"sample"`
+}
+
+// WorkBuddyBudgetTarget adds a visible catalog account/model pair without
+// claiming that it has usage or an upstream budget observation.
+type WorkBuddyBudgetTarget struct {
+	AccountID   string
+	Region      string
+	Model       string
+	Plan        string
+	RequestPath string
 }
 
 // ModelBudgetObservation is a compact, sanitized attempt row used to learn

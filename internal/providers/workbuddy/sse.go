@@ -65,7 +65,7 @@ func Aggregate(reader io.Reader) (map[string]any, error) {
 			if chunk.Usage != nil {
 				result["usage"] = chunk.Usage
 			}
-			streamErr = classifiedError(http.StatusBadGateway, []byte(payload))
+			streamErr = classifiedErrorWithEvidence(http.StatusBadGateway, nil, []byte(payload), "chat", "workbuddy_sse_aggregate")
 			break
 		}
 		if chunk.ID != "" {
@@ -187,7 +187,8 @@ func rewriteChatStream(resp *http.Response) *http.Response {
 	go func() {
 		defer resp.Body.Close()
 		defer pw.Close()
-		if err := copySanitizedSSE(resp.Body, pw); err != nil {
+		status := resp.StatusCode
+		if err := copySanitizedSSEWithEvidence(resp.Body, pw, &status); err != nil {
 			_ = pw.CloseWithError(err)
 		}
 	}()
@@ -201,6 +202,10 @@ func rewriteChatStream(resp *http.Response) *http.Response {
 }
 
 func copySanitizedSSE(src io.Reader, dst io.Writer) error {
+	return copySanitizedSSEWithEvidence(src, dst, nil)
+}
+
+func copySanitizedSSEWithEvidence(src io.Reader, dst io.Writer, httpStatus *int) error {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	sentRole := false
@@ -228,7 +233,7 @@ func copySanitizedSSE(src io.Reader, dst io.Writer) error {
 					return err
 				}
 			}
-			return classifiedError(http.StatusBadGateway, []byte(payload))
+			return classifiedErrorWithEvidence(http.StatusBadGateway, httpStatus, []byte(payload), "chat", "workbuddy_sse_event")
 		}
 		if !ok {
 			continue

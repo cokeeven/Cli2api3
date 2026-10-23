@@ -12,7 +12,11 @@ const maxRetryAfter = 10 * time.Minute
 const minRateLimitCooldown = 30 * time.Second
 
 type Classified struct {
-	Scope      string
+	Scope string
+	// LocalScope is an executor-side inference used to bound a cooldown when
+	// the provider did not report a scope. It must never be copied into
+	// upstream-facing diagnostic fields such as Classified.Scope.
+	LocalScope string
 	RetrySafe  bool
 	Kind       string
 	Status     int
@@ -27,9 +31,22 @@ type Classified struct {
 	// was captured.
 	EvidenceSource  string
 	UpstreamResetAt *time.Time
+	ErrorPhase      string
+	ErrorSource     string
+	HTTPStatus      *int
 	// Model scopes the cooldown to one public model. When set, only that
 	// model is cooled; the account keeps serving everything else.
 	Model string
+}
+
+func classifiedCooldownModel(c Classified) string {
+	if c.Scope == "account" || c.Scope == "platform" {
+		return ""
+	}
+	if c.Scope == "model" || (c.Scope == "" && c.LocalScope == "model") || c.Kind == KindRateLimit {
+		return routeModel(c.Model)
+	}
+	return ""
 }
 
 // backoffFloor and backoffCeiling bound the exponential backoff applied to

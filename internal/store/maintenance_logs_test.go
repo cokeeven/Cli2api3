@@ -88,7 +88,7 @@ func TestMaintenanceMigrationPreservesLegacyHistoryAndCredentials(t *testing.T) 
 		t.Fatal(err)
 	}
 	payload := []byte(`{"access_token":"fixture-only"}`)
-	if err = s.SaveCredentialPayload(ctx, a.ID, "workbuddy-oauth-v1", payload); err != nil {
+	if _, err = db.Exec(`INSERT INTO account_credential_payloads (account_id, format, payload, updated_at) VALUES (?, ?, ?, ?)`, a.ID, "workbuddy-oauth-v1", payload, formatTime(time.Now().UTC())); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 10, 15, 1, 0, 0, 0, time.UTC)

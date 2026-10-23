@@ -46,8 +46,9 @@ func TestCooldownEvidencePersistsPerScopeAndRestoresAcrossRestart(t *testing.T) 
 	firstObserved := first.CooldownEvidence["model-a"].FirstObservedAt
 	time.Sleep(3 * time.Millisecond)
 	manager.Pool().MarkClassified(accountA.ID, executor.Classified{
-		Kind: accounts.KindRateLimit, Scope: "model", Model: "model-a", Code: "SYNTHETIC_A_LATEST",
-		EvidenceSource: "provider_adapter_error", Cooldown: time.Hour, Message: "model-a-latest-no-reset",
+		Kind: accounts.KindUnavailable, LocalScope: "model", Model: "model-a", Code: "SYNTHETIC_A_LATEST",
+		EvidenceSource: "provider_adapter_error", ErrorPhase: "chat", ErrorSource: "provider_adapter_error",
+		Cooldown: time.Hour, Message: "model-a-latest-no-reset",
 	})
 	resetB := time.Now().UTC().Add(5 * time.Hour).Truncate(time.Second)
 	manager.Pool().MarkClassified(accountA.ID, executor.Classified{
@@ -84,7 +85,7 @@ func TestCooldownEvidencePersistsPerScopeAndRestoresAcrossRestart(t *testing.T) 
 		byKey[row.AccountID+"/"+row.Model] = row
 	}
 	rowA := byKey[accountA.ID+"/model-a"]
-	if rowA.Message != "model-a-latest-no-reset" || rowA.Evidence.Code != "SYNTHETIC_A_LATEST" || rowA.Evidence.Scope != "model" || rowA.Evidence.Source != "provider_adapter_error" {
+	if rowA.Message != "model-a-latest-no-reset" || rowA.Evidence.Code != "SYNTHETIC_A_LATEST" || rowA.Evidence.Scope != "model" || rowA.Evidence.ReportedScope != "" || rowA.Evidence.Source != "provider_adapter_error" {
 		t.Fatalf("model-a evidence was overwritten or lost: %+v", rowA)
 	}
 	if !rowA.Evidence.FirstObservedAt.Equal(firstObserved) || !rowA.Evidence.LastObservedAt.After(firstObserved) || rowA.Evidence.UpstreamResetAt != nil || !rowA.Evidence.LocalBackoffUntil.Equal(rowA.DownUntil) {
@@ -114,7 +115,7 @@ func TestCooldownEvidencePersistsPerScopeAndRestoresAcrossRestart(t *testing.T) 
 	restored.Pool().Upsert(executor.Item{ID: accountB.ID, Provider: "workbuddy", Region: "cn", Models: []string{"model-a"}})
 	restored.TestRestoreCooldowns(ctx)
 	itemA, _ := restored.Pool().ByID(accountA.ID)
-	if got := itemA.CooldownEvidence["model-a"]; got.Code != "SYNTHETIC_A_LATEST" || got.Message != "model-a-latest-no-reset" || got.Scope != "model" || got.UpstreamResetAt != nil {
+	if got := itemA.CooldownEvidence["model-a"]; got.Code != "SYNTHETIC_A_LATEST" || got.Message != "model-a-latest-no-reset" || got.Scope != "model" || got.ReportedScope != "" || got.UpstreamResetAt != nil {
 		t.Fatalf("restored model-a evidence mismatch: %+v", got)
 	}
 	if got := itemA.CooldownEvidence[""]; got.Code != "SYNTHETIC_ACCOUNT_A" || got.Message != "account-a-only" {

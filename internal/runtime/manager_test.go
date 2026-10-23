@@ -1414,7 +1414,8 @@ func TestPersistFailureKeepsDirtyEntryAndRetries(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		dirty, version, dirtyOK = manager.TestPersistSnapshot(account.ID)
-		if dirtyOK && dirty.LastError == "write-will-fail" && version == 0 && failing.failures.Load() > 0 {
+		evidence, evidenceOK := dirty.CooldownEvidence["glm-5.3"]
+		if dirtyOK && evidenceOK && evidence.Message == "write-will-fail" && version == 0 && failing.failures.Load() > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1430,9 +1431,23 @@ func TestPersistFailureKeepsDirtyEntryAndRetries(t *testing.T) {
 	if afterDirty != 0 {
 		t.Fatalf("dirty set must drain once writes succeed, got %d", afterDirty)
 	}
+	rows, err := store.LoadCooldowns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedModelCooldown bool
+	for _, row := range rows {
+		if row.AccountID == account.ID && row.Model == "glm-5.3" && row.Kind == accounts.KindRateLimit && row.Message == "write-will-fail" {
+			savedModelCooldown = true
+			break
+		}
+	}
+	if !savedModelCooldown {
+		t.Fatalf("retry did not persist latest model-scoped state: %+v", rows)
+	}
 	saved, err := store.Get(ctx, account.ID)
-	if err != nil || saved.LastError != "write-will-fail" {
-		t.Fatalf("retry did not persist latest state: %+v err=%v", saved, err)
+	if err != nil || saved.LastError != "" {
+		t.Fatalf("model-scoped error must not be copied to the account error: %+v err=%v", saved, err)
 	}
 }
 

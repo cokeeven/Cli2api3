@@ -25,7 +25,7 @@ func (s *Store) InsertRequestLog(ctx context.Context, log accounts.RequestLog) e
 	if log.FinishedAt != nil {
 		finished = formatTime(*log.FinishedAt)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execSQLiteBusyRetry(ctx, s.db, `
 	INSERT INTO request_logs (
 		  id, created_at, finished_at, stream, status, requested_model, mapped_model, requested_reasoning, resolved_reasoning, account_id, provider, routing,
 		  prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, usage_source, credits,
@@ -55,7 +55,7 @@ func (s *Store) UpdateRequestLog(ctx context.Context, log accounts.RequestLog) e
 	if log.FinishedAt != nil {
 		finished = formatTime(*log.FinishedAt)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	result, err := execSQLiteBusyRetry(ctx, s.db, `
 		UPDATE request_logs SET
 		  finished_at = ?, status = ?, requested_model = ?, mapped_model = ?, requested_reasoning = ?, resolved_reasoning = ?, account_id = ?, provider = ?, routing = ?,
 		  prompt_tokens = ?, completion_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
@@ -112,18 +112,18 @@ func (s *Store) InsertRequestAttempt(ctx context.Context, attempt accounts.Reque
 	if attempt.FinishedAt != nil {
 		finished = formatTime(*attempt.FinishedAt)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execSQLiteBusyRetry(ctx, s.db, `
 INSERT INTO request_attempts (
   id, request_id, attempt_index, account_id, started_at, finished_at, status, http_status,
   error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source, provider, model, key_id, credits, usage_state, error_scope, route_reason,
-  provider_region, error_code, upstream_reset_at, provider_plan
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  provider_region, error_code, upstream_reset_at, provider_plan, error_phase, error_source
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		attempt.ID, attempt.RequestID, attempt.AttemptIndex, attempt.AccountID,
 		formatTime(attempt.StartedAt), finished, attempt.Status, nullableInt(attempt.HTTPStatus),
 		attempt.ErrorKind, attempt.ErrorMessage, nullableInt(attempt.LatencyMs),
 		nullableInt(attempt.PromptTokens), nullableInt(attempt.CompletionTokens), attempt.UsageSource,
 		attempt.Provider, attempt.Model, attempt.KeyID, nullableFloat(attempt.Credits), attempt.UsageState, attempt.ErrorScope, attempt.RouteReason,
-		attempt.Region, attempt.ErrorCode, nullableTimePtr(attempt.UpstreamResetAt), attempt.ProviderPlan,
+		attempt.Region, attempt.ErrorCode, nullableTimePtr(attempt.UpstreamResetAt), attempt.ProviderPlan, attempt.ErrorPhase, attempt.ErrorSource,
 	)
 	if err != nil {
 		return fmt.Errorf("insert request attempt: %w", err)
@@ -536,7 +536,7 @@ func (s *Store) InsertRequestUsageDetail(ctx context.Context, detail accounts.Re
 	if unit == "" {
 		unit = "credits"
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execSQLiteBusyRetry(ctx, s.db, `
 INSERT INTO request_usage_details (request_id, created_at, provider, credit, unit)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(request_id) DO UPDATE SET
@@ -587,7 +587,7 @@ func (s *Store) InsertRequestStreamDiagnostic(ctx context.Context, diagnostic ac
 	if diagnostic.ContentLength != nil {
 		contentLength = *diagnostic.ContentLength
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := execSQLiteBusyRetry(ctx, s.db, `
 INSERT INTO request_stream_diagnostics (
   request_id, created_at, finished_at, upstream_status, upstream_request_id, context_err,
   cancellation_source, relay_error, sse_event_count, bytes_read, content_length,
@@ -706,7 +706,7 @@ func (s *Store) listRequestAttempts(ctx context.Context, requestID string) ([]ac
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, request_id, attempt_index, account_id, started_at, finished_at, status, http_status,
        error_kind, error_message, latency_ms, prompt_tokens, completion_tokens, usage_source,provider,model,key_id,credits,usage_state,error_scope,route_reason,
-       provider_region,error_code,upstream_reset_at,provider_plan
+       provider_region,error_code,upstream_reset_at,provider_plan,error_phase,error_source
 FROM request_attempts WHERE request_id = ? ORDER BY attempt_index ASC, started_at ASC`, requestID)
 	if err != nil {
 		return nil, fmt.Errorf("list request attempts: %w", err)
@@ -916,7 +916,7 @@ func scanRequestAttempt(row rowScanner) (accounts.RequestAttempt, error) {
 		&attempt.ID, &attempt.RequestID, &attempt.AttemptIndex, &attempt.AccountID, &started, &finished,
 		&attempt.Status, &httpStatus, &attempt.ErrorKind, &attempt.ErrorMessage, &latency, &prompt, &completion, &attempt.UsageSource,
 		&attempt.Provider, &attempt.Model, &attempt.KeyID, &credits, &attempt.UsageState, &attempt.ErrorScope, &attempt.RouteReason,
-		&attempt.Region, &attempt.ErrorCode, &upstreamResetAt, &attempt.ProviderPlan,
+		&attempt.Region, &attempt.ErrorCode, &upstreamResetAt, &attempt.ProviderPlan, &attempt.ErrorPhase, &attempt.ErrorSource,
 	)
 	if err != nil {
 		return accounts.RequestAttempt{}, err

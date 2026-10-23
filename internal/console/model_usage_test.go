@@ -61,8 +61,8 @@ func TestModelUsageHandlerReadsBoundedLocalDataAndRouteReasons(t *testing.T) {
 	if len(body.Routes) != 1 || len(body.Routes[0].Candidates) != 1 || body.Routes[0].Candidates[0].Reason != "available" || !body.Routes[0].Candidates[0].Schedulable {
 		t.Fatalf("routes=%+v", body.Routes)
 	}
-	if len(body.Budgets) != 0 {
-		t.Fatalf("unqualified WorkBuddy history must not estimate: %+v", body.Budgets)
+	if len(body.Budgets) != 1 || body.Budgets[0].AccountID != "wb-a" || body.Budgets[0].EstimatedTokens != nil || body.Budgets[0].EstimatedRemaining != nil || body.Budgets[0].Observed24hTokens == nil || *body.Budgets[0].Observed24hTokens != 15 {
+		t.Fatalf("catalog visibility may show actual 24h use but must not fabricate a budget or remaining amount: %+v", body.Budgets)
 	}
 
 	bad := httptest.NewRecorder()
@@ -104,6 +104,59 @@ func TestModelUsageRoutesIncludeCurrentCatalogWithoutRequestHistory(t *testing.T
 	routes := handler.modelUsageRoutes("workbuddy", "cn", "", "", nil)
 	if len(routes) != 1 || routes[0].Model != "glm-5.3" || len(routes[0].Candidates) != 1 || routes[0].Candidates[0].ID != "wb-a" {
 		t.Fatalf("routes without request history = %+v", routes)
+	}
+}
+
+func TestModelUsageBudgetCatalogIncludesUnobservedModelsWithBoundedFiltersAndPaging(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "budget-catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recorder := logs.NewRequestRecorder(db)
+	defer recorder.Close()
+	ready := true
+	pool := executor.NewPool(nil, nil)
+	pool.Upsert(executor.Item{ID: "wb-a", Provider: "workbuddy", Region: "cn", Ready: &ready, Models: []string{"glm-5.3"}})
+	pool.Upsert(executor.Item{ID: "wb-b", Provider: "workbuddy", Region: "cn", Ready: &ready, Models: []string{"glm-5.3"}})
+	pool.Upsert(executor.Item{ID: "wb-global", Provider: "workbuddy", Region: "global", Ready: &ready, Models: []string{"glm-5.3"}})
+	pool.Upsert(executor.Item{ID: "trae-cn", Provider: "trae", Region: "cn", Ready: &ready, Models: []string{"glm-5.3"}})
+	handler := &Handler{Recorder: recorder, Pool: pool}
+	now := time.Now().UTC()
+	from, to := now.Add(-24*time.Hour).Format(time.RFC3339), now.Format(time.RFC3339)
+	path := "/api/model-usage?provider=workbuddy&region=cn&model=glm-5.3&from=" + from + "&to=" + to + "&budget_limit=1&budget_offset=1"
+	response := httptest.NewRecorder()
+	handler.HandleModelUsage(response, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Budgets []accounts.WorkBuddyBudgetEstimate `json:"workbuddy_budgets"`
+		Total   int                                `json:"workbuddy_budgets_total"`
+		Offset  int                                `json:"workbuddy_budgets_offset"`
+		Limit   int                                `json:"workbuddy_budgets_limit"`
+		HasMore bool                               `json:"workbuddy_budgets_has_more"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Total != 2 || body.Offset != 1 || body.Limit != 1 || body.HasMore || len(body.Budgets) != 1 || body.Budgets[0].AccountID != "wb-b" {
+		t.Fatalf("budget catalog filters/paging = %+v", body)
+	}
+	row := body.Budgets[0]
+	if row.Model != "glm-5.3" || row.Region != "cn" || row.EstimatedTokens != nil || row.Observed24hTokens != nil || row.Reference != nil || len(row.LowConfidenceReferences) != 0 {
+		t.Fatalf("unobserved catalog model must retain unknown budget and usage: %+v", row)
+	}
+
+	filtered := httptest.NewRecorder()
+	handler.HandleModelUsage(filtered, httptest.NewRequest(http.MethodGet, strings.Replace(path, "&budget_limit=1&budget_offset=1", "&account=wb-a&budget_limit=10", 1), nil).WithContext(ctx))
+	var filteredBody struct {
+		Budgets []accounts.WorkBuddyBudgetEstimate `json:"workbuddy_budgets"`
+		Total   int                                `json:"workbuddy_budgets_total"`
+	}
+	if filtered.Code != http.StatusOK || json.Unmarshal(filtered.Body.Bytes(), &filteredBody) != nil || filteredBody.Total != 1 || len(filteredBody.Budgets) != 1 || filteredBody.Budgets[0].AccountID != "wb-a" {
+		t.Fatalf("account filter was not applied to budget targets: status=%d body=%s", filtered.Code, filtered.Body.String())
 	}
 }
 

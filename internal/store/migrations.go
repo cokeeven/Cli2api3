@@ -369,6 +369,13 @@ ALTER TABLE account_cooldowns ADD COLUMN reported_scope TEXT NOT NULL DEFAULT ''
 ALTER TABLE account_cooldowns ADD COLUMN upstream_reset_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE account_cooldowns ADD COLUMN local_backoff_until TEXT NOT NULL DEFAULT '';
 `},
+	{filename: "038_attempt_error_evidence.sql", sql: `
+ALTER TABLE request_attempts ADD COLUMN error_phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_attempts ADD COLUMN error_source TEXT NOT NULL DEFAULT '';
+`},
+	{filename: "039_credential_generation.sql", sql: `
+ALTER TABLE accounts ADD COLUMN credential_generation INTEGER NOT NULL DEFAULT 0;
+`},
 }
 
 const schemaMigrationsDDL = `

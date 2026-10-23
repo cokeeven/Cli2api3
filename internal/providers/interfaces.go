@@ -96,6 +96,15 @@ type CredentialPayloadCASStore interface {
 	SaveCredentialPayloadIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte) (bool, error)
 }
 
+// CredentialRefreshCASStore persists a successful provider refresh only when
+// both the credential payload and credential generation still match the
+// snapshot used for the upstream request. Implementations may clear a prior
+// authentication failure in the same transaction; a later login or auth
+// observation must win over an older refresh response.
+type CredentialRefreshCASStore interface {
+	SaveCredentialPayloadAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64) (bool, error)
+}
+
 // LoginSession describes one browser-login round for an account.
 type LoginSession struct {
 	AuthURL string `json:"auth_url"`
@@ -297,13 +306,20 @@ type AccountProber interface {
 type Error struct {
 	// Scope and RetrySafe describe an explicit upstream rejection. Empty
 	// scope means unknown; transports must never infer billability from it.
-	Scope            string
-	RetrySafe        bool
-	Kind             string
-	Status           int
-	Message          string
-	Code             string
-	Type             string
+	Scope     string
+	RetrySafe bool
+	Kind      string
+	Status    int
+	Message   string
+	Code      string
+	Type      string
+	// Phase and Source are bounded diagnostic labels supplied by the adapter.
+	// HTTPStatus is the observed upstream response status; Status remains the
+	// normalized client-facing classification status.
+	Phase            string
+	Source           string
+	HTTPStatus       *int
+	Cause            error `json:"-"`
 	RetryAfter       time.Duration
 	RetryAfterHeader string
 	// UpstreamResetAt is the explicit provider-supplied reset instant when the
@@ -328,6 +344,13 @@ func (e *Error) Error() string {
 		return e.Message
 	}
 	return e.Kind
+}
+
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 // Adapter bundles the optional capability interfaces. Every field may be nil;

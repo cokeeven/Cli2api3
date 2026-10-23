@@ -52,7 +52,7 @@ const (
 	pathDailyCheckin  = "/v2/billing/meter/daily-checkin"
 
 	sessionDeadCode         = 12153
-	sessionDeadText         = "Offline user session not found"
+	sessionDeadText         = "offline user session not found"
 	missingSystemPromptCode = 11128
 	missingSystemPromptText = "first message is not system prompt"
 	toolCallSequenceCode    = 11148

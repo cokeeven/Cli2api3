@@ -35,6 +35,13 @@ type modelUsageRoute struct {
 	Candidates []executor.RouteCandidate `json:"candidates"`
 }
 
+const (
+	defaultModelUsageBudgetPageSize = 200
+	maxModelUsageBudgetPageSize     = 500
+	maxModelUsageBudgetOffset       = 20000
+	maxModelUsageBudgetTargets      = 2000
+)
+
 func (h *Handler) HandleModelUsage(w http.ResponseWriter, r *http.Request) {
 	if h == nil {
 		writeErr(w, http.StatusServiceUnavailable, "model_usage_unavailable", "模型用量服务不可用")
@@ -90,6 +97,24 @@ func (h *Handler) HandleModelUsage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	budgetLimit := defaultModelUsageBudgetPageSize
+	if raw := strings.TrimSpace(query.Get("budget_limit")); raw != "" {
+		if value, err := parseBoundedInt(raw, 1, maxModelUsageBudgetPageSize); err == nil {
+			budgetLimit = value
+		} else {
+			writeErr(w, http.StatusBadRequest, "invalid_budget_limit", "预算分页上限必须在1到500之间")
+			return
+		}
+	}
+	budgetOffset := 0
+	if raw := strings.TrimSpace(query.Get("budget_offset")); raw != "" {
+		if value, err := parseBoundedInt(raw, 0, maxModelUsageBudgetOffset); err == nil {
+			budgetOffset = value
+		} else {
+			writeErr(w, http.StatusBadRequest, "invalid_budget_offset", "预算分页偏移必须在0到20000之间")
+			return
+		}
+	}
 	filter := accounts.ModelUsageQuery{
 		Provider: provider, Region: strings.ToLower(strings.TrimSpace(query.Get("region"))),
 		Model: strings.TrimSpace(query.Get("model")), Account: strings.TrimSpace(query.Get("account")),
@@ -101,23 +126,70 @@ func (h *Handler) HandleModelUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	budgets := make([]accounts.WorkBuddyBudgetEstimate, 0)
+	budgetTotal := 0
+	budgetCatalogTruncated := false
 	if !strings.EqualFold(provider, "trae") {
-		allBudgets := accounts.EstimateWorkBuddyBudgetsInRange(data.BudgetObservations, data.To, data.BudgetObservationFrom, data.BudgetObservationsTruncated)
+		targets, truncatedTargets := h.workbuddyBudgetTargets(filter)
+		budgetCatalogTruncated = truncatedTargets
+		allBudgets := accounts.EstimateWorkBuddyBudgetsForTargetsInRange(data.BudgetObservations, targets, data.To, data.BudgetObservationFrom, data.BudgetObservationsTruncated)
 		for _, budget := range allBudgets {
 			if filter.Account == "" || budget.AccountID == filter.Account {
-				budgets = append(budgets, budget)
+				budgetTotal++
+				if budgetTotal > budgetOffset && len(budgets) < budgetLimit {
+					budgets = append(budgets, budget)
+				}
 			}
 		}
 	}
 	response := map[string]any{
-		"data":                        data,
-		"accounts":                    h.modelUsageAccounts(r, provider, filter.Region),
-		"routes":                      h.modelUsageRoutes(provider, filter.Region, filter.Model, filter.Account, data.Rows),
-		"workbuddy_budgets":           budgets,
-		"budget_observation_complete": !data.BudgetObservationsTruncated,
-		"source":                      "gateway_local_observation",
+		"data":                               data,
+		"accounts":                           h.modelUsageAccounts(r, provider, filter.Region),
+		"routes":                             h.modelUsageRoutes(provider, filter.Region, filter.Model, filter.Account, data.Rows),
+		"workbuddy_budgets":                  budgets,
+		"workbuddy_budgets_total":            budgetTotal,
+		"workbuddy_budgets_offset":           budgetOffset,
+		"workbuddy_budgets_limit":            budgetLimit,
+		"workbuddy_budgets_has_more":         budgetOffset+len(budgets) < budgetTotal,
+		"workbuddy_budget_catalog_truncated": budgetCatalogTruncated,
+		"budget_observation_complete":        !data.BudgetObservationsTruncated,
+		"source":                             "gateway_local_observation",
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) workbuddyBudgetTargets(filter accounts.ModelUsageQuery) ([]accounts.WorkBuddyBudgetTarget, bool) {
+	if h == nil || h.Pool == nil || strings.EqualFold(filter.Provider, "trae") {
+		return []accounts.WorkBuddyBudgetTarget{}, false
+	}
+	items := h.Pool.Items()
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	targets := make([]accounts.WorkBuddyBudgetTarget, 0)
+	for _, item := range items {
+		if executor.NormalizeProviderFamily(item.Provider) != "workbuddy" || item.ID == "" {
+			continue
+		}
+		if filter.Region != "" && !strings.EqualFold(filter.Region, item.Region) {
+			continue
+		}
+		if filter.Account != "" && filter.Account != item.ID {
+			continue
+		}
+		models := append([]string(nil), item.Models...)
+		sort.Strings(models)
+		lastModel := ""
+		for _, model := range models {
+			model = strings.TrimSpace(model)
+			if model == "" || model == lastModel || (filter.Model != "" && filter.Model != model) {
+				continue
+			}
+			lastModel = model
+			if len(targets) >= maxModelUsageBudgetTargets {
+				return targets, true
+			}
+			targets = append(targets, accounts.WorkBuddyBudgetTarget{AccountID: item.ID, Region: item.Region, Model: model})
+		}
+	}
+	return targets, false
 }
 
 func (h *Handler) modelUsageAccounts(r *http.Request, provider, region string) []modelUsageAccount {

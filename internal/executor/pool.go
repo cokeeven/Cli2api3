@@ -843,8 +843,16 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 		if p.items[i].ID != id {
 			continue
 		}
-		p.items[i].LastError = c.Message
-		if c.Kind == KindQuota && c.Scope != "model" {
+		model := classifiedCooldownModel(c)
+		if c.Scope == "model" && model == "" {
+			// An explicit model scope without a usable model identifier cannot
+			// safely be widened into an account-wide restriction.
+			break
+		}
+		if model == "" {
+			p.items[i].LastError = c.Message
+		}
+		if c.Kind == KindQuota && model == "" {
 			quota := cloneQuotaSnapshot(p.items[i].Quota)
 			if quota == nil {
 				quota = &QuotaSnapshot{}
@@ -858,10 +866,6 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 		// must be scoped per model: rate_limit on model-A followed by auth
 		// on model-B must not make a later auth on model-A look like a
 		// repeat. Account-wide LastKind covers non-model-scoped failures.
-		model := routeModel(c.Model)
-		if c.Kind != KindRateLimit && !(c.Kind == KindQuota && c.Scope == "model") {
-			model = ""
-		}
 		var prevKind string
 		if model != "" {
 			if p.items[i].ModelLastKind != nil {

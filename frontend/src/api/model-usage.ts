@@ -41,6 +41,21 @@ export type ModelUsageError = {
   upstream_reset_at?: string | null
 }
 
+export type BudgetReference = {
+  estimated_tokens: number | null
+  sample_count: number
+  account_count: number
+  sample_min_tokens: number | null
+  sample_max_tokens: number | null
+  sample_from?: string
+  sample_to?: string
+  plan?: string
+  request_path?: string
+  confidence: string
+  scope: string
+  basis: string
+}
+
 export type BudgetEstimate = {
   account_id: string
   region: string
@@ -60,6 +75,16 @@ export type BudgetEstimate = {
   estimated_tokens: number | null
   observed_since_reset: number | null
   estimated_remaining: number | null
+  observed_24h_tokens: number | null
+  estimated_24h_budget_tokens: number | null
+  observed_24h_coverage: string
+  observed_24h_missing_attempts: number
+  observed_24h_from?: string
+  observed_24h_to?: string
+  estimated_24h_remaining: number | null
+  estimated_24h_basis?: string
+  estimated_at?: string
+  first_limit_24h_sample?: BudgetObservationSample
   reset_at?: string
   restriction_observed_at?: string
   restricted: boolean
@@ -70,16 +95,27 @@ export type BudgetEstimate = {
   missing_attempts: number
   observation_truncated: boolean
   basis: string
-  reference?: {
-    estimated_tokens: number | null
-    sample_count: number
-    account_count: number
-    sample_min_tokens: number | null
-    sample_max_tokens: number | null
-    sample_from?: string
-    sample_to?: string
-    basis: string
-  }
+  reference?: BudgetReference
+  weak_references?: BudgetReference[]
+  weak_references_truncated: boolean
+  low_confidence_references?: Array<{
+    account_id: string
+    plan?: string
+    request_path?: string
+    scope: string
+    sample: BudgetObservationSample
+  }>
+  low_confidence_references_truncated: boolean
+}
+
+export type BudgetObservationSample = {
+  tokens: number | null
+  from?: string
+  to?: string
+  missing_attempts: number
+  coverage: string
+  confidence: string
+  source: string
 }
 
 export type ModelUsageAccount = {
@@ -154,6 +190,11 @@ export type ModelUsageResponse = {
   accounts: ModelUsageAccount[]
   routes: { provider: string; region: string; model: string; candidates: RouteCandidate[] }[]
   workbuddy_budgets: BudgetEstimate[] | null
+  workbuddy_budgets_total: number
+  workbuddy_budgets_offset: number
+  workbuddy_budgets_limit: number
+  workbuddy_budgets_has_more: boolean
+  workbuddy_budget_catalog_truncated: boolean
   budget_observation_complete: boolean
   source: string
 }
@@ -166,6 +207,8 @@ export type ModelUsageQuery = {
   from?: string
   to?: string
   limit?: number
+  budget_limit?: number
+  budget_offset?: number
 }
 
 export type ModelProbeResult = {

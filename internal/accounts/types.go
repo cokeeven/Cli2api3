@@ -36,16 +36,17 @@ type Account struct {
 	CheckinTime          string `json:"checkin_time"`
 	ProxyURL             string `json:"-"`
 	// LastCheckin* are display-only WorkBuddy ops results.
-	LastCheckinAt     string         `json:"last_checkin_at,omitempty"`
-	LastCheckinMsg    string         `json:"last_checkin_msg,omitempty"`
-	LastCheckinStatus string         `json:"last_checkin_status,omitempty"`
-	Status            string         `json:"status"`
-	LastError         string         `json:"last_error,omitempty"`
-	LastErrorKind     string         `json:"last_error_kind,omitempty"`
-	CooldownUntil     *time.Time     `json:"cooldown_until,omitempty"`
-	Quota             *QuotaSnapshot `json:"-"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	LastCheckinAt        string         `json:"last_checkin_at,omitempty"`
+	LastCheckinMsg       string         `json:"last_checkin_msg,omitempty"`
+	LastCheckinStatus    string         `json:"last_checkin_status,omitempty"`
+	Status               string         `json:"status"`
+	LastError            string         `json:"last_error,omitempty"`
+	LastErrorKind        string         `json:"last_error_kind,omitempty"`
+	CooldownUntil        *time.Time     `json:"cooldown_until,omitempty"`
+	Quota                *QuotaSnapshot `json:"-"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
+	CredentialGeneration int64          `json:"-"`
 }
 
 type CreateAccount struct {

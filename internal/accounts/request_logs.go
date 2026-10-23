@@ -119,6 +119,8 @@ type RequestAttempt struct {
 	UsageState       string     `json:"usage_state,omitempty"`
 	ErrorScope       string     `json:"error_scope,omitempty"`
 	ErrorCode        string     `json:"error_code,omitempty"`
+	ErrorPhase       string     `json:"error_phase,omitempty"`
+	ErrorSource      string     `json:"error_source,omitempty"`
 	UpstreamResetAt  *time.Time `json:"upstream_reset_at,omitempty"`
 	RouteReason      string     `json:"route_reason,omitempty"`
 	ID               string     `json:"id"`

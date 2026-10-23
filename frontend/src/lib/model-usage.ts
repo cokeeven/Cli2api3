@@ -18,3 +18,12 @@ export function workbuddyBudgetKey(item: BudgetIdentity): string {
     item.request_path ?? '',
   ])
 }
+
+export function budgetProgressPercent(used: number | null | undefined, reference: number | null | undefined): number | null {
+  if (used == null || reference == null || !Number.isFinite(used) || !Number.isFinite(reference) || used < 0 || reference <= 0) return null
+  return Math.max(0, Math.min(100, Math.round((used / reference) * 100)))
+}
+
+export function budgetProgressExceedsReference(used: number | null | undefined, reference: number | null | undefined): boolean {
+  return used != null && reference != null && Number.isFinite(used) && Number.isFinite(reference) && reference > 0 && used > reference
+}

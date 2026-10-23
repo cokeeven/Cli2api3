@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { workbuddyBudgetKey } from '../src/lib/model-usage.ts'
+import { budgetProgressExceedsReference, budgetProgressPercent, workbuddyBudgetKey } from '../src/lib/model-usage.ts'
 
 test('WorkBuddy budget identity includes the full observation grouping dimensions', () => {
   const base = {
@@ -19,4 +19,23 @@ test('WorkBuddy budget identity includes the full observation grouping dimension
     workbuddyBudgetKey({ ...base, plan: 'pro/a', request_path: 'b' }),
     workbuddyBudgetKey({ ...base, plan: 'pro', request_path: 'a/b' }),
   )
+})
+
+test('budget progress keeps unknowns unavailable and clamps only known ratios', () => {
+  assert.equal(budgetProgressPercent(null, 100), null)
+  assert.equal(budgetProgressPercent(0, null), null)
+  assert.equal(budgetProgressPercent(-1, 100), null)
+  assert.equal(budgetProgressPercent(Number.NaN, 100), null)
+  assert.equal(budgetProgressPercent(Number.NEGATIVE_INFINITY, 100), null)
+  assert.equal(budgetProgressPercent(0, Number.NaN), null)
+  assert.equal(budgetProgressPercent(0, Number.POSITIVE_INFINITY), null)
+  assert.equal(budgetProgressPercent(0, 100), 0)
+  assert.equal(budgetProgressPercent(25, 100), 25)
+  assert.equal(budgetProgressPercent(130, 100), 100)
+  assert.equal(budgetProgressPercent(10, 0), null)
+  assert.equal(budgetProgressExceedsReference(150, 100), true)
+  assert.equal(budgetProgressExceedsReference(100, 100), false)
+  assert.equal(budgetProgressExceedsReference(150, null), false)
+  assert.equal(budgetProgressExceedsReference(-1, 100), false)
+  assert.equal(budgetProgressExceedsReference(Number.POSITIVE_INFINITY, 100), false)
 })

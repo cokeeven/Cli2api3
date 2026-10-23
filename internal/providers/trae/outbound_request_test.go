@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
@@ -102,6 +104,36 @@ func TestChatMethodsRejectUnsupportedResponseFormatBeforeCredentialLookup(t *tes
 				t.Fatalf("chat method error=%v", err)
 			}
 		})
+	}
+}
+
+func TestChatRejectsPartialToolArgumentsWithoutRepairOrUpstreamCall(t *testing.T) {
+	var requests atomic.Int32
+	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	credential, err := (Credential{AccessToken: "synthetic-access", RefreshToken: "synthetic-refresh", UID: "synthetic-user", Domain: DomainCN, ExpiresAt: 4102444800}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.items = map[string][]byte{"synthetic-account": credential}
+	_, err = client.ChatNonStream(context.Background(), "synthetic-account", translate.ChatRequest{
+		Model: "synthetic-model",
+		Messages: []translate.ChatMessage{
+			{Role: "user", Content: "run a harmless local calculation"},
+			{Role: "assistant", ToolCalls: json.RawMessage(`[{"id":"call-synthetic","type":"function","function":{"name":"count","arguments":"{\"value\":\"private-marker"}}]`)},
+		},
+	})
+	var providerErr *providers.Error
+	if !errors.As(err, &providerErr) || providerErr.Code != "invalid_tool_history" || providerErr.Kind != "invalid_request" {
+		t.Fatalf("partial tool history error=%v", err)
+	}
+	if !strings.Contains(providerErr.Message, "messages[1].tool_calls[0]") || !strings.Contains(providerErr.Message, "不会自动补全") {
+		t.Fatalf("error lacks a safe structural explanation: %q", providerErr.Message)
+	}
+	if strings.Contains(providerErr.Message, "private-marker") || requests.Load() != 0 {
+		t.Fatalf("tool arguments leaked or upstream was called: message=%q requests=%d", providerErr.Message, requests.Load())
 	}
 }
 

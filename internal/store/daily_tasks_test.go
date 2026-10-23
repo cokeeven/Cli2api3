@@ -199,7 +199,7 @@ func TestDailyTasksMigrationPreservesExistingAccountsAndCredentials(t *testing.T
 		t.Fatal(err)
 	}
 	payload := []byte(`{"access_token":"fixture-only","uid":"existing"}`)
-	if err = s.SaveCredentialPayload(ctx, a.ID, "workbuddy-oauth-v1", payload); err != nil {
+	if _, err = db.Exec(`INSERT INTO account_credential_payloads (account_id, format, payload, updated_at) VALUES (?, ?, ?, ?)`, a.ID, "workbuddy-oauth-v1", payload, formatTime(time.Now().UTC())); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.Close(); err != nil {
@@ -213,6 +213,9 @@ func TestDailyTasksMigrationPreservesExistingAccountsAndCredentials(t *testing.T
 	got, err := upgraded.Get(ctx, a.ID)
 	if err != nil || got.Name != a.Name || got.ProviderRegion != a.ProviderRegion {
 		t.Fatalf("account changed: %+v %v", got, err)
+	}
+	if got.CredentialGeneration != 0 {
+		t.Fatalf("legacy account credential generation = %d, want zero baseline", got.CredentialGeneration)
 	}
 	_, saved, err := upgraded.LoadCredentialPayload(ctx, a.ID)
 	if err != nil || string(saved) != string(payload) {

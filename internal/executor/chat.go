@@ -635,8 +635,28 @@ func (e ChatExecutor) markClassified(id string, c Classified, model string) {
 		}
 		return
 	}
-	if c.Model == "" && ((c.Kind == accounts.KindRateLimit && c.Scope != "account") || c.Scope == "model") {
-		c.Model = model
+	if c.Scope == "account" {
+		// An explicit account scope wins even if an adapter accidentally
+		// carried a model label with the classification.
+		c.Model = ""
+		c.LocalScope = ""
+	} else if c.Scope == "model" {
+		if c.Model == "" {
+			c.Model = model
+		}
+	} else if c.Scope == "" {
+		switch {
+		case c.Kind == accounts.KindRateLimit && c.Model == "":
+			c.Model = model
+		case c.Kind == accounts.KindUnavailable && c.ErrorPhase == "chat":
+			if item, ok := e.Pool.ByID(id); ok && itemProvider(item) == "workbuddy" {
+				// WorkBuddy chat errors without an upstream scope are locally
+				// isolated to the selected account/model pair. Preserve Scope
+				// as empty so diagnostics do not claim the provider said model.
+				c.Model = model
+				c.LocalScope = "model"
+			}
+		}
 	}
 	e.Pool.MarkClassified(id, c)
 }
@@ -669,6 +689,16 @@ func (e ChatExecutor) recordAttempt(ctx context.Context, attempt accounts.Reques
 		}
 		if attempt.ErrorCode == "" {
 			attempt.ErrorCode = classified.Code
+		}
+		if attempt.ErrorPhase == "" {
+			attempt.ErrorPhase = classified.ErrorPhase
+		}
+		if attempt.ErrorSource == "" {
+			attempt.ErrorSource = classified.ErrorSource
+		}
+		if attempt.HTTPStatus == nil && classified.HTTPStatus != nil {
+			status := *classified.HTTPStatus
+			attempt.HTTPStatus = &status
 		}
 		var providerErr *providers.Error
 		if errors.As(failure[0], &providerErr) && providerErr != nil && providerErr.UpstreamResetAt != nil {
@@ -1150,12 +1180,13 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		started := time.Now()
 		resp, err := e.HTTPClient.Do(httpReq)
 		if err != nil {
+			err = providers.ChatContextError(ctx, err)
 			if requestContextDone(ctx, err) {
 				latency := int(time.Since(started).Milliseconds())
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
 					Status: accounts.AttemptStatusCanceled, ErrorKind: accounts.KindCanceled, ErrorMessage: err.Error(), LatencyMs: &latency,
-				})
+				}, err)
 				return ChatResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
 			classified := Classify(0, err.Error(), "", accounts.KindUnavailable, "")
@@ -1414,7 +1445,7 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 			return partial, Classified{Kind: accounts.KindInvalidRequest, Message: err.Error()}, err
 		}
 		if requestContextDone(ctx, err) {
-			e.recordAttempt(ctx, accounts.RequestAttempt{AttemptIndex: attemptIndex, AccountID: item.ID, StartedAt: started, FinishedAt: &finished, Status: accounts.AttemptStatusCanceled, ErrorKind: accounts.KindCanceled, ErrorMessage: err.Error(), LatencyMs: &latency})
+			e.recordAttempt(ctx, accounts.RequestAttempt{AttemptIndex: attemptIndex, AccountID: item.ID, StartedAt: started, FinishedAt: &finished, Status: accounts.AttemptStatusCanceled, ErrorKind: accounts.KindCanceled, ErrorMessage: err.Error(), LatencyMs: &latency}, err)
 			return partial, Classified{Kind: accounts.KindUnavailable, Message: err.Error()}, err
 		}
 		classified := e.classifyInProcessError(err)
@@ -1682,12 +1713,13 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 		started := time.Now()
 		resp, err := e.streamHTTPClient().Do(httpReq)
 		if err != nil {
+			err = providers.ChatContextError(ctx, err)
 			if requestContextDone(ctx, err) {
 				latency := int(time.Since(started).Milliseconds())
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
 					Status: accounts.AttemptStatusCanceled, ErrorKind: accounts.KindCanceled, ErrorMessage: err.Error(), LatencyMs: &latency,
-				})
+				}, err)
 				return StreamResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
 			classified := Classify(0, err.Error(), "", accounts.KindUnavailable, "")

@@ -14,7 +14,7 @@ func (s *Store) UpdateRequestRoutingDiagnostic(ctx context.Context, diagnostic a
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE request_logs SET routing_diagnostic_json = ? WHERE id = ?`, string(encoded), diagnostic.RequestID)
+	result, err := execSQLiteBusyRetry(ctx, s.db, `UPDATE request_logs SET routing_diagnostic_json = ? WHERE id = ?`, string(encoded), diagnostic.RequestID)
 	if err != nil {
 		return fmt.Errorf("update routing diagnostic: %w", err)
 	}

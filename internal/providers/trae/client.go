@@ -803,6 +803,10 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if !credential.needsRefresh(now) {
 		return credential, nil
 	}
+	account, err := c.store.Get(ctx, accountID)
+	if err != nil {
+		return Credential{}, fmt.Errorf("load Trae account before credential refresh: %w", err)
+	}
 	if c.credentialRefreshCoolingDown(accountID, now) {
 		return c.useTraeCredentialFallback(ctx, accountID, credential, now, fmt.Errorf("credential refresh is cooling down"), false)
 	}
@@ -815,7 +819,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialIfCurrent(ctx, accountID, format, payload, encoded)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -884,12 +888,12 @@ func (c *Client) clearCredentialRefreshFailure(accountID string) {
 	c.mu.Unlock()
 }
 
-func (c *Client) saveCredentialIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte) (bool, error) {
-	store, ok := c.store.(providers.CredentialPayloadCASStore)
+func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64) (bool, error) {
+	store, ok := c.store.(providers.CredentialRefreshCASStore)
 	if !ok {
-		return false, fmt.Errorf("trae credential store does not support compare-and-swap persistence")
+		return false, fmt.Errorf("trae credential store does not support atomic refresh compare-and-swap")
 	}
-	return store.SaveCredentialPayloadIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload)
+	return store.SaveCredentialPayloadAfterRefreshIfCurrent(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload, credentialGeneration)
 }
 
 func (c *Client) useTraeCredentialFallback(ctx context.Context, accountID string, credential Credential, now time.Time, refreshErr error, authFailure bool) (Credential, error) {
@@ -1023,7 +1027,10 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 		return nil, providers.ResolvedChat{}, err
 	}
 	if err := translate.ValidateChatToolHistory(req); err != nil {
-		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Message: err.Error()}
+		return nil, providers.ResolvedChat{}, &providers.Error{
+			Kind: "invalid_request", Status: 400, Code: "invalid_tool_history",
+			Message: "Trae 工具历史无效：" + err.Error() + "；网关不会自动补全参数或执行不完整调用。",
+		}
 	}
 	payload, err := json.Marshal(map[string]any{
 		"model":       req.Model,
@@ -1327,6 +1334,14 @@ func firstNonEmptyStatus(status, fallback int) int {
 func (c *Client) Probe(ctx context.Context, accountID string) (providers.AccountHealth, error) {
 	credential, err := c.credential(ctx, accountID)
 	if err != nil {
+		if errors.Is(err, accounts.ErrAccountNotFound) || errors.Is(err, accounts.ErrSecretNotFound) {
+			if _, accountErr := c.store.Get(ctx, accountID); accountErr == nil {
+				return providers.AccountHealth{
+					LastError:     "Trae 本地登录凭据缺失，请使用账号卡片的登录入口完成登录。",
+					LastErrorKind: accounts.KindAuth,
+				}, nil
+			}
+		}
 		var classified *providers.Error
 		kind := accounts.KindUnavailable
 		if errors.As(err, &classified) && classified.Kind != "" {

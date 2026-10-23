@@ -46,6 +46,7 @@ import { SearchBar } from '@/components/ui/SearchBar'
 import { useI18n } from '@/hooks/useI18n'
 import { accountProviderLabel } from '@/lib/provider'
 import { attemptCreditAmount, attemptRouteKey, attemptScopeKey, attemptUsageKey } from '@/lib/attemptFacts'
+import { hasUnfinishedRequestLogStatus } from '@/lib/requestStatus'
 import { MaintenanceLogsPanel } from '@/components/MaintenanceLogsPanel'
 
 type PageTab = 'requests' | 'runtime' | 'maintenance'
@@ -1021,6 +1022,9 @@ export function LogsPage() {
                     </dd>
                   </div>
                 </dl>
+                {selected && hasUnfinishedRequestLogStatus(selected.status) ? (
+                  <p className="rounded-lg bg-surface-secondary px-3 py-2 text-xs text-muted">{t('logsUnfinishedRequestHint')}</p>
+                ) : null}
                 {selected ? (
                   <div className="rounded-lg bg-surface-secondary px-3 py-3 text-xs">
                     <div className="font-medium text-muted">{t('logsMessageShape')}</div>
@@ -1124,6 +1128,13 @@ export function LogsPage() {
                         const credit = attemptCreditAmount(attempt.credits)
                         const routeKey = attemptRouteKey(attempt.route_reason)
                         const scopeKey = attemptScopeKey(attempt.error_scope)
+                        const phaseKey = attempt.error_phase === 'credential_read'
+                          ? 'logsAttemptPhaseCredentialRead'
+                          : attempt.error_phase === 'refresh'
+                            ? 'logsAttemptPhaseRefresh'
+                            : attempt.error_phase === 'chat'
+                              ? 'logsAttemptPhaseChat'
+                              : ''
                         const statusLabel = attempt.status === 'failover' ? t('logsAttemptFailover') : attempt.status === 'ok' ? t('logsFilterOk') : attempt.status === 'error' ? t('logsFilterError') : attempt.status === 'canceled' ? t('logsFilterCanceled') : attempt.status
                         return (
                         <div key={attempt.id} className="grid gap-1 px-3 py-2.5 text-xs sm:grid-cols-[48px_minmax(0,1fr)_auto]">
@@ -1137,6 +1148,10 @@ export function LogsPage() {
                               <div><dt className="inline text-muted">{t('logsAttemptUsage')} · </dt><dd className="inline">{t(attemptUsageKey(attempt.usage_state))}</dd></div>
                               {attempt.key_id ? <div><dt className="inline text-muted">{t('logsAttemptKey')} · </dt><dd className="mono inline break-all">{attempt.key_id}</dd></div> : null}
                               {attempt.error_scope ? <div><dt className="inline text-muted">{t('logsAttemptScope')} · </dt><dd className="inline">{scopeKey ? t(scopeKey) : attempt.error_scope}</dd></div> : null}
+                              {attempt.error_code ? <div><dt className="inline text-muted">{t('logsAttemptCode')} · </dt><dd className="mono inline break-all">{attempt.error_code}</dd></div> : null}
+                              {attempt.http_status != null ? <div><dt className="inline text-muted">{t('logsAttemptHTTPStatus')} · </dt><dd className="mono inline">{attempt.http_status}</dd></div> : null}
+                              {attempt.error_phase ? <div><dt className="inline text-muted">{t('logsAttemptPhase')} · </dt><dd className="inline">{phaseKey ? t(phaseKey) : attempt.error_phase}</dd></div> : null}
+                              {attempt.error_source ? <div><dt className="inline text-muted">{t('logsAttemptSource')} · </dt><dd className="mono inline break-all">{attempt.error_source}</dd></div> : null}
                               {attempt.latency_ms != null ? <div><dt className="inline text-muted">{t('logsColLatency')} · </dt><dd className="mono inline">{attempt.latency_ms} ms</dd></div> : null}
                             </dl>
                             {attempt.error_message ? <p className="break-words leading-5 text-muted">{attempt.error_message}</p> : null}

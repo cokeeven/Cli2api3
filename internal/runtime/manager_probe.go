@@ -118,6 +118,28 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 		return nil
 	}
 	health, err := adapter.Prober.Probe(ctx, item.ID)
+	preservedAuthStatus := ""
+	if err == nil && (health.Ready || health.Hot) && localCredentialOnlyProbe(item.Provider) {
+		stored, storeErr := m.store.Get(ctx, item.ID)
+		if storeErr != nil {
+			return fmt.Errorf("read account auth state %s: %w", item.ID, storeErr)
+		}
+		if storedAuthFailure(stored) {
+			// WorkBuddy and Trae Probe only confirm that a local credential is
+			// present and structurally complete. That is not evidence that an
+			// upstream session rejected earlier is usable again. Provider login
+			// or a successful credential refresh records status=ready explicitly;
+			// a later probe can then restore runtime readiness.
+			health.Ready = false
+			health.Hot = false
+			health.LastErrorKind = accounts.KindAuth
+			health.LastError = "上游曾拒绝该账号认证；本地凭据检查无法确认会话已恢复。"
+			preservedAuthStatus = stored.Status
+			if preservedAuthStatus != "login_required" && preservedAuthStatus != "auth_failed" {
+				preservedAuthStatus = "login_required"
+			}
+		}
+	}
 	m.mu.Lock()
 	if ctx.Err() != nil || m.runCtx.Err() != nil || m.accountEpoch[item.ID] != epoch {
 		m.mu.Unlock()
@@ -142,6 +164,9 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 			status = "login_required"
 		}
 	}
+	if preservedAuthStatus != "" {
+		status = preservedAuthStatus
+	}
 	if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, health.LastErrorKind); err != nil {
 		m.mu.Unlock()
 		return err
@@ -162,6 +187,19 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 		m.mu.Unlock()
 	}
 	return nil
+}
+
+func localCredentialOnlyProbe(providerID string) bool {
+	switch strings.ToLower(strings.TrimSpace(providerID)) {
+	case "workbuddy", "trae":
+		return true
+	default:
+		return false
+	}
+}
+
+func storedAuthFailure(account accounts.Account) bool {
+	return account.Status == "login_required" || account.Status == "auth_failed" || account.LastErrorKind == accounts.KindAuth
 }
 
 func (m *Manager) forceReady(accountID string) bool {

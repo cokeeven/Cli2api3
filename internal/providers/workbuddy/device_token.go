@@ -107,6 +107,7 @@ func ConfigureDeviceToken(cfg DeviceTokenConfig) {
 //  1. perAccount（credential.DeviceToken，号级隔离，最高优先）
 //  2. 全局兜底 token
 //  3. 文件兜底（带缓存）
+//
 // 全部为空则返回空串（调用方跳过该头）。
 func resolveDeviceToken(perAccount string) string {
 	if v := strings.TrimSpace(perAccount); v != "" {

@@ -24,6 +24,10 @@ export function cooldownLabel(until?: string | null) {
   return seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`
 }
 
+export function accountCooldownLabel(account: Pick<AccountRow, 'down_until' | 'cooldown_until'>) {
+  return cooldownLabel(account.down_until) || cooldownLabel(account.cooldown_until)
+}
+
 export function modelCooldownEntries(account: AccountRow) {
   return Object.entries(account.model_cooldowns ?? {})
     .filter(([, until]) => Boolean(cooldownLabel(until)))
@@ -33,7 +37,13 @@ export function modelCooldownEntries(account: AccountRow) {
 export function accountState(account: AccountRow): AccountState {
   if (!account.enabled) return 'disabled'
   if (account.status === 'quota_exhausted' || account.quota?.exceeded) return 'quota_exhausted'
-  if (account.status === 'cooling' || cooldownLabel(account.down_until || account.cooldown_until)) return 'cooling'
+  const accountCooldowns = [account.down_until, account.cooldown_until].filter((until): until is string => Boolean(until))
+  const hasActiveCooldown = Boolean(accountCooldownLabel(account))
+  const hasExpiredCooldown = accountCooldowns.some((until) => {
+    const milliseconds = Date.parse(until)
+    return Number.isFinite(milliseconds) && milliseconds <= Date.now()
+  })
+  if (hasActiveCooldown || (account.status === 'cooling' && !hasExpiredCooldown)) return 'cooling'
   if (account.status === 'dead' || account.runtime_state === 'dead') return 'dead'
   if (account.status === 'auth_failed' || account.runtime_state === 'auth_failed') return 'auth_failed'
   if (account.status === 'login_required') return 'login'

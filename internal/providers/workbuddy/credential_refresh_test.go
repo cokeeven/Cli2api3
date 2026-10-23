@@ -16,12 +16,14 @@ import (
 )
 
 type credentialTestStore struct {
-	mu      sync.Mutex
-	account accounts.Account
-	format  string
-	payload []byte
-	status  string
-	kind    string
+	mu                           sync.Mutex
+	account                      accounts.Account
+	format                       string
+	payload                      []byte
+	status                       string
+	kind                         string
+	refreshCASExpectedGeneration int64
+	refreshCASCalls              int
 }
 
 func (s *credentialTestStore) Get(context.Context, string) (accounts.Account, error) {
@@ -41,6 +43,7 @@ func (s *credentialTestStore) SaveCredentialPayload(_ context.Context, _ string,
 	defer s.mu.Unlock()
 	s.format = format
 	s.payload = append([]byte(nil), payload...)
+	s.account.CredentialGeneration++
 	return nil
 }
 
@@ -52,13 +55,36 @@ func (s *credentialTestStore) SaveCredentialPayloadIfCurrent(_ context.Context, 
 	}
 	s.format = newFormat
 	s.payload = append([]byte(nil), newPayload...)
+	s.account.CredentialGeneration++
 	return true, nil
 }
 
-func (s *credentialTestStore) Observe(_ context.Context, _, _, status, _, kind string) error {
+func (s *credentialTestStore) SaveCredentialPayloadAfterRefreshIfCurrent(_ context.Context, _ string, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshCASExpectedGeneration = expectedCredentialGeneration
+	s.refreshCASCalls++
+	if s.account.CredentialGeneration != expectedCredentialGeneration || s.format != expectedFormat || !strings.EqualFold(string(s.payload), string(expectedPayload)) {
+		return false, nil
+	}
+	s.format = format
+	s.payload = append([]byte(nil), payload...)
+	if s.status != "quota_exhausted" && (s.status == "login_required" || s.status == "auth_failed" || s.kind == accounts.KindAuth) {
+		s.status, s.kind = "ready", ""
+		s.account.Status, s.account.LastError, s.account.LastErrorKind = "ready", "", ""
+	}
+	s.account.CredentialGeneration++
+	return true, nil
+}
+
+func (s *credentialTestStore) Observe(_ context.Context, _, _, status, lastError, kind string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status, s.kind = status, kind
+	s.account.Status, s.account.LastError, s.account.LastErrorKind = status, lastError, kind
+	if status == "login_required" || status == "auth_failed" || kind == accounts.KindAuth {
+		s.account.CredentialGeneration++
+	}
 	return nil
 }
 
@@ -69,7 +95,7 @@ func newCredentialTestStore(t *testing.T, credential Credential) *credentialTest
 		t.Fatal(err)
 	}
 	return &credentialTestStore{
-		account: accounts.Account{ID: "acc", Provider: "workbuddy", ProviderRegion: "cn"},
+		account: accounts.Account{ID: "acc", Provider: "workbuddy", ProviderRegion: "cn", UpdatedAt: time.Now().UTC()},
 		format:  CredentialFormat,
 		payload: payload,
 	}

@@ -61,6 +61,14 @@ func (m *Manager) EnsureModelCatalogs(ctx context.Context, force bool) {
 	now := time.Now()
 	var stale []Item
 	for _, item := range m.pool.Items() {
+		// A known Trae authentication failure usually means the local account
+		// record has no usable credential payload. Repeated catalog refreshes
+		// cannot repair that state and only retry a request that is known to
+		// fail locally. A successful probe after login moves the item back to
+		// ready, so its catalog refresh can resume normally.
+		if item.Provider == "trae" && item.RuntimeState == "auth_failed" {
+			continue
+		}
 		if !force && item.Models != nil && !item.ModelsAt.IsZero() && now.Sub(item.ModelsAt) < modelCatalogTTL {
 			continue
 		}

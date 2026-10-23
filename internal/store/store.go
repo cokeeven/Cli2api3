@@ -16,7 +16,7 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 	"github.com/caigee-cmd/cli2api/internal/proxy"
-	_ "modernc.org/sqlite"
+	sqlitedriver "modernc.org/sqlite"
 )
 
 type Store struct {
@@ -30,15 +30,16 @@ func OpenStore(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create sqlite directory: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	dsn, err := sqliteDataSource(path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, fmt.Errorf("prepare sqlite data source: %w", err)
 	}
+	connector, err := sqlitedriver.NewConnector(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create sqlite connector: %w", err)
+	}
+	db := sql.OpenDB(contextSQLiteConnector{Connector: connector})
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("configure sqlite: %w", err)
-	}
 	store := &Store{db: db}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
@@ -162,7 +163,8 @@ func (s *Store) Get(ctx context.Context, id string) (accounts.Account, error) {
 	row := s.db.QueryRowContext(ctx, `
 	SELECT id, name, provider, provider_region, remote_uid, auth_type, enabled, max_inflight, priority,
 	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, proxy_url, last_checkin_at, last_checkin_msg, last_checkin_status,
-	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at, auto_checkin, checkin_time
+	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at, auto_checkin, checkin_time,
+	       credential_generation
 	FROM accounts WHERE id = ?`, strings.TrimSpace(id))
 	account, err := scanAccount(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -186,7 +188,7 @@ func scanAccount(row rowScanner) (accounts.Account, error) {
 		&account.AuthType, &account.Enabled, &account.MaxInFlight, &account.Priority,
 		&account.DropSystemPrompt, &account.WorkBuddyAutoCheckin, &account.WorkBuddyCheckinTime, &account.ProxyURL, &account.LastCheckinAt, &account.LastCheckinMsg, &account.LastCheckinStatus,
 		&account.Status, &account.LastError, &account.LastErrorKind, &cooldown, &quotaJSON, &created, &updated,
-		&account.AutoCheckin, &account.CheckinTime,
+		&account.AutoCheckin, &account.CheckinTime, &account.CredentialGeneration,
 	)
 	if err != nil {
 		return accounts.Account{}, err
@@ -236,7 +238,8 @@ func (s *Store) List(ctx context.Context) ([]accounts.Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
 	SELECT id, name, provider, provider_region, remote_uid, auth_type, enabled, max_inflight, priority,
 	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, proxy_url, last_checkin_at, last_checkin_msg, last_checkin_status,
-	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at, auto_checkin, checkin_time
+	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at, auto_checkin, checkin_time,
+	       credential_generation
 	FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -619,13 +622,31 @@ func (s *Store) SaveCredentialPayload(ctx context.Context, accountID, format str
 		return err
 	}
 	now := formatTime(time.Now().UTC())
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save credential payload: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `
 INSERT INTO account_credential_payloads (account_id, format, payload, updated_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET format=excluded.format, payload=excluded.payload, updated_at=excluded.updated_at`,
-		accountID, format, payload, now)
-	if err != nil {
+		accountID, format, payload, now); err != nil {
 		return fmt.Errorf("save credential payload: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE accounts SET credential_generation = credential_generation + 1 WHERE id = ?`, accountID)
+	if err != nil {
+		return fmt.Errorf("advance account credential generation: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("advance account credential generation rows affected: %w", err)
+	}
+	if changed != 1 {
+		return accounts.ErrAccountNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save credential payload: %w", err)
 	}
 	return nil
 }
@@ -645,7 +666,12 @@ func (s *Store) SaveCredentialPayloadIfCurrent(ctx context.Context, accountID, e
 		return false, err
 	}
 	now := formatTime(time.Now().UTC())
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin compare-and-swap credential payload: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 UPDATE account_credential_payloads
 SET format = ?, payload = ?, updated_at = ?
 WHERE account_id = ? AND format = ? AND payload = ?`,
@@ -657,7 +683,103 @@ WHERE account_id = ? AND format = ? AND payload = ?`,
 	if err != nil {
 		return false, fmt.Errorf("compare-and-swap credential payload rows affected: %w", err)
 	}
-	return changed == 1, nil
+	if changed != 1 {
+		return false, nil
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE accounts SET credential_generation = credential_generation + 1 WHERE id = ?`, accountID)
+	if err != nil {
+		return false, fmt.Errorf("advance account credential generation after refresh: %w", err)
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("advance account credential generation rows affected: %w", err)
+	}
+	if changed != 1 {
+		return false, accounts.ErrAccountNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit compare-and-swap credential payload: %w", err)
+	}
+	return true, nil
+}
+
+// SaveCredentialPayloadAfterRefreshIfCurrent commits a successful upstream
+// refresh only while both the credential payload and account-state generation
+// still match the snapshot used for that refresh. The state update shares the
+// transaction so a later login or auth observation cannot be cleared by an
+// older response. A refreshed token clears only an active auth failure; it
+// does not replace a quota-exhausted account state.
+func (s *Store) SaveCredentialPayloadAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64) (bool, error) {
+	if len(payload) == 0 {
+		return false, fmt.Errorf("credential payload required")
+	}
+	account, err := s.Get(ctx, accountID)
+	if err != nil {
+		return false, err
+	}
+	if err := providers.ValidateCredentialFormat(account.Provider, format); err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin credential refresh transaction: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+UPDATE accounts SET credential_generation = credential_generation + 1, updated_at = ?
+WHERE id = ? AND credential_generation = ?`, formatTime(time.Now().UTC()), accountID, expectedCredentialGeneration)
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap account credential generation: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap account credential generation rows affected: %w", err)
+	}
+	if changed != 1 {
+		return false, nil
+	}
+	result, err = tx.ExecContext(ctx, `
+UPDATE account_credential_payloads
+SET format = ?, payload = ?, updated_at = ?
+WHERE account_id = ? AND format = ? AND payload = ?`,
+		format, payload, formatTime(time.Now().UTC()), accountID, expectedFormat, expectedPayload)
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap refreshed credential payload: %w", err)
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap refreshed credential rows affected: %w", err)
+	}
+	if changed != 1 {
+		return false, nil
+	}
+	var status, lastErrorKind string
+	if err := tx.QueryRowContext(ctx, `SELECT status, last_error_kind FROM accounts WHERE id = ?`, accountID).Scan(&status, &lastErrorKind); err != nil {
+		return false, fmt.Errorf("read account state after credential refresh: %w", err)
+	}
+	statusAfterRefresh := status
+	if status == "login_required" || status == "auth_failed" {
+		statusAfterRefresh = "ready"
+	}
+	if statusAfterRefresh != status || lastErrorKind == accounts.KindAuth {
+		var err error
+		if lastErrorKind == accounts.KindAuth {
+			_, err = tx.ExecContext(ctx, `
+UPDATE accounts SET status = ?, last_error = '', last_error_kind = ''
+WHERE id = ? AND credential_generation = ?`, statusAfterRefresh, accountID, expectedCredentialGeneration+1)
+		} else {
+			_, err = tx.ExecContext(ctx, `
+UPDATE accounts SET status = ?
+WHERE id = ? AND credential_generation = ?`, statusAfterRefresh, accountID, expectedCredentialGeneration+1)
+		}
+		if err != nil {
+			return false, fmt.Errorf("record credential refresh recovery: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit credential refresh: %w", err)
+	}
+	return true, nil
 }
 
 func (s *Store) LoadCredentialPayload(ctx context.Context, accountID string) (string, []byte, error) {
@@ -737,16 +859,24 @@ WHERE id = ?`, string(payload), status, formatTime(time.Now().UTC()), id)
 	return tx.Commit()
 }
 func (s *Store) Observe(ctx context.Context, id, remoteUID, status, lastError, lastKind string) error {
+	generationIncrement := 0
+	if status == "login_required" || status == "auth_failed" || lastKind == accounts.KindAuth {
+		generationIncrement = 1
+	}
 	result, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET remote_uid = ?, status = CASE
   WHEN accounts.status = 'quota_exhausted' AND ? = 'ready' THEN accounts.status
   ELSE ?
-END, last_error = ?, last_error_kind = ?, updated_at = ?
-WHERE id = ?`, remoteUID, status, status, lastError, lastKind, formatTime(time.Now().UTC()), id)
+END, last_error = ?, last_error_kind = ?, updated_at = ?,
+credential_generation = credential_generation + ?
+WHERE id = ?`, remoteUID, status, status, lastError, lastKind, formatTime(time.Now().UTC()), generationIncrement, id)
 	if err != nil {
 		return fmt.Errorf("observe account: %w", err)
 	}
-	changed, _ := result.RowsAffected()
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("observe account rows affected: %w", err)
+	}
 	if changed == 0 {
 		return accounts.ErrAccountNotFound
 	}
@@ -851,7 +981,7 @@ func (s *Store) SaveCooldowns(ctx context.Context, accountID string, rows []acco
 		return fmt.Errorf("begin cooldown save: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM account_cooldowns WHERE account_id = ?`, accountID); err != nil {
+	if _, err := execSQLiteBusyRetry(ctx, tx, `DELETE FROM account_cooldowns WHERE account_id = ?`, accountID); err != nil {
 		return fmt.Errorf("clear cooldowns: %w", err)
 	}
 	now := time.Now().UTC()
@@ -860,7 +990,7 @@ func (s *Store) SaveCooldowns(ctx context.Context, accountID string, rows []acco
 			continue
 		}
 		evidence := row.Evidence
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := execSQLiteBusyRetry(ctx, tx, `
 INSERT INTO account_cooldowns (
   account_id, model, down_until, backoff_level, kind, message, model_kind, updated_at,
   first_observed_at, last_observed_at, evidence_code, evidence_source, evidence_scope,
@@ -890,7 +1020,7 @@ ON CONFLICT(account_id, model) DO UPDATE SET
 			return fmt.Errorf("save cooldown: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM account_cooldowns WHERE account_id = ? AND down_until <= ?`,
+	if _, err := execSQLiteBusyRetry(ctx, tx, `DELETE FROM account_cooldowns WHERE account_id = ? AND down_until <= ?`,
 		accountID, formatTime(now)); err != nil {
 		return fmt.Errorf("prune cooldowns: %w", err)
 	}
@@ -902,7 +1032,7 @@ ON CONFLICT(account_id, model) DO UPDATE SET
 // re-read stale entries.
 func (s *Store) LoadCooldowns(ctx context.Context) ([]accounts.CooldownRow, error) {
 	now := formatTime(time.Now().UTC())
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM account_cooldowns WHERE down_until <= ?`, now); err != nil {
+	if _, err := execSQLiteBusyRetry(ctx, s.db, `DELETE FROM account_cooldowns WHERE down_until <= ?`, now); err != nil {
 		return nil, fmt.Errorf("prune expired cooldowns: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -954,13 +1084,18 @@ func formatOptionalCooldownTimePtr(value *time.Time) string {
 func (s *Store) RecordPoolState(ctx context.Context, state accounts.PoolState) error {
 	var cooldown any
 	status := "ready"
+	generationIncrement := 0
+	if state.LastErrorKind == accounts.KindAuth {
+		generationIncrement = 1
+	}
 	if !state.DownUntil.IsZero() && time.Now().Before(state.DownUntil) {
 		cooldown = formatTime(state.DownUntil)
 		status = "cooling"
 	}
 	_, err := s.db.ExecContext(ctx, `
-	UPDATE accounts SET status = ?, last_error = ?, last_error_kind = ?, cooldown_until = ?, updated_at = ?
-	WHERE id = ?`, status, state.LastError, state.LastErrorKind, cooldown, formatTime(time.Now().UTC()), state.ID)
+	UPDATE accounts SET status = ?, last_error = ?, last_error_kind = ?, cooldown_until = ?, updated_at = ?,
+	credential_generation = credential_generation + ?
+	WHERE id = ?`, status, state.LastError, state.LastErrorKind, cooldown, formatTime(time.Now().UTC()), generationIncrement, state.ID)
 	if err != nil {
 		return fmt.Errorf("record pool state: %w", err)
 	}

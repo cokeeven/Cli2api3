@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
@@ -26,6 +28,8 @@ type Direct struct {
 	http   *http.Client
 	now    func() time.Time
 }
+
+var completionIDFallback atomic.Uint64
 
 func NewDirect(store CredentialStore, region func(context.Context, string) (string, error)) *Direct {
 	return &Direct{
@@ -138,7 +142,7 @@ func (d *Direct) ChatStream(ctx context.Context, accountID string, req translate
 		resp.Body.Close()
 		return nil, providers.ResolvedChat{}, upstreamStatusError(resp.StatusCode, raw)
 	}
-	guarded, err := ensureMeaningfulUpstream(resp)
+	guarded, err := ensureMeaningfulUpstream(resp, providers.ChatFirstEventTimeout(prepared.request.Context()))
 	if err != nil {
 		// ensureMeaningfulUpstream closes the body on failure; no client bytes
 		// have been written yet, so the executor can still fail over.
@@ -184,7 +188,30 @@ func emptyUpstreamError() error {
 // completion. Peek before the first client byte so the failure can still be
 // classified and retried on another account. On success the buffered bytes
 // are replayed ahead of the remaining body, preserving real-time streaming.
-func ensureMeaningfulUpstream(resp *http.Response) (*http.Response, error) {
+func ensureMeaningfulUpstream(resp *http.Response, timeout time.Duration) (*http.Response, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, emptyUpstreamError()
+	}
+	if timeout <= 0 {
+		timeout = providers.ChatFirstEventTimeout(nil)
+	}
+	upstreamBody := &closeOnceBody{body: resp.Body}
+	var timerFired bool
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() {
+		timerFired = true
+		_ = upstreamBody.Close()
+		close(timerDone)
+	})
+	stopTimer := func() bool {
+		if timer.Stop() {
+			return false
+		}
+		<-timerDone
+		return timerFired
+	}
+	defer timer.Stop()
+
 	br := bufio.NewReader(resp.Body)
 	var pending bytes.Buffer
 	for {
@@ -192,12 +219,23 @@ func ensureMeaningfulUpstream(resp *http.Response) (*http.Response, error) {
 		if line != "" {
 			pending.WriteString(line)
 			if data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:"); ok && meaningfulDataLine(strings.TrimSpace(data)) {
-				resp.Body = peekedBody{Reader: io.MultiReader(&pending, br), Closer: resp.Body}
+				if stopTimer() {
+					_ = upstreamBody.Close()
+					return nil, emptyUpstreamError()
+				}
+				resp.Body = peekedBody{Reader: io.MultiReader(&pending, br), Closer: upstreamBody}
 				return resp, nil
 			}
 		}
 		if readErr != nil {
-			resp.Body.Close()
+			fired := stopTimer()
+			_ = upstreamBody.Close()
+			if resp.Request != nil && resp.Request.Context().Err() != nil {
+				return nil, providers.ChatContextError(resp.Request.Context(), readErr)
+			}
+			if fired {
+				return nil, emptyUpstreamError()
+			}
 			if errors.Is(readErr, io.EOF) {
 				return nil, emptyUpstreamError()
 			}
@@ -209,6 +247,17 @@ func ensureMeaningfulUpstream(resp *http.Response) (*http.Response, error) {
 			}
 		}
 	}
+}
+
+type closeOnceBody struct {
+	body io.Closer
+	once sync.Once
+	err  error
+}
+
+func (b *closeOnceBody) Close() error {
+	b.once.Do(func() { b.err = b.body.Close() })
+	return b.err
 }
 
 // peekedBody keeps the original body's Close wired to the upstream response
@@ -266,6 +315,9 @@ func BuildPlainChatBody(req translate.ChatRequest, now time.Time) map[string]any
 		item := map[string]any{"role": message.Role, "content": normalizeMessageContent(message)}
 		if message.Name != "" {
 			item["name"] = message.Name
+		}
+		if message.ReasoningContent != "" {
+			item["reasoning_content"] = message.ReasoningContent
 		}
 		if message.ToolCallID != "" {
 			item["tool_call_id"] = message.ToolCallID
@@ -624,7 +676,10 @@ func walkUpstream(r io.Reader, fn func(map[string]any) error) error {
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
+		if data == "[DONE]" {
+			return nil
+		}
+		if data == "" {
 			continue
 		}
 		var outer map[string]any
@@ -652,8 +707,9 @@ func walkUpstream(r io.Reader, fn func(map[string]any) error) error {
 
 func rewriteUpstreamSSE(resp *http.Response, model string) *http.Response {
 	pr, pw := io.Pipe()
+	upstreamBody := &closeOnceBody{body: resp.Body}
 	go func() {
-		defer resp.Body.Close()
+		defer upstreamBody.Close()
 		err := writeOpenAIChunks(pw, resp.Body, model)
 		_ = pw.CloseWithError(err)
 	}()
@@ -663,12 +719,33 @@ func rewriteUpstreamSSE(resp *http.Response, model string) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     headers,
-		Body:       io.NopCloser(pr),
+		Body:       &convertedBody{reader: pr, upstream: upstreamBody},
 		Request:    resp.Request,
 	}
 }
 
+type convertedBody struct {
+	reader   *io.PipeReader
+	upstream *closeOnceBody
+}
+
+func (b *convertedBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+
+func (b *convertedBody) Close() error {
+	_ = b.reader.CloseWithError(io.ErrClosedPipe)
+	return b.upstream.Close()
+}
+
+func newCompletionID() string {
+	id, err := randomUUID()
+	if err != nil {
+		id = fmt.Sprintf("%x-%x", time.Now().UnixNano(), completionIDFallback.Add(1))
+	}
+	return "chatcmpl-" + strings.ReplaceAll(id, "-", "")
+}
+
 func writeOpenAIChunks(w io.Writer, src io.Reader, model string) error {
+	completionID := newCompletionID()
 	var sawFinish, sawTools, sawPayload, sawError bool
 	err := walkUpstream(src, func(body map[string]any) error {
 		frame := frameFromBody(body)
@@ -688,7 +765,7 @@ func writeOpenAIChunks(w io.Writer, src io.Reader, model string) error {
 			return err
 		}
 		chunk := map[string]any{
-			"id": "chatcmpl-qoder", "object": "chat.completion.chunk", "model": model,
+			"id": completionID, "object": "chat.completion.chunk", "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": deltaOf(frame), "finish_reason": emptyOrNil(frame.finish)}},
 		}
 		if len(frame.usage) > 0 {
@@ -718,7 +795,7 @@ func writeOpenAIChunks(w io.Writer, src io.Reader, model string) error {
 				finish = "tool_calls"
 			}
 			chunk := map[string]any{
-				"id": "chatcmpl-qoder", "object": "chat.completion.chunk", "model": model,
+				"id": completionID, "object": "chat.completion.chunk", "model": model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
 			}
 			payload, err := json.Marshal(chunk)

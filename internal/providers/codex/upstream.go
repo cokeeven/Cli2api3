@@ -80,22 +80,46 @@ func normalizeCodexUpstream(fields map[string]json.RawMessage, model string, lit
 		fields["tool_choice"] = choice
 	}
 
-	// Non-lite Codex requests require parallel_tool_calls=true whenever tools are
-	// present; the caller's value is not accepted. Lite models reject the true
-	// value, so the field is forced false. Without tools the member is omitted,
-	// except on lite where the backend still expects the explicit false.
+	// Non-lite Codex requests default parallel_tool_calls to true when tools are
+	// present, while preserving a valid caller-supplied boolean. Lite models
+	// require false. Without tools the member is omitted, except on lite where
+	// the backend still expects the explicit false.
 	if lite {
 		fields["parallel_tool_calls"] = json.RawMessage(`false`)
 	} else if !emptyJSONArray(fields["tools"]) {
-		fields["parallel_tool_calls"] = json.RawMessage(`true`)
+		var requested bool
+		if len(fields["parallel_tool_calls"]) == 0 || json.Unmarshal(fields["parallel_tool_calls"], &requested) != nil {
+			fields["parallel_tool_calls"] = json.RawMessage(`true`)
+		}
 	} else {
 		delete(fields, "parallel_tool_calls")
+	}
+	if lite {
+		reasoning, err := withReasoningContextAllTurns(fields["reasoning"])
+		if err != nil {
+			return err
+		}
+		fields["reasoning"] = reasoning
 	}
 
 	if isNullJSON(fields["prompt_cache_key"]) && sessionID != "" {
 		fields["prompt_cache_key"] = mustJSON(sessionID)
 	}
 	return nil
+}
+
+// withReasoningContextAllTurns sets the Lite backend's required context while
+// retaining effort, summary, and any future reasoning members supplied by the
+// caller or built by the translated request path.
+func withReasoningContextAllTurns(raw json.RawMessage) (json.RawMessage, error) {
+	members := map[string]json.RawMessage{}
+	if !isNullJSON(raw) {
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return nil, err
+		}
+	}
+	members["context"] = json.RawMessage(`"all_turns"`)
+	return json.Marshal(members)
 }
 
 // normalizeServiceTier keeps only the tiers the ChatGPT Codex backend accepts.

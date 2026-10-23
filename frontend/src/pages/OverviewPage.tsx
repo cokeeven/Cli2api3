@@ -1,11 +1,13 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import gsap from 'gsap'
 import { Link } from 'react-router-dom'
-import { Card, Chip } from '@heroui/react'
+import { Button, Card, Chip } from '@heroui/react'
 import {
   ArrowUpRight,
   Cpu,
   Cube,
+  Pause,
+  Play,
   Pulse,
 } from '@phosphor-icons/react'
 import { fetchRequestStats, type RequestStats } from '@/api/logs'
@@ -16,6 +18,7 @@ import { TrafficChartEmpty } from '@/components/overview/TrafficChartEmpty'
 
 const TrafficChart = lazy(() => import('@/components/overview/TrafficChart').then((mod) => ({ default: mod.TrafficChart })))
 import { FilterToggle } from '@/components/ui/FilterToggle'
+import { TimeRangePicker } from '@/components/ui/TimeRangePicker'
 import { PageAlert } from '@/components/ui/PageAlert'
 import { OverviewPageSkeleton, RankListSkeleton, SkeletonBlock, TrafficChartSkeleton } from '@/components/ui/PageSkeletons'
 import { useI18n } from '@/hooks/useI18n'
@@ -23,10 +26,12 @@ import { useOverview } from '@/hooks/useOverview'
 import { fetchAccounts, fetchModels } from '@/api/overview'
 import { formatBytes, formatCompact, formatLatency, formatPercent } from '@/lib/format'
 import { accountProviderFamilyLabel, accountProviderLabel } from '@/lib/provider'
+import { startVisibleInterval } from '@/lib/statsRefresh'
+import { STATS_WINDOW_LABEL, statsQuery, type StatsWindow } from '@/lib/statsWindow'
+import { dateValueToISO, type DateRangeValue } from '@/lib/timeRange'
 import { ProviderMark } from '@/components/ProviderMark'
 
 type AccountRow = NonNullable<Overview['accounts']>[number]
-type StatsWindow = 1 | 24 | 168
 
 const EMPTY_STATS: RequestStats = {
   window: { from: '', to: '', hours: 24 },
@@ -74,10 +79,14 @@ function quotaTone(percentage?: number, exceeded?: boolean) {
 export function OverviewPage() {
   const { lang, t } = useI18n()
   const { overview, loading, error } = useOverview()
-  const [hours, setHours] = useState<StatsWindow>(24)
+  const [statsWindow, setStatsWindow] = useState<StatsWindow>('today')
+  const [customRange, setCustomRange] = useState<DateRangeValue | null>(null)
+  const [statsAutoRefreshPaused, setStatsAutoRefreshPaused] = useState(false)
   const [stats, setStats] = useState<RequestStats | null>(null)
   const [statsError, setStatsError] = useState('')
   const [statsLoading, setStatsLoading] = useState(true)
+  const inFlightStatsKeys = useRef(new Set<string>())
+  const statsMounted = useRef(false)
   const [accounts, setAccounts] = useState<NonNullable<Overview['accounts']>>([])
   const [accountsLoading, setAccountsLoading] = useState(true)
   const [modelCount, setModelCount] = useState(0)
@@ -90,6 +99,19 @@ export function OverviewPage() {
   const coolingAccounts = overview?.worker?.cooling_count ?? 0
   const inFlight = overview?.worker?.in_flight ?? 0
   const traffic = stats ?? EMPTY_STATS
+  const customStatsRange = statsWindow === 'custom' ? {
+    from: dateValueToISO(customRange?.start),
+    to: dateValueToISO(customRange?.end, true),
+  } : null
+  const selectedStatsQuery = statsQuery(statsWindow, customStatsRange)
+  const statsRangeReady = selectedStatsQuery !== null
+  const statsSelectionKey = statsWindow === 'custom'
+    ? `custom:${customStatsRange?.from ?? ''}|${customStatsRange?.to ?? ''}`
+    : statsWindow
+  const statsSelectionRef = useRef(statsSelectionKey)
+  useLayoutEffect(() => {
+    statsSelectionRef.current = statsSelectionKey
+  }, [statsSelectionKey])
 
   useEffect(() => {
     let cancelled = false
@@ -103,25 +125,69 @@ export function OverviewPage() {
   }, [])
 
   useEffect(() => {
-    let cancelled = false
-    void fetchRequestStats({ hours })
+    statsMounted.current = true
+    return () => { statsMounted.current = false }
+  }, [])
+
+  const startStatsFetch = useCallback((key: string, query: { hours?: number; from?: string; to?: string }) => {
+    if (inFlightStatsKeys.current.has(key)) return null
+    inFlightStatsKeys.current.add(key)
+    return fetchRequestStats(query).finally(() => { inFlightStatsKeys.current.delete(key) })
+  }, [])
+
+  const refreshStats = useCallback(async () => {
+    const range = statsWindow === 'custom' ? {
+      from: dateValueToISO(customRange?.start),
+      to: dateValueToISO(customRange?.end, true),
+    } : null
+    const query = statsQuery(statsWindow, range)
+    if (!query) return
+    const key = statsSelectionKey
+    const request = startStatsFetch(key, query)
+    if (!request) return
+    try {
+      const data = await request
+      if (!statsMounted.current || key !== statsSelectionRef.current) return
+      setStats(data)
+      setStatsError('')
+    } catch (err) {
+      if (!statsMounted.current || key !== statsSelectionRef.current) return
+      setStatsError(err instanceof Error ? err.message : String(err))
+    }
+    if (statsMounted.current && key === statsSelectionRef.current) setStatsLoading(false)
+  }, [customRange, startStatsFetch, statsSelectionKey, statsWindow])
+
+  useEffect(() => {
+    if (!statsRangeReady) return
+    const range = statsWindow === 'custom' ? {
+      from: dateValueToISO(customRange?.start),
+      to: dateValueToISO(customRange?.end, true),
+    } : null
+    const query = statsQuery(statsWindow, range)
+    if (!query) return
+    const key = statsSelectionKey
+    const request = startStatsFetch(key, query)
+    if (!request) return
+    void request
       .then((data) => {
-        if (cancelled) return
+        if (!statsMounted.current || key !== statsSelectionRef.current) return
         setStats(data)
         setStatsError('')
       })
       .catch((err) => {
-        if (cancelled) return
+        if (!statsMounted.current || key !== statsSelectionRef.current) return
         setStats(null)
         setStatsError(err instanceof Error ? err.message : String(err))
       })
       .finally(() => {
-        if (!cancelled) setStatsLoading(false)
+        if (statsMounted.current && key === statsSelectionRef.current) setStatsLoading(false)
       })
-    return () => {
-      cancelled = true
-    }
-  }, [hours])
+  }, [customRange, startStatsFetch, statsRangeReady, statsSelectionKey, statsWindow])
+
+  useEffect(() => {
+    if (statsAutoRefreshPaused || !statsRangeReady) return
+    return startVisibleInterval(document, () => { void refreshStats() }, 30_000)
+  }, [refreshStats, statsAutoRefreshPaused, statsRangeReady])
 
   // Resource usage polls on its own 5s cadence; independent of the stats window.
   useEffect(() => {
@@ -140,7 +206,7 @@ export function OverviewPage() {
   }, [])
 
   const metrics = [
-    { label: t('metricRequests'), value: traffic.totals.requests as number | null, kind: 'compact' as const, detail: t('statsWindowHint', { window: t(hours === 1 ? 'statsWindow1h' : hours === 168 ? 'statsWindow7d' : 'statsWindow24h') }), ok: traffic.totals.requests > 0 },
+    { label: t('metricRequests'), value: traffic.totals.requests as number | null, kind: 'compact' as const, detail: t('statsWindowHint', { window: t(STATS_WINDOW_LABEL[statsWindow]) }), ok: traffic.totals.requests > 0 },
     { label: t('metricSuccess'), value: traffic.totals.success_rate, kind: 'percent' as const, detail: `${traffic.totals.ok} ${t('logsFilterOk')} · ${traffic.totals.incomplete} ${t('logsFilterIncomplete')} · ${traffic.totals.error} ${t('logsFilterError')}`, ok: traffic.totals.requests === 0 || traffic.totals.success_rate >= 0.9 },
     { label: t('metricLatency'), value: traffic.latency.p95_ms ?? traffic.latency.avg_ms, kind: 'ms' as const, detail: `p50 ${formatLatency(traffic.latency.p50_ms)} · avg ${formatLatency(traffic.latency.avg_ms)}`, ok: traffic.latency.p95_ms == null || traffic.latency.p95_ms < 8000 },
     { label: t('metricTokens'), value: traffic.tokens.total, kind: 'compact' as const, detail: `${formatCompact(traffic.tokens.prompt)} / ${formatCompact(traffic.tokens.completion)}`, ok: true },
@@ -150,27 +216,75 @@ export function OverviewPage() {
 
   return (
     <div className="space-y-6">
-      <section className="grid gap-4 border-b border-separator pb-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-        <div>
+      <section className="grid gap-4 border-b border-separator pb-4">
+        <div className="min-w-0">
           <h2 data-gsap-reveal className="text-2xl font-semibold tracking-[-0.035em]">{t('homeDisplay')}</h2>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted">{t('homeLead')}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
           <FilterToggle
-            value={String(hours)}
+            className="max-w-full flex-wrap"
+            value={statsWindow}
             onChange={(next) => {
-              const value = Number(next) as StatsWindow
-              if (hours === value) return
-              setStatsLoading(true)
-              setHours(value)
+              const value = next as StatsWindow
+              setStatsWindow(value)
+              const nextRange = value === 'custom' ? {
+                from: dateValueToISO(customRange?.start),
+                to: dateValueToISO(customRange?.end, true),
+              } : null
+              if (statsQuery(value, nextRange)) {
+                setStatsLoading(true)
+              } else {
+                setStats(null)
+                setStatsError('')
+                setStatsLoading(false)
+              }
             }}
             ariaLabel={t('statsTraffic')}
             options={[
+              { id: 'today', label: t('statsWindowToday') },
               { id: '1', label: t('statsWindow1h') },
               { id: '24', label: t('statsWindow24h') },
               { id: '168', label: t('statsWindow7d') },
+              { id: '720', label: t('statsWindow30d') },
+              { id: 'custom', label: t('statsWindowCustom') },
             ]}
           />
+          {statsWindow === 'custom' ? (
+            <TimeRangePicker
+              className="w-full min-w-0 sm:w-[22rem]"
+              value={customRange}
+              onChange={(next) => {
+                setCustomRange(next)
+                const nextRange = {
+                  from: dateValueToISO(next?.start),
+                  to: dateValueToISO(next?.end, true),
+                }
+                if (statsQuery('custom', nextRange)) {
+                  setStatsLoading(true)
+                } else {
+                  setStats(null)
+                  setStatsError('')
+                  setStatsLoading(false)
+                }
+              }}
+              ariaLabel={t('statsWindowCustom')}
+              fromLabel={t('statsWindowFrom')}
+              toLabel={t('statsWindowTo')}
+            />
+          ) : null}
+          <Button
+            size="sm"
+            variant="secondary"
+            aria-label={t(statsAutoRefreshPaused ? 'statsRefreshResume' : 'statsRefreshPause')}
+            onPress={() => setStatsAutoRefreshPaused((paused) => !paused)}
+          >
+            {statsAutoRefreshPaused ? <Play size={14} /> : <Pause size={14} />}
+            {t(statsAutoRefreshPaused ? 'statsRefreshResume' : 'statsRefreshPause')}
+          </Button>
+          <span className="text-[11px] text-muted">
+            {t(statsAutoRefreshPaused ? 'statsRefreshPaused' : 'statsRefreshAuto')}
+          </span>
           <div className="text-left sm:text-right">
             <div className="mono text-[11px] text-muted">{overview?.time || '—'}</div>
             <div className="mt-1 inline-flex items-center gap-2 text-sm font-medium">
@@ -180,6 +294,12 @@ export function OverviewPage() {
           </div>
         </div>
       </section>
+
+      {!statsRangeReady ? (
+        <div className="rounded-2xl border border-border bg-surface-secondary px-5 py-3 text-sm text-muted">
+          {t('statsWindowCompleteRangeHint')}
+        </div>
+      ) : null}
 
       {error ? <PageAlert title={t('failedOverview', { msg: error })} /> : null}
 
@@ -193,11 +313,11 @@ export function OverviewPage() {
             <div className="mt-6 flex items-end justify-between gap-3">
               <div>
                 <div className="mono text-2xl font-semibold tracking-[-0.035em]">
-                  {statsLoading ? <SkeletonBlock className="h-8 w-24" /> : metric.value == null ? '—' : <CountUp value={metric.value} kind={metric.kind} />}
+                  {statsLoading && statsRangeReady ? <SkeletonBlock className="h-8 w-24" /> : !statsRangeReady || metric.value == null ? '—' : <CountUp value={metric.value} kind={metric.kind} />}
                 </div>
-                <div className="mono mt-1 text-[11px] text-muted">{statsLoading ? <SkeletonBlock className="h-3 w-28" /> : metric.detail}</div>
+                <div className="mono mt-1 text-[11px] text-muted">{statsLoading && statsRangeReady ? <SkeletonBlock className="h-3 w-28" /> : statsRangeReady ? metric.detail : '—'}</div>
               </div>
-              <span className="status-dot" data-state={metric.ok ? 'ok' : 'danger'} />
+              {statsRangeReady ? <span className="status-dot" data-state={metric.ok ? 'ok' : 'danger'} /> : null}
             </div>
           </div>
         ))}
@@ -210,12 +330,14 @@ export function OverviewPage() {
               <h3 className="font-semibold tracking-[-0.015em]">{t('statsTraffic')}</h3>
               <p className="mt-0.5 text-xs text-muted">{t('statsTrafficHint')}</p>
             </div>
-            <Chip size="sm" variant="soft" color={traffic.totals.error ? 'warning' : 'success'}>
-              {formatPercent(traffic.totals.success_rate)}
+            <Chip size="sm" variant="soft" color={statsRangeReady && traffic.totals.error ? 'warning' : 'default'}>
+              {statsRangeReady ? formatPercent(traffic.totals.success_rate) : '—'}
             </Chip>
           </div>
           <div className="space-y-5 p-5">
-            {statsError ? (
+            {!statsRangeReady ? (
+              <div className="flex min-h-72 items-center justify-center text-sm text-muted">—</div>
+            ) : statsError ? (
               <div className="text-sm text-danger">{t('failedStats', { msg: statsError })}</div>
             ) : statsLoading ? (
               <TrafficChartSkeleton />
@@ -241,7 +363,7 @@ export function OverviewPage() {
               ].map(([label, value]) => (
                 <div key={String(label)}>
                   <div className="text-[11px] text-muted">{label}</div>
-                  <div className="mono mt-1 text-sm font-medium">{statsLoading ? <SkeletonBlock className="h-4 w-16" /> : value}</div>
+                  <div className="mono mt-1 text-sm font-medium">{statsLoading && statsRangeReady ? <SkeletonBlock className="h-4 w-16" /> : value}</div>
                 </div>
               ))}
             </div>
@@ -345,7 +467,9 @@ export function OverviewPage() {
             </div>
             <Pulse size={15} className="text-muted" />
           </div>
-          {statsLoading ? (
+          {!statsRangeReady ? (
+            <div className="px-5 py-8 text-sm text-muted">—</div>
+          ) : statsLoading ? (
             <RankListSkeleton />
           ) : (
             <RankList
@@ -368,7 +492,9 @@ export function OverviewPage() {
             </div>
             <Cube size={15} className="text-muted" />
           </div>
-          {statsLoading ? (
+          {!statsRangeReady ? (
+            <div className="px-5 py-8 text-sm text-muted">—</div>
+          ) : statsLoading ? (
             <RankListSkeleton rows={4} />
           ) : (
             <RankList
@@ -391,7 +517,9 @@ export function OverviewPage() {
             </div>
             <Pulse size={15} className="text-muted" />
           </div>
-          {statsLoading ? (
+          {!statsRangeReady ? (
+            <div className="px-5 py-8 text-sm text-muted">—</div>
+          ) : statsLoading ? (
             <RankListSkeleton rows={4} />
           ) : traffic.errors.length ? (
             <RankList

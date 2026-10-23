@@ -37,6 +37,19 @@ func WithChatTimeouts(ctx context.Context, p ChatTimeouts) context.Context {
 	return context.WithValue(ctx, chatTimeoutsKey{}, p.Normalized())
 }
 
+// ChatFirstEventTimeout returns the normalized first-event bound attached to a
+// chat request. Providers that peek at an upstream stream before exposing the
+// response can use the same configured bound without enabling the full
+// response-body deadline wrapper.
+func ChatFirstEventTimeout(ctx context.Context) time.Duration {
+	if ctx != nil {
+		if policy, ok := ctx.Value(chatTimeoutsKey{}).(ChatTimeouts); ok {
+			return policy.Normalized().FirstEvent
+		}
+	}
+	return (ChatTimeouts{}).Normalized().FirstEvent
+}
+
 type ChatTimeoutError struct{ Phase string }
 
 func (e *ChatTimeoutError) Error() string        { return "chat time limit exceeded during " + e.Phase }

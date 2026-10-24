@@ -211,6 +211,112 @@ export type ModelUsageQuery = {
   budget_offset?: number
 }
 
+export type ModelUsageOverviewRow = {
+  provider: string
+  region: string
+  model: string
+  requests: number
+  attempts: number
+  succeeded_attempts: number
+  failed_attempts: number
+  canceled_attempts: number
+  failover_attempts: number
+  length_requests: number
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  known_usage_attempts: number
+  estimated_usage_attempts: number
+  missing_usage_attempts: number
+  account_count: number
+  recent_usage: boolean
+  last_activity_at?: string
+  schedulable_accounts: number
+  restricted_accounts: number
+}
+
+export type ModelUsageOverviewResponse = {
+  data: {
+    rows: ModelUsageOverviewRow[]
+    summary: {
+      models: number
+      requests: number
+      attempts: number
+      prompt_tokens: number
+      completion_tokens: number
+      known_usage_attempts: number
+      estimated_usage_attempts: number
+      missing_usage_attempts: number
+    }
+    total: number
+    page: number
+    page_size: number
+    has_more: boolean
+    from: string
+    to: string
+    catalog_limited: boolean
+  }
+  source: string
+}
+
+export type ModelUsageDetailRow = {
+  usage: Pick<ModelUsageRow,
+    'account_id' | 'requests' | 'attempts' | 'succeeded_attempts' | 'failed_attempts' | 'canceled_attempts' |
+    'failover_attempts' | 'length_requests' | 'prompt_tokens' | 'completion_tokens' | 'known_usage_attempts' |
+    'estimated_usage_attempts' | 'missing_usage_attempts' | 'last_success_at' | 'cache_read_tokens' |
+    'cache_write_tokens' | 'cache_known_requests' | 'cache_missing_requests'>
+  account: ModelUsageAccount
+  route?: RouteCandidate
+  budgets: BudgetEstimate[]
+}
+
+export type ModelUsageDetailResponse = {
+  data: {
+    rows: ModelUsageDetailRow[]
+    total: number
+    page: number
+    page_size: number
+    has_more: boolean
+    from: string
+    to: string
+    budget_observation_from?: string
+    budget_observations_truncated: boolean
+    catalog_limited: boolean
+  }
+  source: string
+}
+
+export type ModelUsageDiagnosticsResponse = {
+  data: {
+    errors: ModelUsageError[]
+    total: number
+    page: number
+    page_size: number
+    has_more: boolean
+    from: string
+    to: string
+  }
+  routes: RouteCandidate[]
+  routes_total: number
+  routes_page: number
+  routes_page_size: number
+  routes_has_more: boolean
+  source: string
+}
+
+export type ModelUsageCompactQuery = {
+  provider?: string
+  region?: string
+  model?: string
+  account?: string
+  search?: string
+  activity?: string
+  from?: string
+  to?: string
+  page?: number
+  page_size?: number
+  sort?: string
+}
+
 export type ModelProbeResult = {
   ok: boolean
   request_id: string
@@ -238,6 +344,29 @@ export function fetchModelUsage(query: ModelUsageQuery = {}, signal?: AbortSigna
   }
   const suffix = params.toString()
   return api<ModelUsageResponse>(`/api/model-usage${suffix ? `?${suffix}` : ''}`, { signal })
+}
+
+function compactQuery(query: ModelUsageCompactQuery) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  return params.toString()
+}
+
+export function fetchModelUsageOverview(query: ModelUsageCompactQuery, signal?: AbortSignal) {
+  const suffix = compactQuery(query)
+  return api<ModelUsageOverviewResponse>(`/api/model-usage/overview${suffix ? `?${suffix}` : ''}`, { signal })
+}
+
+export function fetchModelUsageDetail(query: ModelUsageCompactQuery, signal?: AbortSignal) {
+  const suffix = compactQuery(query)
+  return api<ModelUsageDetailResponse>(`/api/model-usage/detail${suffix ? `?${suffix}` : ''}`, { signal })
+}
+
+export function fetchModelUsageDiagnostics(query: ModelUsageCompactQuery, signal?: AbortSignal) {
+  const suffix = compactQuery(query)
+  return api<ModelUsageDiagnosticsResponse>(`/api/model-usage/diagnostics${suffix ? `?${suffix}` : ''}`, { signal })
 }
 
 export function probeModel(accountId: string, model: string, signal?: AbortSignal) {

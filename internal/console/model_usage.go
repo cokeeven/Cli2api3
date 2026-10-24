@@ -47,8 +47,18 @@ func (h *Handler) HandleModelUsage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "model_usage_unavailable", "模型用量服务不可用")
 		return
 	}
-	if strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/model-usage"), "/") == "probe" {
+	switch strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/model-usage"), "/") {
+	case "probe":
 		h.HandleModelUsageProbe(w, r)
+		return
+	case "overview":
+		h.HandleModelUsageOverview(w, r)
+		return
+	case "detail":
+		h.HandleModelUsageDetail(w, r)
+		return
+	case "diagnostics":
+		h.HandleModelUsageDiagnostics(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {

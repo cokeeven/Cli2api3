@@ -16,6 +16,142 @@ type ModelUsageQuery struct {
 	Limit    int
 }
 
+// ModelUsageCatalogModel is a process-local catalog identity. It contains no
+// account credentials and lets the read API show a model before it has usage.
+type ModelUsageCatalogModel struct {
+	Provider string
+	Region   string
+	Model    string
+}
+
+type ModelUsageOverviewQuery struct {
+	Provider       string
+	Region         string
+	Search         string
+	Activity       string
+	From           time.Time
+	To             time.Time
+	Page           int
+	PageSize       int
+	CatalogModels  []ModelUsageCatalogModel
+	CatalogLimited bool
+}
+
+type ModelUsageOverviewRow struct {
+	Provider               string     `json:"provider"`
+	Region                 string     `json:"region"`
+	Model                  string     `json:"model"`
+	Requests               int        `json:"requests"`
+	Attempts               int        `json:"attempts"`
+	SucceededAttempts      int        `json:"succeeded_attempts"`
+	FailedAttempts         int        `json:"failed_attempts"`
+	CanceledAttempts       int        `json:"canceled_attempts"`
+	FailoverAttempts       int        `json:"failover_attempts"`
+	LengthRequests         int        `json:"length_requests"`
+	PromptTokens           *int64     `json:"prompt_tokens"`
+	CompletionTokens       *int64     `json:"completion_tokens"`
+	KnownUsageAttempts     int        `json:"known_usage_attempts"`
+	EstimatedUsageAttempts int        `json:"estimated_usage_attempts"`
+	MissingUsageAttempts   int        `json:"missing_usage_attempts"`
+	AccountCount           int        `json:"account_count"`
+	RecentUsage            bool       `json:"recent_usage"`
+	LastActivityAt         *time.Time `json:"last_activity_at,omitempty"`
+	SchedulableAccounts    int        `json:"schedulable_accounts"`
+	RestrictedAccounts     int        `json:"restricted_accounts"`
+}
+
+type ModelUsageOverviewSummary struct {
+	Models                 int   `json:"models"`
+	Requests               int   `json:"requests"`
+	Attempts               int   `json:"attempts"`
+	PromptTokens           int64 `json:"prompt_tokens"`
+	CompletionTokens       int64 `json:"completion_tokens"`
+	KnownUsageAttempts     int   `json:"known_usage_attempts"`
+	EstimatedUsageAttempts int   `json:"estimated_usage_attempts"`
+	MissingUsageAttempts   int   `json:"missing_usage_attempts"`
+}
+
+type ModelUsageOverviewData struct {
+	Rows           []ModelUsageOverviewRow   `json:"rows"`
+	Summary        ModelUsageOverviewSummary `json:"summary"`
+	Total          int                       `json:"total"`
+	Page           int                       `json:"page"`
+	PageSize       int                       `json:"page_size"`
+	HasMore        bool                      `json:"has_more"`
+	From           time.Time                 `json:"from"`
+	To             time.Time                 `json:"to"`
+	CatalogLimited bool                      `json:"catalog_limited"`
+}
+
+type ModelUsageDetailQuery struct {
+	Provider        string
+	Region          string
+	Model           string
+	From            time.Time
+	To              time.Time
+	Page            int
+	PageSize        int
+	Sort            string
+	CatalogAccounts []string
+	CatalogLimited  bool
+}
+
+type ModelUsageAccountRow struct {
+	AccountID              string     `json:"account_id"`
+	Requests               int        `json:"requests"`
+	Attempts               int        `json:"attempts"`
+	SucceededAttempts      int        `json:"succeeded_attempts"`
+	FailedAttempts         int        `json:"failed_attempts"`
+	CanceledAttempts       int        `json:"canceled_attempts"`
+	FailoverAttempts       int        `json:"failover_attempts"`
+	LengthRequests         int        `json:"length_requests"`
+	PromptTokens           *int64     `json:"prompt_tokens"`
+	CompletionTokens       *int64     `json:"completion_tokens"`
+	KnownUsageAttempts     int        `json:"known_usage_attempts"`
+	EstimatedUsageAttempts int        `json:"estimated_usage_attempts"`
+	MissingUsageAttempts   int        `json:"missing_usage_attempts"`
+	LastSuccessAt          *time.Time `json:"last_success_at,omitempty"`
+	CacheReadTokens        *int64     `json:"cache_read_tokens"`
+	CacheWriteTokens       *int64     `json:"cache_write_tokens"`
+	CacheKnownRequests     int        `json:"cache_known_requests"`
+	CacheMissingRequests   int        `json:"cache_missing_requests"`
+}
+
+type ModelUsageDetailData struct {
+	Rows                        []ModelUsageAccountRow   `json:"rows"`
+	Total                       int                      `json:"total"`
+	Page                        int                      `json:"page"`
+	PageSize                    int                      `json:"page_size"`
+	HasMore                     bool                     `json:"has_more"`
+	From                        time.Time                `json:"from"`
+	To                          time.Time                `json:"to"`
+	BudgetObservationFrom       time.Time                `json:"budget_observation_from,omitempty"`
+	BudgetObservations          []ModelBudgetObservation `json:"-"`
+	BudgetObservationsTruncated bool                     `json:"budget_observations_truncated"`
+	CatalogLimited              bool                     `json:"catalog_limited"`
+}
+
+type ModelUsageDiagnosticsQuery struct {
+	Provider string
+	Region   string
+	Model    string
+	Account  string
+	From     time.Time
+	To       time.Time
+	Page     int
+	PageSize int
+}
+
+type ModelUsageDiagnosticsData struct {
+	Errors   []ModelUsageError `json:"errors"`
+	Total    int               `json:"total"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+	HasMore  bool              `json:"has_more"`
+	From     time.Time         `json:"from"`
+	To       time.Time         `json:"to"`
+}
+
 type ModelUsageRow struct {
 	Provider               string     `json:"provider"`
 	Region                 string     `json:"region"`
@@ -185,4 +321,12 @@ type ModelBudgetObservation struct {
 
 type ModelUsageStore interface {
 	ReadModelUsage(context.Context, ModelUsageQuery) (ModelUsageData, error)
+}
+
+// CompactModelUsageStore serves the paginated read path used by the console.
+// The legacy endpoint continues to use ModelUsageStore for compatibility.
+type CompactModelUsageStore interface {
+	ReadModelUsageOverview(context.Context, ModelUsageOverviewQuery) (ModelUsageOverviewData, error)
+	ReadModelUsageDetail(context.Context, ModelUsageDetailQuery) (ModelUsageDetailData, error)
+	ReadModelUsageDiagnostics(context.Context, ModelUsageDiagnosticsQuery) (ModelUsageDiagnosticsData, error)
 }

@@ -26,13 +26,14 @@ import {
   accountRoutingFacts,
   cooldownLabel,
   dailyTasksDisabledReason,
+  formatCheckinMessage,
   modelCooldownEntries,
   type AccountRow,
 } from '@/lib/account'
 import { accountProviderLabel } from '@/lib/provider'
 import { copyText } from '@/lib/clipboard'
 
-export type AccountBusyKind = 'create' | 'import' | 'device' | 'pat' | 'callback' | 'rewarm' | 'refresh' | 'toggle' | 'delete' | 'export' | 'settings' | 'checkin' | 'daily'
+export type AccountBusyKind = 'create' | 'import' | 'device' | 'pat' | 'callback' | 'rewarm' | 'refresh' | 'credential' | 'toggle' | 'delete' | 'export' | 'settings' | 'checkin' | 'daily'
 
 type Translate = (key: string, vars?: Record<string, string | number>) => string
 
@@ -52,6 +53,7 @@ type Props = {
   onSubmitCallback?: () => void
   onExport: () => void
   onRefresh?: () => void
+  onRefreshCredential?: () => void
   onDelete: () => void
   onToggle: (selected: boolean) => void
   checkinDefaultTime?: string
@@ -96,6 +98,7 @@ export function AccountCard({
   onSubmitCallback,
   onExport,
   onRefresh,
+  onRefreshCredential,
   onDelete,
   onToggle,
   checkinDefaultTime,
@@ -381,7 +384,7 @@ export function AccountCard({
                 <span className={checkinStatus === 'error' ? 'text-danger' : ''}>{t(checkinLabel)}</span>
               </span>
             </Tooltip.Trigger>
-            <Tooltip.Content>{account.last_checkin_at ? new Date(account.last_checkin_at).toLocaleString() : t('lastCheckinNone')}{account.last_checkin_msg ? ` · ${account.last_checkin_msg}` : ''}</Tooltip.Content>
+            <Tooltip.Content>{account.last_checkin_at ? new Date(account.last_checkin_at).toLocaleString() : t('lastCheckinNone')}{account.last_checkin_msg ? ` · ${formatCheckinMessage(account.last_checkin_msg, t)}` : ''}</Tooltip.Content>
           </Tooltip>
           <Tooltip>
             <Tooltip.Trigger>
@@ -398,6 +401,7 @@ export function AccountCard({
 
       <Card.Footer className="flex flex-wrap items-center gap-1.5 border-t border-separator px-3 py-2">
         <Button size="sm" variant="ghost" onPress={onViewUsage}>{t('usageAction')}</Button>
+        {onRefreshCredential ? <Button size="sm" variant="ghost" isDisabled={Boolean(busyKind) || !account.enabled} isPending={busyKind === 'credential'} onPress={onRefreshCredential}>{t('credentialRefreshAction')}</Button> : null}
         {onRefresh ? (
           <Tooltip>
             <Tooltip.Trigger>

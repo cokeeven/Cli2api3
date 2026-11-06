@@ -10,18 +10,17 @@ import (
 
 func validateCallerReasoning(req translate.ChatRequest, caps providers.ModelCapabilities) error {
 	raw := bytes.TrimSpace(req.ReasoningEffort)
-	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
-		if !providers.SupportsReasoningLevel(requestedReasoningEffort(req.ReasoningEffort), caps) {
-			return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
-		}
-		return nil
+	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) && requestedReasoningEffort(raw) == "" {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "unrecognized reasoning effort"}
+	}
+	if err := providers.ValidateReasoningSignals(req, requestedReasoningLevel(req)); err != nil {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: err.Error()}
 	}
 	if !hasExplicitReasoning(req) {
 		return nil
 	}
-	level := requestedReasoningLevel(req)
-	if !providers.SupportsReasoningLevel(level, caps) {
-		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
+	if providers.MatchReasoningLevel(requestedReasoningLevel(req), caps) == "" {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "reasoning intent or model capabilities cannot be matched to an advertised level"}
 	}
 	return nil
 }
@@ -53,7 +52,8 @@ func hasExplicitReasoning(req translate.ChatRequest) bool {
 	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
 		return true
 	}
-	return req.EnableThinking != nil || req.EnableReasoning != nil || req.IsReasoning != nil
+	_, thinking, _ := providers.ThinkingIntent(req.Thinking)
+	return req.EnableThinking != nil || req.EnableReasoning != nil || req.IsReasoning != nil || thinking
 }
 
 func normalizeReasoningLevel(raw string) string {
@@ -82,6 +82,9 @@ func requestedReasoningLevel(req translate.ChatRequest) string {
 		}
 		return "none"
 	}
+	if level, present, _ := providers.ThinkingIntent(req.Thinking); present {
+		return level
+	}
 	return ""
 }
 
@@ -109,6 +112,9 @@ func requestedReasoningEffort(raw json.RawMessage) string {
 }
 
 func clampReasoningLevel(level string, caps providers.ModelCapabilities) string {
+	if level != "" {
+		return providers.MatchReasoningLevel(level, caps)
+	}
 	return providers.ResolveReasoningLevel(level, caps)
 }
 

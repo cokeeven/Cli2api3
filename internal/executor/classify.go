@@ -201,7 +201,7 @@ func Classify(status int, body, retryAfter, kindHint, failoverHint string) Class
 			kind = KindNotReady
 		case IsInvalidRequestText(lower):
 			kind = KindInvalidRequest
-		case authLike(lower) && !quotaLike(lower, code, typ) && !rateLike(lower):
+		case (code == "401" || code == "403" || authLike(lower)) && !quotaLike(lower, code, typ) && !rateLike(lower):
 			kind = KindAuth
 		case rateLike(lower) || code == "429" || status == 429:
 			kind = KindRateLimit
@@ -423,8 +423,6 @@ func authLike(lower string) bool {
 		strings.Contains(lower, "forbidden") ||
 		strings.Contains(lower, "duplicate request") ||
 		strings.Contains(lower, "unauthorized") ||
-		strings.Contains(lower, "401") ||
-		strings.Contains(lower, "403") ||
 		strings.Contains(lower, "credential") ||
 		strings.Contains(lower, "refresh token") ||
 		strings.Contains(lower, "access token")

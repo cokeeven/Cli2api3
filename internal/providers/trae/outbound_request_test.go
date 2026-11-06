@@ -22,7 +22,7 @@ func TestChatRequestRejectsUnsupportedExplicitReasoning(t *testing.T) {
 		Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"},
 	}}
 	_, _, err := client.chatRequest(context.Background(), Credential{}, translate.ChatRequest{
-		Model: "test-model", ReasoningEffort: json.RawMessage(`"high"`),
+		Model: "test-model", ReasoningEffort: json.RawMessage(`"unrecognized"`),
 	}, "")
 	var providerErr *providers.Error
 	if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {
@@ -161,6 +161,7 @@ func TestChatSerializesCallerLimitsInstructionsAndToolRoundToHTTP(t *testing.T) 
 			ReasoningOptions: []string{"low", "medium", "high"}, ReasoningDefault: "medium",
 		},
 	}}
+	client.rememberCatalogFor("synthetic-account", []providers.ModelInfo{client.catalog["test-model"]})
 	maxMode := true
 	tools := json.RawMessage(`[{"type":"function","function":{"name":"lookup","description":"find","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]`)
 	toolCalls := json.RawMessage(`[{"id":"call_synthetic_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}},{"id":"call_synthetic_2","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"y\"}"}}]`)
@@ -251,6 +252,7 @@ func TestStrictJSONToolFollowupIsPassedThroughWithoutAdapterFormatting(t *testin
 			client.catalog = map[string]providers.ModelInfo{"glm-5.3": {
 				NativeModel: "glm-5.3", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"high"}, ReasoningDefault: "high"},
 			}}
+			client.rememberCatalogFor("synthetic-account", []providers.ModelInfo{client.catalog["glm-5.3"]})
 			messages := []translate.ChatMessage{
 				{Role: "system", Content: "Use caller-provided actual tool results. Never invent a tool result. Return final JSON only."},
 				{Role: "developer", Content: "Call count_letters once with text fidelity. After its actual result, output JSON keys text and count, with no further tool calls."},

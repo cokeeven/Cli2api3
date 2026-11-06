@@ -1,6 +1,7 @@
 package workbuddy
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"unicode"
@@ -29,7 +30,7 @@ type catalogModelEntry struct {
 	MaxInputTokens    int                  `json:"maxInputTokens"`
 	MaxOutputTokens   int                  `json:"maxOutputTokens"`
 	Disabled          bool                 `json:"disabled"`
-	OnlyReasoning     bool                 `json:"onlyReasoning"`
+	OnlyReasoning     *bool                `json:"onlyReasoning"`
 	SupportsReasoning bool                 `json:"supportsReasoning"`
 	SupportsImages    bool                 `json:"supportsImages"`
 	SupportsToolCall  bool                 `json:"supportsToolCall"`
@@ -51,9 +52,25 @@ func catalogModel(model catalogModelEntry) providers.ModelInfo {
 	} else if defaultLevel != "" && !containsLevel(options, defaultLevel) {
 		options = append([]string{defaultLevel}, options...)
 	}
-	canDisable := !model.OnlyReasoning
+	onlyReasoning := model.OnlyReasoning != nil && *model.OnlyReasoning
+	canDisable := model.OnlyReasoning != nil && !*model.OnlyReasoning
 	if model.Reasoning.CanDisableThinking != nil {
-		canDisable = *model.Reasoning.CanDisableThinking && !model.OnlyReasoning
+		canDisable = *model.Reasoning.CanDisableThinking && !onlyReasoning
+	}
+	if !canDisable {
+		filtered := options[:0]
+		for _, option := range options {
+			if option != "none" {
+				filtered = append(filtered, option)
+			}
+		}
+		options = filtered
+		if defaultLevel == "none" {
+			defaultLevel = ""
+			if len(options) > 0 {
+				defaultLevel = options[0]
+			}
+		}
 	}
 	if canDisable && (len(options) > 0 || model.SupportsReasoning) && !containsLevel(options, "none") {
 		options = append([]string{"none"}, options...)
@@ -61,11 +78,12 @@ func catalogModel(model catalogModelEntry) providers.ModelInfo {
 	window, windowMax := contextWindows(model)
 	credits := strings.TrimSpace(model.Credits)
 	return providers.ModelInfo{
-		NativeModel: model.ID,
-		PublicModel: model.ID,
-		DisplayName: model.Name,
-		Credits:     credits,
-		Free:        catalogCreditsFree(credits),
+		NativeModel:      model.ID,
+		PublicModel:      model.ID,
+		DisplayName:      model.Name,
+		Credits:          credits,
+		Free:             catalogCreditsFree(credits),
+		FallbackEvidence: &providers.FallbackCapabilities{ContextWindow: model.MaxInputTokens, MaxOutput: model.MaxOutputTokens, Tools: model.SupportsToolCall, Images: model.SupportsImages, ReasoningOptions: append([]string(nil), options...), CanDisableThinking: canDisable},
 		Capabilities: providers.ModelCapabilities{
 			ContextWindow:      window,
 			ContextWindowMax:   windowMax,
@@ -184,6 +202,60 @@ func (c *Client) rememberCatalog(models []providers.ModelInfo) {
 			c.catalog[strings.ToLower(key)] = model
 		}
 	}
+}
+
+// Account-scoped catalog evidence prevents one account or region from
+// supplying capabilities for another account's chat attempt.
+func (c *Client) rememberCatalogFor(accountID string, models []providers.ModelInfo) {
+	c.rememberCatalogForEvidence(accountID, models, providers.AttemptCredentialEvidence{})
+}
+
+func (c *Client) rememberCatalogForEvidence(accountID string, models []providers.ModelInfo, evidence providers.AttemptCredentialEvidence) {
+	c.rememberCatalog(models)
+	entries := make(map[string]providers.ModelInfo, len(models)*2)
+	for _, info := range models {
+		for _, id := range []string{info.NativeModel, info.PublicModel} {
+			if strings.TrimSpace(id) != "" {
+				entries[id] = info
+				entries[accounts.CanonicalModelID(id)] = info
+			}
+		}
+	}
+	c.mu.Lock()
+	if c.catalogByAccount == nil {
+		c.catalogByAccount = make(map[string]map[string]providers.ModelInfo)
+	}
+	c.catalogByAccount[accountID] = entries
+	if c.catalogGeneration == nil {
+		c.catalogGeneration = make(map[string]providers.AttemptCredentialEvidence)
+	}
+	c.catalogGeneration[accountID] = evidence
+	c.mu.Unlock()
+}
+
+func (c *Client) accountCatalogModel(ctx context.Context, accountID, model string) (providers.ModelInfo, bool) {
+	if accountID == "" {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		info, ok := c.catalog[model]
+		if !ok {
+			info, ok = c.catalog[accounts.CanonicalModelID(model)]
+		}
+		return info, ok
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	requestEvidence := providers.CredentialEvidence(ctx, accountID)
+	catalogEvidence := c.catalogGeneration[accountID]
+	if requestEvidence.Valid && (!catalogEvidence.Valid || requestEvidence.Generation != catalogEvidence.Generation) {
+		return providers.ModelInfo{}, false
+	}
+	entries := c.catalogByAccount[accountID]
+	info, ok := entries[model]
+	if !ok {
+		info, ok = entries[accounts.CanonicalModelID(model)]
+	}
+	return info, ok
 }
 
 func (c *Client) capsFor(model string) providers.ModelCapabilities {

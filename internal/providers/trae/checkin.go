@@ -32,7 +32,16 @@ func (AlreadyCheckedInError) AlreadyCheckedIn() bool { return true }
 // re-probe so success is only reported when the account actually flipped.
 // Account completion and device-only limits are distinct. Free-form upstream
 // messages never establish success or eligibility.
-func (client *Client) Checkin(ctx context.Context, accountID string) (providers.CheckinResult, error) {
+func (client *Client) Checkin(ctx context.Context, accountID string) (result providers.CheckinResult, resultErr error) {
+	ctx, trace := providers.WithCheckinTrace(ctx)
+	defer func() {
+		if resultErr != nil {
+			missing := trace.Phase == "credential" && (errors.Is(resultErr, accounts.ErrAccountNotFound) || errors.Is(resultErr, accounts.ErrSecretNotFound) || errors.Is(resultErr, providers.ErrCredentialMissing))
+			result, resultErr = trace.Failure(resultErr, missing)
+		} else {
+			result.Message = result.Message + "; " + trace.Summary(result.Status)
+		}
+	}()
 	credential, err := client.credential(ctx, accountID)
 	if err != nil {
 		return providers.CheckinResult{}, err
@@ -71,11 +80,9 @@ func (client *Client) Checkin(ctx context.Context, accountID string) (providers.
 	if claimAlready {
 		return providers.CheckinResult{Status: "already", Message: "already checked in; no new reward claimed"}, nil
 	}
-	return providers.CheckinResult{
-		Status:        "success",
-		Message:       "checkin claimed",
-		RewardCredits: float64(after.credits + after.extraCredits),
-	}, nil
+	// Status credits describe the check-in rule, not a verified balance
+	// increase. Keep the actual amount unknown even after checked_in flips.
+	return providers.CheckinResult{Status: "success", Message: "checkin claimed"}, nil
 }
 
 type checkinState struct {

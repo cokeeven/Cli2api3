@@ -6,7 +6,7 @@ export function attemptCreditAmount(credits?: number | null) {
 export function attemptRouteKey(reason?: string) {
   const keys: Record<string, string> = {
     default: 'logsAttemptRouteDefault', priority: 'logsAttemptRoutePriority', sticky: 'logsAttemptRouteSticky',
-    temporary_capacity_borrow: 'logsAttemptRouteBorrow', quota_migration: 'logsAttemptRouteMigration',
+    temporary_capacity_borrow: 'logsAttemptRouteBorrow', quota_migration: 'logsAttemptRouteMigration', configured_model_fallback: 'logsAttemptRouteAlternative',
   }
   return keys[reason || ''] || ''
 }

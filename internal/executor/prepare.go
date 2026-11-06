@@ -312,5 +312,8 @@ func RequestedReasoningLevel(req translate.ChatRequest) string {
 		}
 		return "none"
 	}
+	if level, present, _ := providers.ThinkingIntent(req.Thinking); present {
+		return level
+	}
 	return ""
 }

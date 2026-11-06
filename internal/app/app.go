@@ -156,6 +156,8 @@ func New(cfg config.Config) *App {
 	chatExecutor.Providers = providerReg
 	chatExecutor.OnAttempt = recorder.Attempt
 	chatExecutor.Budgets = store
+	chatExecutor.AuthRecovery = store
+	chatExecutor.ModelAlternatives = store
 	if err := store.RecoverUsageReservations(context.Background()); err != nil {
 		panic(err)
 	}

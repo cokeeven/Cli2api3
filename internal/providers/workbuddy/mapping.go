@@ -12,19 +12,17 @@ import (
 
 func validateCallerReasoning(req translate.ChatRequest, caps providers.ModelCapabilities) error {
 	raw := bytes.TrimSpace(req.ReasoningEffort)
-	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
-		level := requestedReasoningEffort(req.ReasoningEffort)
-		if !providers.SupportsReasoningLevel(level, caps) || (level == "none" && !caps.CanDisableThinking) {
-			return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
-		}
-		return nil
+	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) && requestedReasoningEffort(raw) == "" {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "unrecognized reasoning effort"}
+	}
+	if err := providers.ValidateReasoningSignals(req, requestedReasoningLevel(req)); err != nil {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: err.Error()}
 	}
 	if !hasExplicitReasoning(req) {
 		return nil
 	}
-	level := requestedReasoningLevel(req)
-	if !providers.SupportsReasoningLevel(level, caps) || (level == "none" && !caps.CanDisableThinking) {
-		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "requested reasoning effort is not supported by the model catalog"}
+	if providers.MatchReasoningLevel(requestedReasoningLevel(req), caps) == "" {
+		return &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "reasoning intent or model capabilities cannot be matched to an advertised level"}
 	}
 	return nil
 }
@@ -34,7 +32,8 @@ func hasExplicitReasoning(req translate.ChatRequest) bool {
 	if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
 		return true
 	}
-	return req.EnableThinking != nil || req.EnableReasoning != nil || req.IsReasoning != nil
+	_, thinking, _ := providers.ThinkingIntent(req.Thinking)
+	return req.EnableThinking != nil || req.EnableReasoning != nil || req.IsReasoning != nil || thinking
 }
 
 // officialTopLevelReasoningModels need the 2.132.0 CLI field names. The
@@ -72,6 +71,9 @@ func requestedReasoningLevel(req translate.ChatRequest) string {
 		}
 		return "none"
 	}
+	if level, present, _ := providers.ThinkingIntent(req.Thinking); present {
+		return level
+	}
 	return ""
 }
 
@@ -106,7 +108,11 @@ func applyChatReasoning(obj map[string]any, req translate.ChatRequest, storedLev
 	if level == "" {
 		level = storedLevel
 	}
-	level = providers.ResolveReasoningLevel(level, caps)
+	if level != "" {
+		level = providers.MatchReasoningLevel(level, caps)
+	} else {
+		level = providers.ResolveReasoningLevel(level, caps)
+	}
 	if level == "" {
 		clearChatReasoning(obj)
 		return ""
@@ -120,7 +126,7 @@ func applyChatReasoning(obj map[string]any, req translate.ChatRequest, storedLev
 			}
 		} else {
 			clearChatReasoning(obj)
-			return ""
+			return "none"
 		}
 	}
 	if usesTopLevelReasoningFields(req.Model) {

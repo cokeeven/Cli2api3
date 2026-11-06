@@ -674,3 +674,9 @@ func derefInt(value *int) int {
 	}
 	return *value
 }
+
+func setModelFallbackHeaders(w http.ResponseWriter, model, region string) {
+	w.Header().Set("X-CLI2API-Model-Fallback", "configured")
+	w.Header().Set("X-CLI2API-Actual-Model", model)
+	w.Header().Set("X-CLI2API-Region", region)
+}

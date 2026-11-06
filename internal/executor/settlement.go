@@ -41,6 +41,9 @@ func (e ChatExecutor) executionContext(ctx context.Context) (context.Context, co
 	return context.WithTimeoutCause(providers.WithChatTimeouts(ctx, e.ChatTimeouts), duration, &providers.ChatTimeoutError{Phase: "total"})
 }
 func (l *routeLoop) routeReason(e ChatExecutor) string {
+	if l.fallbackUsed {
+		return "configured_model_fallback"
+	}
 	if l.routing.Source == routingStickyEscape {
 		if l.routing.Migrate {
 			return "quota_migration"
@@ -216,12 +219,13 @@ func (l *routeLoop) finishAttempt(e ChatExecutor, result *ChatResult, completion
 
 type finalizedBody struct {
 	io.ReadCloser
-	ctx           context.Context
-	fallback      func()
-	release       func()
-	once          sync.Once
-	transportOnce sync.Once
-	closeErr      error
+	ctx              context.Context
+	fallback         func()
+	release          func()
+	once             sync.Once
+	transportOnce    sync.Once
+	closeErr         error
+	deferReadRelease bool
 }
 
 func (b *finalizedBody) Read(data []byte) (int, error) {
@@ -229,7 +233,7 @@ func (b *finalizedBody) Read(data []byte) (int, error) {
 	if b.ctx != nil {
 		err = providers.ChatContextError(b.ctx, err)
 	}
-	if err != nil {
+	if err != nil && !b.deferReadRelease {
 		b.release()
 	}
 	return n, err
@@ -273,6 +277,12 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 	var stopCancel atomic.Pointer[func() bool]
 	result.Finalize = func(completion StreamCompletion) {
 		once.Do(func() {
+			if ctx.Err() != nil {
+				completion.Completed = false
+				if completion.Err == nil {
+					completion.Err = ctx.Err()
+				}
+			}
 			if lease.cancel != nil {
 				defer lease.cancel()
 			}
@@ -297,8 +307,13 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 			if completion.Completed && completion.Err == nil {
 				attempt.Status = accounts.AttemptStatusOK
 				attempt.HTTPStatus = ptrInt(200)
-				e.markOK(item.ID, req.Model, item.StateVersion)
-				e.bindSession(lease.routing, item.ID)
+				if result.authAttempt == nil || !result.authAttempt.needed {
+					e.markItemOK(item, req.Model)
+				}
+				e.finishAuthAttempt(ctx, item.ID, result.authAttempt)
+				if !lease.fallbackUsed {
+					e.bindSession(lease.routing, item.ID)
+				}
 			} else {
 				if completion.Err == nil {
 					completion.Err = context.Canceled
@@ -313,7 +328,7 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 				attempt.ErrorKind = classified.Kind
 				attempt.ErrorMessage = truncateErr(completion.Err.Error())
 				if !requestContextDone(ctx, completion.Err) {
-					e.ObserveStreamFailure(item.ID, completion.Err, req.Model)
+					e.observeStreamFailure(item.ID, completion.Err, req.Model, result.authAttempt, isInProcessItem(item))
 				}
 			}
 			e.recordAttempt(ctx, attempt, completion.Err)
@@ -324,7 +339,7 @@ func (e ChatExecutor) finalizeStream(ctx context.Context, req translate.ChatRequ
 		if release == nil {
 			release = func() {}
 		}
-		body = &finalizedBody{ReadCloser: result.Response.Body, ctx: ctx, release: release, fallback: func() { result.Finalize(StreamCompletion{}) }}
+		body = &finalizedBody{ReadCloser: result.Response.Body, ctx: ctx, release: release, deferReadRelease: item.modelProbe, fallback: func() { result.Finalize(StreamCompletion{}) }}
 		result.Response.Body = body
 		// Cancellation must unblock the upstream read without consuming the
 		// one-shot fallback finalizer. The gateway still needs to relay any

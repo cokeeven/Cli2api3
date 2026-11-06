@@ -6,7 +6,7 @@ import type { CheckinRecord } from '@/api/types'
 import { EmptyPanel } from '@/components/ui/EmptyPanel'
 import { PageAlert } from '@/components/ui/PageAlert'
 import { SkeletonBlock } from '@/components/ui/PageSkeletons'
-import type { AccountRow } from '@/lib/account'
+import { formatCheckinMessage, type AccountRow } from '@/lib/account'
 
 type Translate = (key: string, vars?: Record<string, string | number>) => string
 
@@ -89,7 +89,7 @@ export function AccountCheckinRecordsModal({ account, t, onClose }: Props) {
                             <Chip size="sm" variant="soft" color={status.color}>{status.label}</Chip>
                             <span className="mono text-[11px] text-muted">{formatRecordTime(record.created_at)}</span>
                           </div>
-                          <p className="mt-1 break-words text-xs leading-5 text-foreground/75">{record.message || '—'}</p>
+                          <p className="mt-1 break-words text-xs leading-5 text-foreground/75">{formatCheckinMessage(record.message, t) || '—'}</p>
                         </div>
                       </div>
                     )

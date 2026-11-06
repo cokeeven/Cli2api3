@@ -139,6 +139,7 @@ func TestChatOutboundDSHIdentityRewriteUsesFinalHTTPBodyForBothModes(t *testing.
 			}
 			store.items = map[string][]byte{"synthetic": credential}
 			client.catalog = map[string]providers.ModelInfo{"test-model": {NativeModel: "test-model", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"medium"}, ReasoningDefault: "medium"}}}
+			client.rememberCatalogFor("synthetic", []providers.ModelInfo{client.catalog["test-model"]})
 			request := translate.ChatRequest{
 				Model: "test-model", Stream: stream,
 				Messages: []translate.ChatMessage{

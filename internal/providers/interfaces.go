@@ -78,6 +78,19 @@ type ModelInfo struct {
 	// to keep a model routed to the scene that actually serves it; it is
 	// provider-internal and never a public API field.
 	Scene string `json:"-"`
+	// FallbackEvidence contains only explicitly advertised per-account facts.
+	// It is not inferred from the broader display capabilities.
+	FallbackEvidence *FallbackCapabilities `json:"-"`
+}
+
+// FallbackCapabilities are conservative account-specific catalog facts.
+type FallbackCapabilities struct {
+	ContextWindow      int
+	MaxOutput          int
+	Tools              bool
+	Images             bool
+	ReasoningOptions   []string
+	CanDisableThinking bool
 }
 
 // CredentialCodec validates and stores provider credentials.
@@ -88,6 +101,16 @@ type CredentialCodec interface {
 type CredentialMaintainer interface {
 	Keepalive(context.Context, string) error
 }
+
+// CredentialForcer performs an explicit upstream exchange and reports a
+// conflict if the response could not be committed against its starting
+// credential generation. It must never return the credential itself.
+type CredentialForcer interface {
+	ForceCredentialRefresh(context.Context, string) error
+}
+
+var ErrCredentialMissing = errors.New("credential or refresh token missing")
+var ErrCredentialSuperseded = errors.New("credential or authentication state changed during refresh")
 
 // CredentialPayloadCASStore persists a refreshed credential only when the
 // stored payload still matches the snapshot used for the refresh. This keeps a
@@ -103,6 +126,26 @@ type CredentialPayloadCASStore interface {
 // observation must win over an older refresh response.
 type CredentialRefreshCASStore interface {
 	SaveCredentialPayloadAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64) (bool, error)
+}
+
+// FencedCredentialRefreshCASStore additionally checks the in-memory auth
+// event sequence while atomically committing the existing generation CAS.
+type FencedCredentialRefreshCASStore interface {
+	SaveCredentialPayloadAfterRefreshFenced(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64, expectedAuthVersion uint64) (bool, error)
+}
+
+// CredentialAuthVersion is captured before upstream exchange, never after it.
+func CredentialAuthVersion(store any, accountID string) (uint64, bool) {
+	source, ok := store.(interface{ CredentialAuthVersion(string) uint64 })
+	if !ok {
+		return 0, false
+	}
+	return source.CredentialAuthVersion(accountID), true
+}
+
+type VerifiedLoginStore interface {
+	AuthAttemptSnapshot(context.Context, string) (int64, uint64, bool, error)
+	SaveVerifiedLoginFenced(context.Context, string, string, []byte, string, int64, uint64) (bool, error)
 }
 
 // LoginSession describes one browser-login round for an account.
@@ -141,8 +184,9 @@ type ChatOutcome struct {
 	CachedTokens             *int
 	UsageSource              string
 	Credits                  *float64
-	// ReasoningLevel is the clamped reasoning level actually sent upstream,
-	// empty when the provider did not include one in the payload.
+	// ReasoningLevel is the resolved reasoning selection. For WorkBuddy,
+	// "none" uses the existing omission-based disable mapping on the wire;
+	// empty means no level could be reported.
 	ReasoningLevel string
 	// OutputLimit and OutputLimitSource describe the actual max_tokens value
 	// placed in the provider request. A nil limit means the adapter left the
@@ -155,8 +199,9 @@ type ChatOutcome struct {
 // ResolvedChat carries provider-side metadata for a stream request that the
 // API layer may want to log alongside the relayed upstream response.
 type ResolvedChat struct {
-	// ReasoningLevel is the clamped reasoning level actually sent upstream,
-	// empty when the provider did not include one in the payload.
+	// ReasoningLevel is the resolved reasoning selection. For WorkBuddy,
+	// "none" uses the existing omission-based disable mapping on the wire;
+	// empty means no level could be reported.
 	ReasoningLevel       string
 	OutputLimit          *int
 	OutputLimitSource    string

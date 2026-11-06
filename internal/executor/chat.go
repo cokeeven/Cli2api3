@@ -22,6 +22,17 @@ type providerRegistry = providers.Registry
 
 type AttemptHook func(accounts.RequestAttempt)
 
+type AuthRecovery interface {
+	AuthAttemptSnapshot(context.Context, string) (int64, uint64, bool, error)
+	RecoverAuthAfterSuccess(context.Context, string, int64, uint64) (bool, error)
+}
+
+type authAttemptSnapshot struct {
+	generation int64
+	version    uint64
+	needed     bool
+}
+
 type ChatExecutor struct {
 	Pool      *Pool
 	WorkerKey string
@@ -37,10 +48,14 @@ type ChatExecutor struct {
 	CapacityQueueWait       time.Duration
 	ChatTimeouts            providers.ChatTimeouts
 	Budgets                 accounts.UsageBudgetStore
+	AuthRecovery            AuthRecovery
+	ModelAlternatives       accounts.ModelAlternativeReader
 	SessionAffinity         *SessionAffinity
 }
 
 type ChatResult struct {
+	ModelFallback            bool
+	Region                   string
 	Model                    string
 	Content                  string
 	Reasoning                string
@@ -79,6 +94,10 @@ type StreamCompletion struct {
 }
 
 type StreamResult struct {
+	ModelFallback        bool
+	ActualModel          string
+	Region               string
+	authAttempt          *authAttemptSnapshot
 	Finalize             func(StreamCompletion)
 	Response             *http.Response
 	AccountID            string
@@ -94,6 +113,49 @@ type StreamResult struct {
 	// NativeResponses marks the body as an upstream OpenAI Responses SSE stream
 	// that /v1/responses can relay verbatim instead of translating.
 	NativeResponses bool
+}
+
+func (e ChatExecutor) beginAuthAttempt(ctx context.Context, item Item) *authAttemptSnapshot {
+	if e.AuthRecovery == nil || (itemProvider(item) != "workbuddy" && itemProvider(item) != "trae") {
+		return nil
+	}
+	generation, version, needed, err := e.AuthRecovery.AuthAttemptSnapshot(ctx, item.ID)
+	if err != nil {
+		return nil
+	}
+	return &authAttemptSnapshot{generation: generation, version: version, needed: needed || item.LastKind == KindAuth}
+}
+
+func (e ChatExecutor) finishAuthAttempt(ctx context.Context, id string, snapshot *authAttemptSnapshot) {
+	if snapshot == nil || !snapshot.needed || e.AuthRecovery == nil {
+		return
+	}
+	_, err := e.AuthRecovery.RecoverAuthAfterSuccess(ctx, id, snapshot.generation, snapshot.version)
+	if err != nil {
+		log.Printf("auth recovery failed account=%q: %v", id, err)
+	}
+}
+
+func (e ChatExecutor) credentialEvidenceContext(ctx context.Context, item Item) context.Context {
+	if e.AuthRecovery == nil || (itemProvider(item) != "workbuddy" && itemProvider(item) != "trae") {
+		return ctx
+	}
+	return providers.WithCredentialEvidence(ctx, item.ID)
+}
+
+func (e ChatExecutor) actualAuthAttempt(ctx context.Context, item Item, initial *authAttemptSnapshot) *authAttemptSnapshot {
+	evidence := providers.CredentialEvidence(ctx, item.ID)
+	if !evidence.Observed {
+		return initial
+	}
+	if !evidence.Valid {
+		return nil
+	}
+	needed := evidence.NeedsRecovery || (initial != nil && initial.needed)
+	if current, ok := e.Pool.ByID(item.ID); ok && current.LastKind == KindAuth {
+		needed = true
+	}
+	return &authAttemptSnapshot{generation: evidence.Generation, version: evidence.Version, needed: needed}
 }
 
 type NativeResponseResult struct {
@@ -563,6 +625,10 @@ func isInProcessItem(item Item) bool {
 // impossible at that point (bytes are on the wire), so this only records the
 // classified state for the next request's scheduling.
 func (e ChatExecutor) ObserveStreamFailure(accountID string, err error, model string) {
+	e.observeStreamFailure(accountID, err, model, nil, false)
+}
+
+func (e ChatExecutor) observeStreamFailure(accountID string, err error, model string, snapshot *authAttemptSnapshot, fenced bool) {
 	if e.Pool == nil || accountID == "" || err == nil || requestContextDone(nil, err) {
 		return
 	}
@@ -579,7 +645,11 @@ func (e ChatExecutor) ObserveStreamFailure(accountID string, err error, model st
 		return
 	}
 
-	e.markClassified(accountID, classified, model)
+	if fenced {
+		e.markAttemptFailure(accountID, classified, model, snapshot)
+	} else {
+		e.markClassified(accountID, classified, model)
+	}
 }
 
 func (e ChatExecutor) handleModelAvailabilityFailure(requestID, source, accountID, model string, classified Classified) {
@@ -661,6 +731,21 @@ func (e ChatExecutor) markClassified(id string, c Classified, model string) {
 	e.Pool.MarkClassified(id, c)
 }
 
+func (e ChatExecutor) markAttemptFailure(id string, c Classified, model string, snapshot *authAttemptSnapshot) {
+	item, exists := Item{}, false
+	if e.Pool != nil {
+		item, exists = e.Pool.ByID(id)
+	}
+	if exists && (itemProvider(item) == "workbuddy" || itemProvider(item) == "trae") && c.Kind == KindAuth && c.Scope != "model" && c.Scope != "platform" && e.AuthRecovery != nil {
+		if snapshot == nil {
+			return
+		}
+		e.Pool.MarkClassifiedAuthVersion(id, c, snapshot.version)
+		return
+	}
+	e.markClassified(id, c, model)
+}
+
 // markOK records a success scoped to the requested public model so a 200
 // on one model does not discard a cooldown recorded for another. Pass an
 // empty model for a true account-level recovery.
@@ -673,6 +758,17 @@ func (e ChatExecutor) markOK(id, model string, version ...uint64) {
 	} else {
 		e.Pool.MarkOK(id, model)
 	}
+}
+
+func (e ChatExecutor) markItemOK(item Item, model string) {
+	if e.Pool == nil {
+		return
+	}
+	if item.modelProbe {
+		e.Pool.MarkProbeOK(item, model)
+		return
+	}
+	e.markOK(item.ID, model, item.StateVersion)
 }
 
 func (e ChatExecutor) recordAttempt(ctx context.Context, attempt accounts.RequestAttempt, failure ...error) {
@@ -849,19 +945,26 @@ type routeLoop struct {
 	pinned                string
 	index                 int
 	// eligible narrows candidates to one protocol capability; nil admits all.
-	eligible      func(Item) bool
-	ctx           context.Context
-	identity      routingIdentity
-	platforms     []string
-	platformIndex int
-	hardProvider  string
-	release       func()
-	reservation   string
-	started       time.Time
-	request       translate.ChatRequest
-	strictAccount string
-	native        bool
-	cancel        context.CancelFunc
+	eligible                 func(Item) bool
+	ctx                      context.Context
+	identity                 routingIdentity
+	platforms                []string
+	platformIndex            int
+	hardProvider             string
+	release                  func()
+	reservation              string
+	started                  time.Time
+	request                  translate.ChatRequest
+	strictAccount            string
+	native                   bool
+	fallbackUsed             bool
+	alternativeConfigured    bool
+	fallbackOriginalErr      error
+	fallbackOriginalAccount  string
+	fallbackOriginalProvider string
+	lastModelFailureItem     Item
+	lastModelFailure         Classified
+	cancel                   context.CancelFunc
 }
 
 func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter string, req translate.ChatRequest) routeLoop {
@@ -1097,6 +1200,61 @@ func (l routeLoop) canFailover(classified Classified) bool {
 	return classified.Failover && l.index < l.attempts
 }
 
+// configureAlternative grants at most one additional attempt, on the failed
+// platform only, using capabilities observed in the selected account catalog.
+func (l *routeLoop) configureAlternative(e ChatExecutor, req *translate.ChatRequest, item Item, c Classified, original error) bool {
+	if l.fallbackUsed || l.native || l.strictAccount != "" || !c.RetrySafe || c.Scope != "model" || requestContextDone(l.ctx, original) {
+		return false
+	}
+	policy, err := accounts.LoadModelAlternativePolicy(l.ctx, e.ModelAlternatives)
+	if err != nil || !policy.Enabled {
+		return false
+	}
+	provider, region := itemProvider(item), itemRegion(item)
+	for _, rule := range policy.Rules {
+		if !strings.EqualFold(strings.TrimSpace(rule.Provider), provider) || !strings.EqualFold(strings.TrimSpace(rule.Region), region) || routeModel(rule.RequestedModel) != routeModel(req.Model) {
+			continue
+		}
+		l.alternativeConfigured = true
+		if l.index >= retryCap(e.MaxAttempts, l.expanded) {
+			return false
+		}
+		target := routeModel(rule.AlternativeModel)
+		next := *req
+		next.Model = target
+		base := l.eligible
+		eligible := func(candidate Item) bool {
+			cap, ok := candidate.FallbackModels[target]
+			return (base == nil || base(candidate)) && itemHasCatalogModel(candidate, target) && ok && providers.FallbackCompatible(next, &cap)
+		}
+		found := false
+		for _, candidate := range e.Pool.Items() {
+			if itemProvider(candidate) == provider && itemRegion(candidate) == region && eligible(candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		l.finishAttempt(e, nil, nil, false)
+		l.noteFailure(item, original)
+		l.fallbackUsed = true
+		l.fallbackOriginalErr, l.fallbackOriginalAccount, l.fallbackOriginalProvider = original, item.ID, provider
+		*req = next
+		l.request = next
+		l.platforms = []string{platformID(provider, region)}
+		l.platformIndex = 0
+		l.providerFilter, l.regionFilter, l.prefer, l.pinned = provider, region, "", ""
+		l.excluded = map[string]struct{}{}
+		l.eligible = eligible
+		l.attempts = l.index + 1
+		l.stopReason = ""
+		return true
+	}
+	return false
+}
+
 func (l *routeLoop) exclude(item Item) {
 	l.excluded[item.ID] = struct{}{}
 	if l.lastErr != nil {
@@ -1137,6 +1295,23 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 	for loop.index < loop.attempts {
 		item, i, err := loop.pickNextQueued(e, req.Model)
 		if err != nil {
+			if !loop.fallbackUsed && loop.lastErr != nil && loop.configureAlternative(e, &req, loop.lastModelFailureItem, loop.lastModelFailure, loop.lastErr) {
+				ctx = providers.WithFallbackValidation(ctx)
+				continue
+			}
+			if loop.fallbackUsed && requestContextDone(ctx, err) {
+				return ChatResult{AttemptCount: loop.index}, err
+			}
+			if loop.fallbackUsed {
+				if requestContextDone(ctx, err) {
+					return result, err
+				}
+				loop.lastErr = loop.fallbackOriginalErr
+				return ChatResult{AttemptCount: loop.index, AccountID: loop.fallbackOriginalAccount, Provider: loop.fallbackOriginalProvider}, loop.fallbackOriginalErr
+			}
+			if loop.alternativeConfigured && loop.lastErr != nil {
+				return ChatResult{AttemptCount: loop.index, AccountID: loop.lastModelFailureItem.ID, Provider: itemProvider(loop.lastModelFailureItem)}, loop.lastErr
+			}
 			attempts, accountID, provider, pickErr := loop.pickFailure(err)
 			if loop.lastErr != nil {
 				return ChatResult{AttemptCount: attempts, AccountID: accountID, Provider: provider}, pickErr
@@ -1148,12 +1323,38 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			result, classified, err := e.chatInProcessNonStreamAttempt(ctx, item, req, i, loop.index < loop.attempts)
 			if err == nil {
 				result.AttemptCount = i + 1
+				if loop.fallbackUsed {
+					result.Model = req.Model
+					result.ModelFallback = true
+					result.Region = item.Region
+				}
 				e.observeRouting(&loop.routing, result.AccountID)
-				e.bindSession(loop.routing, result.AccountID)
+				if !loop.fallbackUsed {
+					e.bindSession(loop.routing, result.AccountID)
+				}
 				loop.finishAttempt(e, &result, nil, true)
 				return result, nil
 			}
+			if loop.fallbackUsed {
+				result.AttemptCount = i + 1
+				if requestContextDone(ctx, err) {
+					return result, err
+				}
+				if result.HasUsageEvidence() {
+					loop.lastErr = err
+					loop.finishAttempt(e, &result, nil, false)
+					return result, err
+				}
+				if result.Content != "" || result.Reasoning != "" || (len(result.ToolCalls) > 0 && string(result.ToolCalls) != "null") {
+					loop.lastErr = err
+					return result, err
+				}
+				loop.noteFailure(item, err)
+				loop.lastErr = loop.fallbackOriginalErr
+				return ChatResult{AttemptCount: i + 1, AccountID: loop.fallbackOriginalAccount, Provider: loop.fallbackOriginalProvider}, loop.fallbackOriginalErr
+			}
 			loop.lastErr = err
+			loop.lastModelFailureItem, loop.lastModelFailure = item, classified
 			result.AttemptCount = i + 1
 			if result.HasUsageEvidence() {
 				loop.finishAttempt(e, &result, nil, false)
@@ -1164,6 +1365,10 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			}
 			if loop.canFailover(classified) {
 				loop.exclude(item)
+				continue
+			}
+			if loop.configureAlternative(e, &req, item, classified, err) {
+				ctx = providers.WithFallbackValidation(ctx)
 				continue
 			}
 			return result, err
@@ -1250,11 +1455,11 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		result.AttemptCount = i + 1
 		result.ReasoningLevel = RequestedReasoningLevel(req)
 		if result.ReasoningLevel != "" {
-			logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, result.ReasoningLevel)
+			logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, result.ReasoningLevel, RequestedReasoningLevel(req))
 		}
 		e.observeRouting(&loop.routing, item.ID)
 		e.bindSession(loop.routing, item.ID)
-		e.markOK(item.ID, req.Model, item.StateVersion)
+		e.markItemOK(item, req.Model)
 		e.recordAttempt(ctx, accounts.RequestAttempt{
 			AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: &finished,
 			Status: accounts.AttemptStatusOK, HTTPStatus: ptrInt(resp.StatusCode), LatencyMs: &latency,
@@ -1304,14 +1509,17 @@ func (e ChatExecutor) chatInProcessNonStreamAttempt(ctx context.Context, item It
 	if adapter.Chat == nil {
 		return ChatResult{}, Classified{}, fmt.Errorf("provider %s does not implement chat", item.Provider)
 	}
+	authAttempt := e.beginAuthAttempt(ctx, item)
+	attemptCtx := providers.WithDiagnosticRequestID(e.credentialEvidenceContext(ctx, item), RequestIDFromContext(ctx))
 	started := time.Now()
 	sanitized, promptStripped := sanitizeForItemWithDecision(item, req)
-	outcome, err := adapter.Chat.ChatNonStream(ctx, item.ID, sanitized)
+	outcome, err := adapter.Chat.ChatNonStream(attemptCtx, item.ID, sanitized)
+	authAttempt = e.actualAuthAttempt(attemptCtx, item, authAttempt)
 	err = providers.ChatContextError(ctx, err)
 	finished := time.Now().UTC()
 	latency := int(finished.Sub(started).Milliseconds())
 	if err == nil {
-		logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, outcome.ReasoningLevel)
+		logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, outcome.ReasoningLevel, RequestedReasoningLevel(req))
 	}
 	if err != nil {
 		classified := e.classifyInProcessError(err)
@@ -1326,7 +1534,7 @@ func (e ChatExecutor) chatInProcessNonStreamAttempt(ctx context.Context, item It
 			e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "provider_non_stream", item.ID, req.Model, classified)
 		}
 		if !requestContextDone(ctx, err) {
-			e.markClassified(item.ID, classified, req.Model)
+			e.markAttemptFailure(item.ID, classified, req.Model, authAttempt)
 		}
 		status := accounts.AttemptStatusError
 		if requestContextDone(ctx, err) {
@@ -1347,7 +1555,10 @@ func (e ChatExecutor) chatInProcessNonStreamAttempt(ctx context.Context, item It
 		e.recordAttempt(ctx, attempt, err)
 		return partial, classified, NewExecutionError(classified, err)
 	}
-	e.markOK(item.ID, req.Model, item.StateVersion)
+	if authAttempt == nil || !authAttempt.needed {
+		e.markItemOK(item, req.Model)
+	}
+	e.finishAuthAttempt(ctx, item.ID, authAttempt)
 	result := chatResultFromOutcome(outcome, item, promptStripped)
 	prompt, completion := result.UsageTokenEvidence()
 	e.recordAttempt(ctx, accounts.RequestAttempt{
@@ -1412,6 +1623,8 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 	if preferNativeResponses && native != nil && adapter.NativeResponses == nil {
 		return StreamResult{}, Classified{}, providers.ErrUnsupported
 	}
+	authAttempt := e.beginAuthAttempt(ctx, item)
+	attemptCtx := providers.WithDiagnosticRequestID(e.credentialEvidenceContext(ctx, item), RequestIDFromContext(ctx))
 	started := time.Now()
 	var resp *http.Response
 	var resolved providers.ResolvedChat
@@ -1423,20 +1636,21 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 			Model:            NativeModelID(item, req.Model),
 			DropSystemPrompt: item.DropSystemPrompt && itemProvider(item) != "qoder",
 		}
-		resp, resolved, err = adapter.NativeResponses.ResponsesStream(ctx, item.ID, native, options)
+		resp, resolved, err = adapter.NativeResponses.ResponsesStream(attemptCtx, item.ID, native, options)
 		nativeResponses = err == nil
 	} else {
 		sanitized, stripped := sanitizeForItemWithDecision(item, req)
 		promptStripped = boolPointer(stripped)
-		resp, resolved, err = adapter.Chat.ChatStream(ctx, item.ID, sanitized)
+		resp, resolved, err = adapter.Chat.ChatStream(attemptCtx, item.ID, sanitized)
 	}
+	authAttempt = e.actualAuthAttempt(attemptCtx, item, authAttempt)
 	if err == nil && (resp == nil || resp.Body == nil) {
 		err = StreamIncompleteError()
 	}
 	partial := StreamResult{AccountID: item.ID, Provider: item.Provider, ReasoningLevel: resolved.ReasoningLevel, OutputLimit: resolved.OutputLimit, OutputLimitSource: resolved.OutputLimitSource, OutputBudgetEvidence: resolved.OutputBudgetEvidence, PromptStripped: promptStripped}
 	err = providers.ChatContextError(ctx, err)
 	if err == nil {
-		logResolvedReasoning(ctx, "chat_stream", item, req.Model, resolved.ReasoningLevel)
+		logResolvedReasoning(ctx, "chat_stream", item, req.Model, resolved.ReasoningLevel, RequestedReasoningLevel(req))
 	}
 	if err != nil {
 		finished := time.Now().UTC()
@@ -1452,7 +1666,7 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 		if classified.Kind == accounts.KindModelNotAvailable {
 			e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "provider_stream", item.ID, req.Model, classified)
 		}
-		e.markClassified(item.ID, classified, req.Model)
+		e.markAttemptFailure(item.ID, classified, req.Model, authAttempt)
 		status := accounts.AttemptStatusError
 		if classified.Failover && allowFailover {
 			status = accounts.AttemptStatusFailover
@@ -1465,7 +1679,8 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 	}
 	ttfb := int(time.Since(started).Milliseconds())
 	return StreamResult{
-		Response: resp, AccountID: item.ID, Provider: item.Provider, TTFBMs: ttfb,
+		authAttempt: authAttempt,
+		Response:    resp, AccountID: item.ID, Provider: item.Provider, TTFBMs: ttfb,
 		ReasoningLevel: resolved.ReasoningLevel, OutputLimit: resolved.OutputLimit,
 		OutputLimitSource: resolved.OutputLimitSource, OutputBudgetEvidence: resolved.OutputBudgetEvidence, PromptStripped: promptStripped,
 		NativeResponses: nativeResponses,
@@ -1673,6 +1888,20 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 	for loop.index < loop.attempts {
 		item, i, err := loop.pickNextQueued(e, req.Model)
 		if err != nil {
+			if !loop.fallbackUsed && loop.lastErr != nil && loop.configureAlternative(e, &req, loop.lastModelFailureItem, loop.lastModelFailure, loop.lastErr) {
+				ctx = providers.WithFallbackValidation(ctx)
+				continue
+			}
+			if loop.fallbackUsed && requestContextDone(ctx, err) {
+				return StreamResult{AttemptCount: loop.index}, err
+			}
+			if loop.fallbackUsed {
+				loop.lastErr = loop.fallbackOriginalErr
+				return StreamResult{AttemptCount: loop.index, AccountID: loop.fallbackOriginalAccount, Provider: loop.fallbackOriginalProvider}, loop.fallbackOriginalErr
+			}
+			if loop.alternativeConfigured && loop.lastErr != nil {
+				return StreamResult{AttemptCount: loop.index, AccountID: loop.lastModelFailureItem.ID, Provider: itemProvider(loop.lastModelFailureItem)}, loop.lastErr
+			}
 			attempts, accountID, provider, pickErr := loop.pickFailure(err)
 			if loop.lastErr != nil {
 				return StreamResult{AttemptCount: attempts, AccountID: accountID, Provider: provider}, pickErr
@@ -1685,18 +1914,36 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			result.AttemptCount = i + 1
 
 			if err == nil {
+				if loop.fallbackUsed {
+					result.ActualModel = req.Model
+					result.ModelFallback = true
+					result.Region = item.Region
+				}
 				result.AttemptCount = i + 1
 				e.observeRouting(&loop.routing, result.AccountID)
 				e.finalizeStream(ctx, req, &result, &loop, item, i)
 				return result, nil
 			}
+			if loop.fallbackUsed {
+				if requestContextDone(ctx, err) {
+					return result, err
+				}
+				loop.noteFailure(item, err)
+				loop.lastErr = loop.fallbackOriginalErr
+				return StreamResult{AttemptCount: i + 1, AccountID: loop.fallbackOriginalAccount, Provider: loop.fallbackOriginalProvider}, loop.fallbackOriginalErr
+			}
 			loop.lastErr = err
+			loop.lastModelFailureItem, loop.lastModelFailure = item, classified
 			e.observeFailedRoute(&loop, item, classified)
 			if requestContextDone(ctx, err) {
 				return result, err
 			}
 			if loop.canFailover(classified) {
 				loop.exclude(item)
+				continue
+			}
+			if loop.configureAlternative(e, &req, item, classified, err) {
+				ctx = providers.WithFallbackValidation(ctx)
 				continue
 			}
 			return result, err
@@ -1771,7 +2018,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 		e.observeRouting(&loop.routing, item.ID)
 		resolved := RequestedReasoningLevel(req)
 		if resolved != "" {
-			logResolvedReasoning(ctx, "chat_stream", item, req.Model, resolved)
+			logResolvedReasoning(ctx, "chat_stream", item, req.Model, resolved, RequestedReasoningLevel(req))
 		}
 		result = StreamResult{
 			Response:       resp,
@@ -1805,10 +2052,17 @@ func truncateErr(msg string) string {
 // logResolvedReasoning emits one line per successful chat attempt showing the
 // reasoning level actually sent upstream. Empty levels are omitted to keep
 // noise down for providers that do not accept a reasoning knob.
-func logResolvedReasoning(ctx context.Context, source string, item Item, model, level string) {
+func logResolvedReasoning(ctx context.Context, source string, item Item, model, level, requested string) {
 	if level == "" {
 		return
 	}
-	log.Printf("chat reasoning resolved request_id=%q source=%q account=%q provider=%q model=%q level=%q",
-		RequestIDFromContext(ctx), source, item.ID, item.Provider, model, level)
+	reason := "unchanged"
+	if requested == "" {
+		reason = "caller_unspecified"
+	} else if requested != level && (item.Provider == "workbuddy" || item.Provider == "trae") {
+		reason = "account_catalog_match"
+	} else if requested != level {
+		reason = "provider_resolution"
+	}
+	log.Printf("chat reasoning resolved request_id=%q source=%q account=%q provider=%q model=%q requested=%q level=%q reason=%q", RequestIDFromContext(ctx), source, item.ID, item.Provider, model, requested, level, reason)
 }

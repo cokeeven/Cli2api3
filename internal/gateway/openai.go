@@ -94,12 +94,18 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		if provider := firstNonEmpty(upstream.Provider, providerFilter); provider != "" {
 			w.Header().Set("X-CLI2API-Provider", provider)
 		}
+		if upstream.ModelFallback {
+			setModelFallbackHeaders(w, upstream.ActualModel, upstream.Region)
+		}
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 		stats, relayErr := RelayOpenAIStream(w, upstream.Response.Body)
+		if upstream.ModelFallback {
+			stats.Model = upstream.ActualModel
+		}
 		status := streamLogStatus(relayErr, stats.SawDone, r.Context().Err() != nil)
 		budgetState := outputBudgetEnforcement(firstNonEmpty(upstream.Provider, providerFilter), upstream.OutputBudgetEvidence, upstream.OutputLimit, stats.CompletionTokens, stats.UsageSource)
 		h.recordStreamDiagnostic(requestID, upstream.Response, started, stats, relayErr, r.Context().Err(), streamDiagnosticTiming{
@@ -144,6 +150,9 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	res, err := h.Executor.ChatNonStream(ctx, req, prefer, providerFilter)
+	if res.AccountID != "" {
+		w.Header().Set("X-CLI2API-Account", res.AccountID)
+	}
 	if err != nil {
 		h.finishRequestLog(requestID, started, req, publicModel, res.AccountID, firstNonEmpty(res.Provider, providerFilter), res.Routing, accounts.RequestStatusError, 0, nonstreamFailureUsage(res), err, res.AttemptCount, res.ReasoningLevel, requestLogMetadata{
 			OutputLimit: res.OutputLimit, OutputLimitSource: res.OutputLimitSource, OutputBudgetEvidence: res.OutputBudgetEvidence, PromptStripped: res.PromptStripped,
@@ -151,7 +160,9 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		WriteClassifiedErr(w, err)
 		return
 	}
-	if publicModel != "" {
+	if res.ModelFallback {
+		setModelFallbackHeaders(w, res.Model, res.Region)
+	} else if publicModel != "" {
 		res.Model = publicModel
 	}
 	prompt, completion := res.UsageTokenEvidence()

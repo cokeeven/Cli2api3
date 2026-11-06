@@ -547,8 +547,8 @@ func TestCooldownsSurviveReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded) != 2 {
-		t.Fatalf("expired rows must be pruned, got %d: %+v", len(loaded), loaded)
+	if len(loaded) != 3 {
+		t.Fatalf("expired model must remain pending a probe, got %d: %+v", len(loaded), loaded)
 	}
 	byModel := map[string]accounts.CooldownRow{}
 	for _, row := range loaded {
@@ -734,5 +734,40 @@ func TestStorePersistsQuotaAndStatus(t *testing.T) {
 	}
 	if stored.Status != "ready" || stored.Quota == nil || stored.Quota.Exceeded {
 		t.Fatalf("resource-package account state = %+v", stored)
+	}
+}
+
+// An expired model cooldown is still a pending half-open probe after restart.
+func TestExpiredModelCooldownSurvivesReopenUntilCleared(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "probe.db")
+	db, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := db.Create(ctx, accounts.CreateAccount{Name: "probe", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := accounts.CooldownRow{AccountID: account.ID, Model: "m", DownUntil: time.Now().UTC().Add(-time.Second), Kind: accounts.KindRateLimit}
+	if err = db.SaveCooldowns(ctx, account.ID, []accounts.CooldownRow{row}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.LoadCooldowns(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Model != "m" {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	if err = db.SaveCooldowns(ctx, account.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.LoadCooldowns(ctx)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
 }

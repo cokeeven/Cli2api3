@@ -2,7 +2,6 @@ package workbuddy
 
 import (
 	"encoding/json"
-	"errors"
 	"testing"
 
 	"github.com/caigee-cmd/cli2api/internal/providers"
@@ -37,12 +36,13 @@ func TestApplyChatReasoningPreservesCatalogMax(t *testing.T) {
 	}
 }
 
-func TestExplicitMaxStillRequiresCatalogSupport(t *testing.T) {
-	err := validateCallerReasoning(translate.ChatRequest{
-		ReasoningEffort: json.RawMessage(`"max"`),
-	}, providers.ModelCapabilities{ReasoningOptions: []string{"low", "high"}, ReasoningDefault: "high"})
-	var providerErr *providers.Error
-	if !errors.As(err, &providerErr) || providerErr.Code != "unsupported_reasoning_effort" {
-		t.Fatalf("unsupported explicit max error = %#v", err)
+func TestExplicitMaxMatchesCatalog(t *testing.T) {
+	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "high"}, ReasoningDefault: "high"}
+	req := translate.ChatRequest{ReasoningEffort: json.RawMessage(`"max"`)}
+	if err := validateCallerReasoning(req, caps); err != nil {
+		t.Fatal(err)
+	}
+	if got := applyChatReasoning(map[string]any{}, req, "", caps); got != "high" {
+		t.Fatalf("got %q", got)
 	}
 }

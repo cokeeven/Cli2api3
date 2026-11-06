@@ -20,7 +20,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db              *sql.DB
+	authCoordinator *accounts.AuthCoordinator
 }
 
 func OpenStore(path string) (*Store, error) {
@@ -40,7 +41,7 @@ func OpenStore(path string) (*Store, error) {
 	}
 	db := sql.OpenDB(contextSQLiteConnector{Connector: connector})
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
+	store := &Store{db: db, authCoordinator: &accounts.AuthCoordinator{}}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -48,6 +49,9 @@ func OpenStore(path string) (*Store, error) {
 	_ = os.Chmod(path, 0o600)
 	return store, nil
 }
+
+func (s *Store) AuthCoordinator() *accounts.AuthCoordinator { return s.authCoordinator }
+func (s *Store) CredentialAuthVersion(id string) uint64     { return s.authCoordinator.Version(id) }
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -614,6 +618,8 @@ func (s *Store) SaveCredentialPayload(ctx context.Context, accountID, format str
 	if len(payload) == 0 {
 		return fmt.Errorf("credential payload required")
 	}
+	guard := s.authCoordinator.Lock(accountID)
+	defer guard.Unlock()
 	account, err := s.Get(ctx, accountID)
 	if err != nil {
 		return err
@@ -648,6 +654,7 @@ ON CONFLICT(account_id) DO UPDATE SET format=excluded.format, payload=excluded.p
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit save credential payload: %w", err)
 	}
+	s.authCoordinator.Changed(accountID, guard.Advance())
 	return nil
 }
 
@@ -758,7 +765,7 @@ WHERE account_id = ? AND format = ? AND payload = ?`,
 		return false, fmt.Errorf("read account state after credential refresh: %w", err)
 	}
 	statusAfterRefresh := status
-	if status == "login_required" || status == "auth_failed" {
+	if status == "login_required" || status == "auth_failed" || (status == "cooling" && lastErrorKind == accounts.KindAuth) {
 		statusAfterRefresh = "ready"
 	}
 	if statusAfterRefresh != status || lastErrorKind == accounts.KindAuth {
@@ -778,6 +785,171 @@ WHERE id = ? AND credential_generation = ?`, statusAfterRefresh, accountID, expe
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit credential refresh: %w", err)
+	}
+	return true, nil
+}
+
+// SaveCredentialPayloadAfterRefreshFenced orders the database CAS with pool
+// auth events for this account. No network call runs under this guard.
+func (s *Store) SaveCredentialPayloadAfterRefreshFenced(ctx context.Context, accountID, expectedFormat string, expectedPayload []byte, format string, payload []byte, expectedCredentialGeneration int64, expectedAuthVersion uint64) (bool, error) {
+	guard := s.authCoordinator.Lock(accountID)
+	defer guard.Unlock()
+	if guard.Version() != expectedAuthVersion {
+		return false, nil
+	}
+	before, err := s.Get(ctx, accountID)
+	if err != nil {
+		return false, err
+	}
+	saved, err := s.SaveCredentialPayloadAfterRefreshIfCurrent(ctx, accountID, expectedFormat, expectedPayload, format, payload, expectedCredentialGeneration)
+	if err != nil || !saved {
+		return saved, err
+	}
+	version := guard.Advance()
+	wasAuth := before.Status == "login_required" || before.Status == "auth_failed" || before.LastErrorKind == accounts.KindAuth
+	s.authCoordinator.Recovered(accountID, version, wasAuth)
+	providers.RecordCredentialEvidence(ctx, accountID, providers.AttemptCredentialEvidence{Generation: expectedCredentialGeneration + 1, Version: version, NeedsRecovery: wasAuth, Observed: true, Valid: true})
+	return true, nil
+}
+
+// LoadCredentialPayloadWithEvidence takes the payload and its event snapshot
+// atomically. Only the non-secret generation and sequence enter the context.
+func (s *Store) LoadCredentialPayloadWithEvidence(ctx context.Context, id string) (string, []byte, error) {
+	guard := s.authCoordinator.Lock(id)
+	defer guard.Unlock()
+	format, payload, err := s.LoadCredentialPayload(ctx, id)
+	if err != nil {
+		providers.RecordCredentialEvidence(ctx, id, providers.AttemptCredentialEvidence{Observed: true})
+		return "", nil, err
+	}
+	account, err := s.Get(ctx, id)
+	if err != nil {
+		providers.RecordCredentialEvidence(ctx, id, providers.AttemptCredentialEvidence{Observed: true})
+		return "", nil, err
+	}
+	needs := account.Status == "login_required" || account.Status == "auth_failed" || account.LastErrorKind == accounts.KindAuth
+	providers.RecordCredentialEvidence(ctx, id, providers.AttemptCredentialEvidence{Generation: account.CredentialGeneration, Version: guard.Version(), NeedsRecovery: needs, Observed: true, Valid: true})
+	return format, payload, nil
+}
+
+// AuthAttemptSnapshot captures both the stored credential generation and the
+// in-memory auth event sequence before a provider attempt begins.
+func (s *Store) AuthAttemptSnapshot(ctx context.Context, id string) (int64, uint64, bool, error) {
+	guard := s.authCoordinator.Lock(id)
+	defer guard.Unlock()
+	account, err := s.Get(ctx, id)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	needs := account.Status == "login_required" || account.Status == "auth_failed" || account.LastErrorKind == accounts.KindAuth
+	return account.CredentialGeneration, guard.Version(), needs, nil
+}
+
+// RecoverAuthAfterSuccess never replaces credentials. Only a fully successful
+// same-account upstream attempt may invoke it, with its pre-attempt snapshot.
+func (s *Store) RecoverAuthAfterSuccess(ctx context.Context, id string, generation int64, version uint64) (bool, error) {
+	guard := s.authCoordinator.Lock(id)
+	defer guard.Unlock()
+	if guard.Version() != version {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE accounts SET
+status = CASE WHEN status IN ('login_required','auth_failed') OR (status = 'cooling' AND last_error_kind = 'auth') THEN 'ready' ELSE status END,
+last_error = CASE WHEN last_error_kind = 'auth' THEN '' ELSE last_error END,
+last_error_kind = CASE WHEN last_error_kind = 'auth' THEN '' ELSE last_error_kind END,
+credential_generation = credential_generation + 1, updated_at = ?
+WHERE id = ? AND credential_generation = ?`, formatTime(time.Now().UTC()), id, generation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return false, err
+	}
+	next := guard.Advance()
+	s.authCoordinator.Recovered(id, next, true)
+	return true, nil
+}
+
+// SaveVerifiedLoginFenced is for a successful provider login exchange, not an
+// unverified import. The token and auth recovery share a single transaction.
+func (s *Store) SaveVerifiedLoginFenced(ctx context.Context, id, format string, payload []byte, uid string, generation int64, version uint64) (bool, error) {
+	if len(payload) == 0 {
+		return false, fmt.Errorf("credential payload required")
+	}
+	guard := s.authCoordinator.Lock(id)
+	defer guard.Unlock()
+	if guard.Version() != version {
+		return false, nil
+	}
+	account, err := s.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if err := providers.ValidateCredentialFormat(account.Provider, format); err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE accounts SET remote_uid = ?,
+status = CASE WHEN status IN ('login_required','auth_failed','offline') OR (status = 'cooling' AND last_error_kind = 'auth') THEN 'ready' ELSE status END,
+last_error = CASE WHEN last_error_kind = 'auth' THEN '' ELSE last_error END,
+last_error_kind = CASE WHEN last_error_kind = 'auth' THEN '' ELSE last_error_kind END,
+credential_generation = credential_generation + 1, updated_at = ?
+WHERE id = ? AND credential_generation = ?`, uid, formatTime(time.Now().UTC()), id, generation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return false, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO account_credential_payloads(account_id,format,payload,updated_at) VALUES(?,?,?,?)
+ON CONFLICT(account_id) DO UPDATE SET format=excluded.format,payload=excluded.payload,updated_at=excluded.updated_at`, id, format, payload, formatTime(time.Now().UTC()))
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	next := guard.Advance()
+	wasAuth := account.Status == "login_required" || account.Status == "auth_failed" || account.LastErrorKind == accounts.KindAuth
+	s.authCoordinator.Recovered(id, next, wasAuth)
+	return true, nil
+}
+
+// ApplyProbeFenced discards a stale local probe after any newer auth event or
+// credential change. apply updates only runtime memory while the same short
+// account guard is held; it must not do network I/O or reacquire this guard.
+func (s *Store) ApplyProbeFenced(ctx context.Context, id string, generation int64, version uint64, remoteUID, status, lastError, lastKind string, apply func()) (bool, error) {
+	guard := s.authCoordinator.Lock(id)
+	defer guard.Unlock()
+	if guard.Version() != version {
+		return false, nil
+	}
+	increment := 0
+	if status == "login_required" || status == "auth_failed" || lastKind == accounts.KindAuth {
+		increment = 1
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE accounts SET remote_uid = ?, status = CASE
+WHEN status = 'quota_exhausted' AND ? = 'ready' THEN status ELSE ? END,
+last_error = ?, last_error_kind = ?, updated_at = ?, credential_generation = credential_generation + ?
+WHERE id = ? AND credential_generation = ?`, remoteUID, status, status, lastError, lastKind, formatTime(time.Now().UTC()), increment, id, generation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return false, err
+	}
+	if increment != 0 {
+		s.authCoordinator.Changed(id, guard.Advance())
+	}
+	if apply != nil {
+		apply()
 	}
 	return true, nil
 }
@@ -859,6 +1031,11 @@ WHERE id = ?`, string(payload), status, formatTime(time.Now().UTC()), id)
 	return tx.Commit()
 }
 func (s *Store) Observe(ctx context.Context, id, remoteUID, status, lastError, lastKind string) error {
+	var guard *accounts.AuthGuard
+	if status == "login_required" || status == "auth_failed" || lastKind == accounts.KindAuth {
+		guard = s.authCoordinator.Lock(id)
+		defer guard.Unlock()
+	}
 	generationIncrement := 0
 	if status == "login_required" || status == "auth_failed" || lastKind == accounts.KindAuth {
 		generationIncrement = 1
@@ -879,6 +1056,9 @@ WHERE id = ?`, remoteUID, status, status, lastError, lastKind, formatTime(time.N
 	}
 	if changed == 0 {
 		return accounts.ErrAccountNotFound
+	}
+	if guard != nil {
+		s.authCoordinator.Changed(id, guard.Advance())
 	}
 	return nil
 }
@@ -970,8 +1150,8 @@ func canonicalCooldownModel(model string) string {
 }
 
 // SaveCooldowns replaces the persisted cooldown set for one account. Rows
-// whose deadline already passed are dropped instead of being written, so a
-// long-lived process cannot accumulate expired entries.
+// preserves expired model rows until a successful probe clears them; expired
+// account-wide rows do not require a model-scoped probe.
 func (s *Store) SaveCooldowns(ctx context.Context, accountID string, rows []accounts.CooldownRow) error {
 	if accountID == "" {
 		return nil
@@ -986,7 +1166,7 @@ func (s *Store) SaveCooldowns(ctx context.Context, accountID string, rows []acco
 	}
 	now := time.Now().UTC()
 	for _, row := range rows {
-		if row.DownUntil.IsZero() || !now.Before(row.DownUntil) {
+		if row.DownUntil.IsZero() || (canonicalCooldownModel(row.Model) == "" && !now.Before(row.DownUntil)) {
 			continue
 		}
 		evidence := row.Evidence
@@ -1020,26 +1200,25 @@ ON CONFLICT(account_id, model) DO UPDATE SET
 			return fmt.Errorf("save cooldown: %w", err)
 		}
 	}
-	if _, err := execSQLiteBusyRetry(ctx, tx, `DELETE FROM account_cooldowns WHERE account_id = ? AND down_until <= ?`,
+	if _, err := execSQLiteBusyRetry(ctx, tx, `DELETE FROM account_cooldowns WHERE account_id = ? AND model = '' AND down_until <= ?`,
 		accountID, formatTime(now)); err != nil {
 		return fmt.Errorf("prune cooldowns: %w", err)
 	}
 	return tx.Commit()
 }
 
-// LoadCooldowns returns every cooldown whose deadline is still in the future.
-// Expired rows are pruned in the same statement so repeated restarts do not
-// re-read stale entries.
+// LoadCooldowns retains expired model restrictions as pending half-open probes.
+// Expired account-wide rows are pruned.
 func (s *Store) LoadCooldowns(ctx context.Context) ([]accounts.CooldownRow, error) {
 	now := formatTime(time.Now().UTC())
-	if _, err := execSQLiteBusyRetry(ctx, s.db, `DELETE FROM account_cooldowns WHERE down_until <= ?`, now); err != nil {
+	if _, err := execSQLiteBusyRetry(ctx, s.db, `DELETE FROM account_cooldowns WHERE model = '' AND down_until <= ?`, now); err != nil {
 		return nil, fmt.Errorf("prune expired cooldowns: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT account_id, model, down_until, backoff_level, kind, message, model_kind,
        first_observed_at, last_observed_at, evidence_code, evidence_source, evidence_scope,
        reported_scope, upstream_reset_at, local_backoff_until
-FROM account_cooldowns WHERE down_until > ? ORDER BY account_id, model`, now)
+FROM account_cooldowns ORDER BY account_id, model`)
 	if err != nil {
 		return nil, fmt.Errorf("load cooldowns: %w", err)
 	}
@@ -1091,6 +1270,8 @@ func (s *Store) RecordPoolState(ctx context.Context, state accounts.PoolState) e
 	if !state.DownUntil.IsZero() && time.Now().Before(state.DownUntil) {
 		cooldown = formatTime(state.DownUntil)
 		status = "cooling"
+	} else if state.LastErrorKind != "" && state.LastErrorKind != accounts.KindAuth {
+		status = "error"
 	}
 	_, err := s.db.ExecContext(ctx, `
 	UPDATE accounts SET status = ?, last_error = ?, last_error_kind = ?, cooldown_until = ?, updated_at = ?,

@@ -319,7 +319,7 @@ data: [DONE]
 			}))
 			defer server.Close()
 			client := NewClient(store)
-			client.rememberCatalog([]providers.ModelInfo{{NativeModel: "glm-5.2", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"none", "medium"}}}})
+			client.rememberCatalogFor("acc1", []providers.ModelInfo{{NativeModel: "glm-5.2", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"none", "medium"}}}})
 			client.http = server.Client()
 			client.http.Transport = rewriteTransport{server: server.URL, round: server.Client().Transport}
 
@@ -375,7 +375,7 @@ func TestChatNonStreamReadLifecycle(t *testing.T) {
 			}))
 			payload, _ := (Credential{AccessToken: "at", UID: "u1", Domain: "codebuddy.cn", ExpiresAt: 4102444800}).Encode()
 			store.items = map[string][]byte{"acc1": payload}
-			client.rememberCatalog([]providers.ModelInfo{{NativeModel: "glm-5.2", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"low", "high"}}}})
+			client.rememberCatalogFor("acc1", []providers.ModelInfo{{NativeModel: "glm-5.2", Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"low", "high"}}}})
 			client.http.Timeout = 10 * time.Millisecond
 			out, err := client.ChatNonStream(ctx, "acc1", translate.ChatRequest{
 				Model: "glm-5.2", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}},
@@ -1556,7 +1556,7 @@ func TestDailyCheckinSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg != "签到成功" {
+	if msg != "checkin accepted; reward not confirmed" {
 		t.Fatalf("msg=%q", msg)
 	}
 }
@@ -1575,7 +1575,7 @@ func TestDailyCheckinAlreadyCheckedIn(t *testing.T) {
 	if !errors.As(err, &already) {
 		t.Fatalf("err=%v", err)
 	}
-	if msg != "今日已签到" {
+	if msg != "already checked in; no new reward claimed" {
 		t.Fatalf("msg=%q", msg)
 	}
 }
@@ -1595,7 +1595,7 @@ func TestDailyCheckinAlreadyCheckedInHTTP400(t *testing.T) {
 	if !errors.As(err, &already) {
 		t.Fatalf("HTTP 400 already-checked-in must not be a generic failure, err=%v", err)
 	}
-	if msg != "今天已签到，请明天再来" {
+	if msg != "already checked in; no new reward claimed" {
 		t.Fatalf("msg=%q", msg)
 	}
 }
@@ -1619,7 +1619,7 @@ func TestDailyCheckinRetriesTransientFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg != "签到成功" || calls.Load() != 3 {
+	if msg != "checkin accepted; reward not confirmed" || calls.Load() != 3 {
 		t.Fatalf("msg=%q calls=%d", msg, calls.Load())
 	}
 }
@@ -1647,7 +1647,7 @@ func TestDailyCheckinRetriesRequestProcessing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message != "签到成功" || calls.Load() != 3 {
+	if message != "checkin accepted; reward not confirmed" || calls.Load() != 3 {
 		t.Fatalf("message=%q calls=%d", message, calls.Load())
 	}
 }

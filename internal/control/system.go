@@ -23,28 +23,30 @@ type System struct {
 	Mu                *sync.Mutex
 }
 type SystemSettingsPatch struct {
-	MaintenanceSchedule          *accounts.MaintenanceSchedule `json:"maintenance_schedule"`
-	AutomationMaintenanceEnabled *bool                         `json:"automation_maintenance_enabled"`
-	CrossProviderModelPool       *bool                         `json:"cross_provider_model_pool"`
-	CheckinDisabledAccounts      *bool                         `json:"checkin_disabled_accounts"`
-	RoutingStrategy              *string                       `json:"routing_strategy"`
-	ProxyURL                     *string                       `json:"proxy_url"`
-	WorkBuddyCheckinTime         *string                       `json:"workbuddy_checkin_time"`
-	QuotaRefreshIntervalMinutes  *int                          `json:"quota_refresh_interval_minutes"`
-	CheckinTimes                 map[string]string             `json:"checkin_times"`
+	ModelAlternatives            *accounts.ModelAlternativePolicy `json:"model_alternatives"`
+	MaintenanceSchedule          *accounts.MaintenanceSchedule    `json:"maintenance_schedule"`
+	AutomationMaintenanceEnabled *bool                            `json:"automation_maintenance_enabled"`
+	CrossProviderModelPool       *bool                            `json:"cross_provider_model_pool"`
+	CheckinDisabledAccounts      *bool                            `json:"checkin_disabled_accounts"`
+	RoutingStrategy              *string                          `json:"routing_strategy"`
+	ProxyURL                     *string                          `json:"proxy_url"`
+	WorkBuddyCheckinTime         *string                          `json:"workbuddy_checkin_time"`
+	QuotaRefreshIntervalMinutes  *int                             `json:"quota_refresh_interval_minutes"`
+	CheckinTimes                 map[string]string                `json:"checkin_times"`
 }
 type SystemSettings struct {
-	MaintenanceSchedule          accounts.MaintenanceSchedule  `json:"maintenance_schedule"`
-	AutomationMaintenanceEnabled bool                          `json:"automation_maintenance_enabled"`
-	CrossProviderModelPool       bool                          `json:"cross_provider_model_pool"`
-	CheckinDisabledAccounts      bool                          `json:"checkin_disabled_accounts"`
-	RoutingStrategy              string                        `json:"routing_strategy"`
-	ProxyURL                     string                        `json:"proxy_url"`
-	WorkBuddyCheckinTime         string                        `json:"workbuddy_checkin_time"`
-	QuotaRefreshIntervalMinutes  int                           `json:"quota_refresh_interval_minutes"`
-	CheckinTimes                 map[string]string             `json:"checkin_times"`
-	Timezone                     string                        `json:"timezone"`
-	SessionAffinity              executor.SessionAffinityStats `json:"session_affinity"`
+	ModelAlternatives            accounts.ModelAlternativePolicy `json:"model_alternatives"`
+	MaintenanceSchedule          accounts.MaintenanceSchedule    `json:"maintenance_schedule"`
+	AutomationMaintenanceEnabled bool                            `json:"automation_maintenance_enabled"`
+	CrossProviderModelPool       bool                            `json:"cross_provider_model_pool"`
+	CheckinDisabledAccounts      bool                            `json:"checkin_disabled_accounts"`
+	RoutingStrategy              string                          `json:"routing_strategy"`
+	ProxyURL                     string                          `json:"proxy_url"`
+	WorkBuddyCheckinTime         string                          `json:"workbuddy_checkin_time"`
+	QuotaRefreshIntervalMinutes  int                             `json:"quota_refresh_interval_minutes"`
+	CheckinTimes                 map[string]string               `json:"checkin_times"`
+	Timezone                     string                          `json:"timezone"`
+	SessionAffinity              executor.SessionAffinityStats   `json:"session_affinity"`
 }
 
 func (h *System) Current(ctx context.Context) SystemSettings {
@@ -66,6 +68,7 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 		}
 	}
 	settings := SystemSettings{
+		ModelAlternatives:            accounts.ModelAlternativePolicy{Rules: []accounts.ModelAlternativeRule{}},
 		MaintenanceSchedule:          accounts.DefaultMaintenanceSchedule(),
 		AutomationMaintenanceEnabled: automationMaintenanceEnabled,
 		CrossProviderModelPool:       h.CrossProviderPool.Load(),
@@ -77,6 +80,9 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 		Timezone:                     time.Now().Format("MST -07:00"),
 	}
 	if h.Settings != nil {
+		if policy, err := accounts.LoadModelAlternativePolicy(ctx, h.Settings); err == nil {
+			settings.ModelAlternatives = policy
+		}
 		if schedule, err := accounts.LoadMaintenanceSchedule(ctx, h.Settings); err == nil {
 			settings.MaintenanceSchedule = schedule
 		}
@@ -96,7 +102,7 @@ func (h *System) Current(ctx context.Context) SystemSettings {
 }
 
 func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
-	if input.MaintenanceSchedule == nil && input.AutomationMaintenanceEnabled == nil && input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && input.QuotaRefreshIntervalMinutes == nil && len(input.CheckinTimes) == 0 {
+	if input.ModelAlternatives == nil && input.MaintenanceSchedule == nil && input.AutomationMaintenanceEnabled == nil && input.CrossProviderModelPool == nil && input.CheckinDisabledAccounts == nil && input.RoutingStrategy == nil && input.ProxyURL == nil && input.WorkBuddyCheckinTime == nil && input.QuotaRefreshIntervalMinutes == nil && len(input.CheckinTimes) == 0 {
 		return operationError("invalid_request", "a system setting is required")
 	}
 	if input.MaintenanceSchedule != nil {
@@ -114,6 +120,11 @@ func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
 			return operationError("invalid_routing_strategy", "routing_strategy must be round-robin, weighted-round-robin, or fill-first")
 		}
 		strategy = accounts.NormalizeRoutingStrategy(rawStrategy)
+	}
+	if input.ModelAlternatives != nil {
+		if err := accounts.ValidateModelAlternativePolicy(*input.ModelAlternatives); err != nil {
+			return operationError("invalid_model_alternatives", err.Error())
+		}
 	}
 	var checkinTime string
 	checkinTimes := make(map[string]string, len(input.CheckinTimes))
@@ -175,6 +186,15 @@ func (h *System) Patch(ctx context.Context, input SystemSettingsPatch) error {
 		}
 		if err := h.Accounts.ReloadProxyURL(ctx, proxyURL); err != nil {
 			return operationError("proxy_reload_failed", err.Error())
+		}
+	}
+	if input.ModelAlternatives != nil {
+		payload, err := json.Marshal(input.ModelAlternatives)
+		if err != nil {
+			return operationError("system_settings_save_failed", "invalid alternatives")
+		}
+		if err = h.Settings.SetSecret(ctx, accounts.ModelAlternativesSecret, string(payload)); err != nil {
+			return operationError("system_settings_save_failed", "alternative policy could not be saved")
 		}
 	}
 	if input.CrossProviderModelPool != nil {

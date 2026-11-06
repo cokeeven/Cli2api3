@@ -26,9 +26,9 @@ func TestApplyChatReasoningKeepsNestedObjectForGLM(t *testing.T) {
 	}
 }
 
-func TestExplicitUnsupportedReasoningIsRejectedInsteadOfDowngraded(t *testing.T) {
+func TestUnknownExplicitReasoningIsRejected(t *testing.T) {
 	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"}
-	for _, raw := range []json.RawMessage{json.RawMessage(`"high"`), json.RawMessage(`"unrecognized"`)} {
+	for _, raw := range []json.RawMessage{json.RawMessage(`"unrecognized"`)} {
 		err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: raw}, caps)
 		var providerErr *providers.Error
 		if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {

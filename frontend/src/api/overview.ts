@@ -1,4 +1,4 @@
-import { api } from './client'
+import { api, apiWithMetadata } from './client'
 import type { CheckinRecord, Overview } from './types'
 
 export function fetchOverviewSummary(keyOverride?: string) {
@@ -151,10 +151,16 @@ export function refreshAccount(accountId: string, options?: { quota?: boolean })
   })
 }
 
+export function refreshCredential(accountId: string) {
+  return api<{ status: 'success' | 'rejected' | 'missing' | 'superseded' | 'busy' | 'unsupported' | 'unavailable'; relogin_required: boolean }>(
+    `/api/accounts/${encodeURIComponent(accountId)}/credential-refresh`, { method: 'POST', body: '{}' },
+  )
+}
+
 export function testChat(model: string, content: string, accountId?: string) {
   const headers: Record<string, string> = {}
   if (accountId) headers['X-Qoder-Account'] = accountId
-  return api('/api/chat', {
+  return apiWithMetadata('/api/chat', {
     method: 'POST',
     headers,
     body: JSON.stringify({

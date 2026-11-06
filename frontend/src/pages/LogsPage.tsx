@@ -998,6 +998,7 @@ export function LogsPage() {
                     [t('logsSourceFingerprint'), selected?.source_fingerprint || t('logsUnknown')],
                     [t('logsReasoningRequested'), selected?.requested_reasoning || t('logsUnknown')],
                     [t('logsReasoningResolved'), selected?.resolved_reasoning || t('logsUnknown')],
+                    [t('logsReasoningDifference'), selected?.requested_reasoning && selected?.resolved_reasoning && selected.requested_reasoning !== selected.resolved_reasoning && ['trae', 'workbuddy'].includes(selected.provider || '') ? t('logsReasoningCatalogMatch') : t('logsUnknown')],
                     [t('logsOutputLimit'), selected?.output_limit_tokens == null ? t('logsUnknown') : selected.output_limit_tokens],
                     [t('logsOutputLimitSource'), selected?.output_limit_source || t('logsUnknown')],
                     [t('logsOutputBudgetEnforcement'), outputBudgetLabel(selected?.output_budget_enforcement)],

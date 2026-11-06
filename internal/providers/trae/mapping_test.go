@@ -9,9 +9,9 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
 
-func TestExplicitUnsupportedReasoningIsRejectedInsteadOfDowngraded(t *testing.T) {
+func TestUnknownExplicitReasoningIsRejected(t *testing.T) {
 	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"}
-	for _, raw := range []json.RawMessage{json.RawMessage(`"high"`), json.RawMessage(`"unrecognized"`)} {
+	for _, raw := range []json.RawMessage{json.RawMessage(`"unrecognized"`)} {
 		err := validateCallerReasoning(translate.ChatRequest{ReasoningEffort: raw}, caps)
 		var providerErr *providers.Error
 		if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {
@@ -44,7 +44,7 @@ func TestNormalizeReasoningLevelAliases(t *testing.T) {
 
 func TestClampReasoningLevelDropsUnknownAndFallsBack(t *testing.T) {
 	caps := providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"}
-	if got := clampReasoningLevel("xhigh", caps); got != "low" {
+	if got := clampReasoningLevel("xhigh", caps); got != "medium" {
 		t.Fatalf("clamp=%q", got)
 	}
 	if got := clampReasoningLevel("high", providers.ModelCapabilities{}); got != "" {

@@ -301,6 +301,7 @@ func (m *Manager) fetchProviderModelsAt(ctx context.Context, item Item, epoch ui
 	m.withCurrentCatalog(ctx, item, epoch, func() {
 		m.pool.MergeModels(item.ID, ids)
 		m.mergeFreeModels(item.ID, models)
+		m.pool.MergeFallbackModels(item.ID, models)
 	})
 	return true
 }

@@ -74,7 +74,7 @@ func (e ChatExecutor) observeFailedRoute(l *routeLoop, item Item, c Classified) 
 }
 
 func (l *routeLoop) finishRouting(e ChatExecutor, err error, stop string) error {
-	if err != nil && l.lastErr != nil && l.lastAccount != "" {
+	if err != nil && l.lastErr != nil && l.lastAccount != "" && !l.fallbackUsed {
 		l.noteFailure(Item{ID: l.lastAccount}, l.lastErr)
 	}
 	if err != nil {
@@ -88,7 +88,7 @@ func (l *routeLoop) finishRouting(e ChatExecutor, err error, stop string) error 
 				if l.attempts < l.initialCandidates {
 					stop = "attempt_limit"
 				}
-				if l.expanded {
+				if l.expanded && !l.fallbackUsed && !l.alternativeConfigured {
 					err = routeStoppedError(stop, c)
 				}
 			}

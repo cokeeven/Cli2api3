@@ -117,6 +117,20 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 		// No prober registered: leave pool state alone and never hit ""+/health.
 		return nil
 	}
+	probeFence, hasFence := m.store.(interface {
+		AuthAttemptSnapshot(context.Context, string) (int64, uint64, bool, error)
+		ApplyProbeFenced(context.Context, string, int64, uint64, string, string, string, string, func()) (bool, error)
+	})
+	hasFence = hasFence && localCredentialOnlyProbe(item.Provider)
+	var generation int64
+	var authVersion uint64
+	if hasFence {
+		var snapshotErr error
+		generation, authVersion, _, snapshotErr = probeFence.AuthAttemptSnapshot(ctx, item.ID)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+	}
 	health, err := adapter.Prober.Probe(ctx, item.ID)
 	preservedAuthStatus := ""
 	if err == nil && (health.Ready || health.Hot) && localCredentialOnlyProbe(item.Provider) {
@@ -146,14 +160,14 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 		return ctx.Err()
 	}
 	if err != nil {
-		m.pool.MergeHealth(item.ID, false, false, 0, item.Restarts, err.Error())
-		_ = m.store.Observe(ctx, item.ID, "", "error", err.Error(), KindUnavailable)
+		if hasFence {
+			_, _ = probeFence.ApplyProbeFenced(ctx, item.ID, generation, authVersion, "", "error", err.Error(), KindUnavailable, func() { m.pool.MergeHealth(item.ID, false, false, 0, item.Restarts, err.Error()) })
+		} else {
+			m.pool.MergeHealth(item.ID, false, false, 0, item.Restarts, err.Error())
+			_ = m.store.Observe(ctx, item.ID, "", "error", err.Error(), KindUnavailable)
+		}
 		m.mu.Unlock()
 		return fmt.Errorf("probe account %s: %w", item.ID, err)
-	}
-	m.pool.MergeHealth(item.ID, health.Ready, health.Hot, health.InFlight, item.Restarts, health.LastError)
-	if health.Ready || health.Hot {
-		delete(m.restartBackoff, item.ID)
 	}
 	status := "login_required"
 	if health.Ready || health.Hot {
@@ -167,9 +181,27 @@ func (m *Manager) refreshInProcessAt(ctx context.Context, item Item, epoch uint6
 	if preservedAuthStatus != "" {
 		status = preservedAuthStatus
 	}
-	if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, health.LastErrorKind); err != nil {
+	apply := func() {
+		m.pool.MergeHealth(item.ID, health.Ready, health.Hot, health.InFlight, item.Restarts, health.LastError)
+	}
+	if hasFence {
+		applied, applyErr := probeFence.ApplyProbeFenced(ctx, item.ID, generation, authVersion, health.UID, status, health.LastError, health.LastErrorKind, apply)
+		if applyErr != nil {
+			m.mu.Unlock()
+			return applyErr
+		}
+		if !applied {
+			m.mu.Unlock()
+			return nil
+		}
+	} else if err := m.store.Observe(ctx, item.ID, health.UID, status, health.LastError, health.LastErrorKind); err != nil {
 		m.mu.Unlock()
 		return err
+	} else {
+		apply()
+	}
+	if health.Ready || health.Hot {
+		delete(m.restartBackoff, item.ID)
 	}
 	if health.Ready || health.Hot {
 		m.maintenanceDone.Add(1)

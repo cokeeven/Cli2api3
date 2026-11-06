@@ -22,7 +22,7 @@ func TestChatRequestRejectsUnsupportedExplicitReasoning(t *testing.T) {
 		Capabilities: providers.ModelCapabilities{ReasoningOptions: []string{"low", "medium"}, ReasoningDefault: "low"},
 	}}
 	_, _, err := client.chatRequest(context.Background(), "", Credential{}, translate.ChatRequest{
-		Model: "test-model", ReasoningEffort: json.RawMessage(`"high"`),
+		Model: "test-model", ReasoningEffort: json.RawMessage(`"unrecognized"`),
 	})
 	var providerErr *providers.Error
 	if !errors.As(err, &providerErr) || providerErr.Kind != "invalid_request" || providerErr.Code != "unsupported_reasoning_effort" {
@@ -42,6 +42,7 @@ func TestGlobalChatSerializesLimitsRolesAndToolHistory(t *testing.T) {
 			}))
 			store.region = "global"
 			client.catalog = map[string]providers.ModelInfo{"m": {NativeModel: "m", Capabilities: providers.ModelCapabilities{MaxOutput: 64, Tools: true, ReasoningOptions: []string{"high"}, ReasoningDefault: "high"}}}
+			client.rememberCatalogFor("global", []providers.ModelInfo{client.catalog["m"]})
 			credential, _ := (Credential{AccessToken: "synthetic", UID: "synthetic", Domain: "codebuddy.ai", ExpiresAt: 4102444800}).Encode()
 			store.items = map[string][]byte{"global": credential}
 			request := translate.ChatRequest{Model: "m", Stream: stream, MaxCompletionTokens: json.RawMessage(`48`), Messages: []translate.ChatMessage{{Role: "system", Content: "system marker"}, {Role: "developer", Content: "developer marker"}, {Role: "assistant", ToolCalls: json.RawMessage(`[{"id":"call_local","type":"function","function":{"name":"lookup","arguments":"{}"}}]`)}, {Role: "tool", ToolCallID: "call_local", Content: "synthetic actual result"}, {Role: "user", Content: "continue"}}, Tools: json.RawMessage(`[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]`)}
@@ -95,6 +96,7 @@ func TestChatSerializesCallerLimitsInstructionsAndToolRoundToHTTP(t *testing.T) 
 			MaxOutput: 128, ReasoningOptions: []string{"low", "medium", "high"}, ReasoningDefault: "medium",
 		},
 	}}
+	client.rememberCatalogFor("synthetic-account", []providers.ModelInfo{client.catalog["test-model"]})
 	tools := json.RawMessage(`[{"type":"function","function":{"name":"lookup","description":"find","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]`)
 	toolCalls := json.RawMessage(`[{"id":"call_synthetic_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}},{"id":"call_synthetic_2","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"y\"}"}}]`)
 	secondToolCall := json.RawMessage(`[{"id":"call_synthetic_3","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"z\"}"}}]`)

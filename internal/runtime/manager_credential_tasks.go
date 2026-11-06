@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/executor"
 	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
@@ -70,6 +71,16 @@ func (m *Manager) MaintainCredentialAccount(parent context.Context, id string) e
 	return m.maintainCredential(parent, id, true)
 }
 func (m *Manager) maintainCredential(parent context.Context, id string, manual bool) (result error) {
+	return m.maintainCredentialMode(parent, id, manual, false)
+}
+
+// ForceCredentialAccount performs one explicit provider exchange under the
+// same per-account maintenance lease used by scheduled credential checks.
+func (m *Manager) ForceCredentialAccount(parent context.Context, id string) error {
+	return m.maintainCredentialMode(parent, id, true, true)
+}
+
+func (m *Manager) maintainCredentialMode(parent context.Context, id string, manual, force bool) (result error) {
 	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 	stop := context.AfterFunc(m.runCtx, cancel)
@@ -127,7 +138,33 @@ func (m *Manager) maintainCredential(parent context.Context, id string, manual b
 	if maintainer == nil {
 		return fmt.Errorf("credential maintenance unsupported")
 	}
-	return maintainer.Keepalive(ctx, id)
+	var authVersion uint64
+	var hasSnapshot bool
+	if source, ok := m.store.(accounts.AuthCoordinatorSource); ok && source.AuthCoordinator() != nil {
+		authVersion, hasSnapshot = source.AuthCoordinator().Version(id), true
+	}
+	var operationErr error
+	if force {
+		forcer, ok := maintainer.(providers.CredentialForcer)
+		if !ok {
+			return providers.ErrUnsupported
+		}
+		operationErr = forcer.ForceCredentialRefresh(ctx, id)
+	} else {
+		operationErr = maintainer.Keepalive(ctx, id)
+	}
+	var upstream *providers.Error
+	if hasSnapshot && errors.As(operationErr, &upstream) && upstream.Kind == accounts.KindAuth {
+		if source := m.store.(accounts.AuthCoordinatorSource); source.AuthCoordinator().Version(id) != authVersion {
+			return providers.ErrCredentialSuperseded
+		}
+		classified := executor.ClassifyError(operationErr)
+		classified.Scope = "account"
+		if _, exists := m.pool.ByID(id); exists && !m.pool.MarkClassifiedAuthVersion(id, classified, authVersion) {
+			return providers.ErrCredentialSuperseded
+		}
+	}
+	return operationErr
 }
 
 func (m *Manager) maintainDueCredentials(parent context.Context) {

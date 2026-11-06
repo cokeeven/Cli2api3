@@ -87,7 +87,13 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 		checkErr = fmt.Errorf("provider returned an invalid check-in result")
 	}
 	if checkErr != nil {
-		result = providers.CheckinResult{Status: "error", Message: checkErr.Error()}
+		if result.Status != "error" || result.Message == "" {
+			message := checkErr.Error()
+			if account.Provider == "workbuddy" || account.Provider == "trae" {
+				message = "checkin failed; reward not confirmed"
+			}
+			result = providers.CheckinResult{Status: "error", Message: message}
+		}
 	}
 	checkErr = manager.finishMaintenance(ctx, run, checkErr, 0)
 	recordCtx, stopRecording := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -96,7 +102,7 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 	if recordErr != nil {
 		return account, errors.Join(checkErr, fmt.Errorf("save check-in result: %w", recordErr))
 	}
-	if result.Status != "skipped" {
+	if result.Status == "success" || result.Status == "already" || (account.Provider != "workbuddy" && account.Provider != "trae" && result.Status != "skipped") {
 		manager.refreshCheckinQuota(ctx, accountID, adapter)
 	}
 	readCtx, stopReading := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -150,6 +156,9 @@ func checkinDue(account Account, configuredTime string, now time.Time) bool {
 
 func checkinDueFor(account Account, configuredTime string, now time.Time, allowDisabled bool) bool {
 	if (!account.Enabled && !allowDisabled) || !account.AutoCheckin {
+		return false
+	}
+	if recordedToday(account.LastCheckinAt, now) && (strings.Contains(account.LastCheckinMsg, "outcome=upstream_rejected_9074") || strings.Contains(account.LastCheckinMsg, "outcome=credential_missing")) {
 		return false
 	}
 	if recordedToday(account.LastCheckinAt, now) && account.LastCheckinStatus != "error" {

@@ -23,6 +23,7 @@ import { useI18n } from '@/hooks/useI18n'
 import { CompactSwitch } from '@/components/ui/CompactSwitch'
 import { CheckinDefaults } from '@/components/checkin/CheckinDefaults'
 import { QuotaRefreshSettings } from '@/components/QuotaRefreshSettings'
+import { ModelAlternativeSettings } from '@/components/ModelAlternativeSettings'
 import { VersionHistory } from '@/components/VersionHistory'
 import { buildVersionHistory } from '@/lib/versionHistory'
 
@@ -446,6 +447,8 @@ export function SystemPage() {
               <Description className="text-xs leading-5 text-muted">{t('proxyUrlHint')}</Description>
             </div>
           </Card>
+
+          <ModelAlternativeSettings settings={settings} onSaved={setSettings} />
 
           <CheckinDefaults settings={settings} onSaved={setSettings} />
 

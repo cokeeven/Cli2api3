@@ -31,6 +31,7 @@ import {
   fetchLoginStatus,
   loginWithPat,
   refreshAccount,
+  refreshCredential,
   startDeviceLogin,
   updateAccount,
   type ProviderDescriptor,
@@ -40,6 +41,7 @@ import { AccountsPageSkeleton } from '@/components/ui/PageSkeletons'
 import {
   accountState,
   checkinFeedback,
+  formatCheckinMessage,
   isAvailable,
   type AccountRow,
 } from '@/lib/account'
@@ -79,6 +81,7 @@ export function AccountsPage() {
   const [checkinHistoryId, setCheckinHistoryId] = useState<string | null>(null)
   const [dailyHistoryId, setDailyHistoryId] = useState<string | null>(null)
   const [dailyNotice, setDailyNotice] = useState<{ status: 'success' | 'warning' | 'danger'; title: string; description: string } | null>(null)
+  const [credentialNotice, setCredentialNotice] = useState<{ status: 'success' | 'warning' | 'danger'; title: string; description: string } | null>(null)
   useEffect(() => {
     if (!dailyNotice) return
     const timer = window.setTimeout(() => setDailyNotice(null), 10000)
@@ -325,6 +328,19 @@ export function AccountsPage() {
     }
   }
 
+  async function onRefreshCredential(id: string) {
+    setBusy({ id, kind: 'credential' })
+    setCredentialNotice(null)
+    try {
+      const result = await refreshCredential(id)
+      const name = accounts.find((account) => account.id === id)?.name || id
+      setCredentialNotice({ status: result.status === 'success' ? 'success' : result.status === 'rejected' || result.status === 'missing' ? 'danger' : 'warning', title: t('credentialRefreshAction'), description: `${name} · ${t(`credentialRefresh_${result.status}`)}` })
+      await reloadAccounts(false)
+    } catch (error) {
+      setCredentialNotice({ status: 'danger', title: t('credentialRefreshAction'), description: error instanceof Error ? error.message : String(error) })
+    } finally { setBusy(null) }
+  }
+
   async function onRefreshCredits() {
     setQuotaRefreshing(true)
     try {
@@ -351,13 +367,13 @@ export function AccountsPage() {
         setCheckinNotice({
           status: feedback.status,
           title: t(feedback.titleKey),
-          description: `${name} · ${feedback.message || t(feedback.titleKey)}`,
+          description: `${name} · ${formatCheckinMessage(feedback.message, t) || t(feedback.titleKey)}`,
         })
       } catch (error) {
         setCheckinNotice({
           status: 'danger',
           title: t('checkinOutcomeFailed'),
-          description: `${name} · ${error instanceof Error ? error.message : String(error)}`,
+          description: `${name} · ${formatCheckinMessage(error instanceof Error ? error.message : String(error), t)}`,
         })
         throw error
       } finally {
@@ -444,6 +460,7 @@ export function AccountsPage() {
       </section>
 
       {dailyNotice ? <PageAlert {...dailyNotice} /> : null}
+      {credentialNotice ? <PageAlert {...credentialNotice} /> : null}
       {settings?.automation_maintenance_enabled === false ? <PageAlert status="default" title={t('maintenancePaused')} description={t('maintenanceAccountHint')} /> : null}
       <AddAccountModal isOpen={addOpen} onClose={() => setAddOpen(false)} onAdded={() => void reloadAccounts(false)} />
       <AccountModelsModal key={modelsId ?? 'closed'} account={modelsAccount} t={t} onClose={() => setModelsId(null)} />
@@ -564,6 +581,7 @@ export function AccountsPage() {
             onPatLogin={() => void onPat(account.id)}
             onExport={() => void onExport(account.id)}
             onRefresh={() => void onRefreshAccount(account.id)}
+            onRefreshCredential={account.provider === 'workbuddy' || account.provider === 'trae' ? () => void onRefreshCredential(account.id) : undefined}
             onDelete={() => setConfirmId(account.id)}
             onToggle={(selected) => void onToggle(account.id, selected)}
             checkinDefaultTime={settings?.checkin_times[account.provider || '']}

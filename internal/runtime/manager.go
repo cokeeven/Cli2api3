@@ -189,6 +189,12 @@ func NewManager(config ManagerConfig, store AccountStore, starter ProcessStarter
 		},
 	}
 	manager.persistCond = sync.NewCond(&manager.persistMu)
+	if source, ok := store.(accounts.AuthCoordinatorSource); ok && source.AuthCoordinator() != nil {
+		coordinator := source.AuthCoordinator()
+		manager.pool.SetAuthCoordinator(coordinator)
+		coordinator.SetRecoveryHook(manager.pool.RecoverAuthentication)
+		coordinator.SetChangeHook(manager.pool.SyncAuthVersion)
+	}
 	manager.persistDone.Add(1)
 	go manager.drainCooldowns()
 	manager.pool.SetObserver(func(item Item) {
@@ -264,13 +270,33 @@ func (m *Manager) drainCooldowns() {
 		}
 		m.persistMu.Unlock()
 
-		err := m.poolState.RecordPoolState(ctx, poolStateFromItem(item))
+		var guard *accounts.AuthGuard
+		if source, ok := m.store.(accounts.AuthCoordinatorSource); ok {
+			guard = source.AuthCoordinator().Lock(item.ID)
+		}
+		// A credential write, direct auth observation, or successful fenced
+		// refresh supersedes an older queued account status. Preserve model
+		// cooldowns using the newest pool snapshot even when status is stale.
+		staleAuth := guard != nil && item.AuthVersion != guard.Version()
+		if staleAuth {
+			if latest, ok := m.pool.ByID(item.ID); ok {
+				item = latest
+				if guard.PoolEvent() && item.AuthVersion == guard.Version() {
+					staleAuth = false
+				}
+			}
+		}
+		var err error
+		if !staleAuth {
+			err = m.poolState.RecordPoolState(ctx, poolStateFromItem(item))
+		}
 		if err == nil {
 			err = m.poolState.SaveCooldowns(ctx, item.ID, cooldownRows(item))
 		}
 		if err == nil && item.Quota != nil {
 			err = m.store.SaveQuota(ctx, item.ID, item.Quota)
 		}
+		guard.Unlock()
 		m.persistMu.Lock()
 		if err != nil {
 			// The write failed (SQLite locked, disk error, connection). Put

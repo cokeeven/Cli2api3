@@ -67,12 +67,18 @@ func (h *Handler) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.R
 	defer upstream.Response.Body.Close()
 	h.finishCompatibility(execution, upstream.AccountID, upstream.Provider, upstream.Routing, accounts.RequestStatusStreaming, upstream.TTFBMs, nil, nil, upstream.AttemptCount, upstream.ReasoningLevel)
 	setCompatibilityStreamHeaders(w, upstream.AccountID, firstNonEmpty(upstream.Provider, execution.ProviderFilter))
+	if upstream.ModelFallback {
+		setModelFallbackHeaders(w, upstream.ActualModel, upstream.Region)
+	}
 	w.WriteHeader(http.StatusOK)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 	writer := compatibilityStreamWriter(w)
-	stats, relayErr := RelayAnthropicStream(writer, upstream.Response.Body, execution.RequestID, firstNonEmpty(execution.PublicModel, execution.Request.Model))
+	stats, relayErr := RelayAnthropicStream(writer, upstream.Response.Body, execution.RequestID, firstNonEmpty(upstream.ActualModel, execution.PublicModel, execution.Request.Model))
+	if upstream.ModelFallback {
+		stats.Model = upstream.ActualModel
+	}
 	status := streamLogStatus(relayErr, stats.SawDone, r.Context().Err() != nil)
 	h.recordStreamDiagnostic(execution.RequestID, upstream.Response, execution.Started, stats, relayErr, r.Context().Err())
 	ttfb := streamTTFB(execution.Started, upstream.TTFBMs, stats)

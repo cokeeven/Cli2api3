@@ -40,5 +40,10 @@ func (client *Client) Checkin(ctx context.Context, accountID string) (providers.
 	if !payload.CheckinResult.Valid() {
 		return providers.CheckinResult{}, fmt.Errorf("invalid worker check-in status")
 	}
+	// Preserve the existing Qoder wire contract: its zero value was omitted
+	// by omitempty before the shared amount became nullable.
+	if payload.CheckinResult.RewardCredits != nil && *payload.CheckinResult.RewardCredits == 0 {
+		payload.CheckinResult.RewardCredits = nil
+	}
 	return payload.CheckinResult, nil
 }

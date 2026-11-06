@@ -170,6 +170,16 @@ func (a *Accounts) RefreshAccount(ctx context.Context, id string, forceQuota boo
 	return a.runtime.RefreshAccount(ctx, id, forceQuota)
 }
 
+func (a *Accounts) ForceCredentialAccount(ctx context.Context, id string) error {
+	forcer, ok := a.runtime.(interface {
+		ForceCredentialAccount(context.Context, string) error
+	})
+	if !ok {
+		return providers.ErrUnsupported
+	}
+	return forcer.ForceCredentialAccount(ctx, id)
+}
+
 func (a *Accounts) GetStored(ctx context.Context, id string) (accounts.Account, error) {
 	return a.store().Get(ctx, id)
 }

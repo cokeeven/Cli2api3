@@ -140,6 +140,20 @@ func combineCatalogEntry(a, b providers.ModelInfo) providers.ModelInfo {
 		winner, loser = b, a
 	}
 	winner.Scene = preferredScene(a.Scene, b.Scene)
+	// Reasoning must describe the scene actually selected for chat, not a
+	// different scene that happened to advertise a larger context window.
+	serving := winner
+	if a.Scene != "" && a.Scene == winner.Scene {
+		serving = a
+	} else if b.Scene != "" && b.Scene == winner.Scene {
+		serving = b
+	}
+	winner.Capabilities.Reasoning = serving.Capabilities.Reasoning
+	winner.Capabilities.ReasoningOptions = serving.Capabilities.ReasoningOptions
+	winner.Capabilities.ReasoningDefault = serving.Capabilities.ReasoningDefault
+	winner.Capabilities.ReasoningType = serving.Capabilities.ReasoningType
+	winner.Capabilities.CanDisableThinking = serving.Capabilities.CanDisableThinking
+	winner.FallbackEvidence = serving.FallbackEvidence
 	if winner.Credits == "" && loser.Credits != "" {
 		winner.Credits = loser.Credits
 	}
@@ -186,6 +200,7 @@ func catalogModel(item catalogConfig, scene string) (providers.ModelInfo, bool) 
 	if len(options) == 0 {
 		options, defaultLevel = parseReasoningOptionList(item.ReasoningEffortOptions, item.DefaultReasoningEffort)
 	}
+	advertisedReasoning := append([]string(nil), options...)
 	thinkingType := ""
 	promptMax, maxOut := 0, 0
 	// Trae expresses context tiers as model_detail_list entries: the first is
@@ -223,11 +238,12 @@ func catalogModel(item catalogConfig, scene string) (providers.ModelInfo, bool) 
 		options, defaultLevel = []string{"low", "high", "xhigh"}, "high"
 	}
 	return providers.ModelInfo{
-		NativeModel: id,
-		PublicModel: id,
-		DisplayName: display,
-		Credits:     creditsText(contactConsumptionRate(item.DisplayContactConfig)),
-		Scene:       scene,
+		NativeModel:      id,
+		PublicModel:      id,
+		DisplayName:      display,
+		Credits:          creditsText(contactConsumptionRate(item.DisplayContactConfig)),
+		Scene:            scene,
+		FallbackEvidence: &providers.FallbackCapabilities{ContextWindow: window, MaxOutput: maxOut, ReasoningOptions: advertisedReasoning, CanDisableThinking: providers.SupportsReasoningLevel("none", providers.ModelCapabilities{ReasoningOptions: advertisedReasoning})},
 		Capabilities: providers.ModelCapabilities{
 			ContextWindow:        window,
 			ContextWindowMax:     windowMax,
@@ -239,6 +255,7 @@ func catalogModel(item catalogConfig, scene string) (providers.ModelInfo, bool) 
 			Tools:                true,
 			Reasoning:            reasoning,
 			ReasoningOptions:     options,
+			CanDisableThinking:   providers.SupportsReasoningLevel("none", providers.ModelCapabilities{ReasoningOptions: options}),
 			ReasoningDefault:     defaultLevel,
 			ReasoningType:        thinkingType,
 			OutputBudgetEvidence: outputBudgetEvidence(id, scene, maxOut),

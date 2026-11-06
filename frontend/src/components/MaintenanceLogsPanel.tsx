@@ -1,3 +1,4 @@
+import { formatCheckinMessage } from '@/lib/account'
 import { useEffect, useMemo, useState } from 'react'
 import { getLocalTimeZone, type DateValue } from '@internationalized/date'
 import { Button, Card, Chip, DateField, DateRangePicker, Modal, RangeCalendar, Table } from '@heroui/react'
@@ -146,8 +147,8 @@ export function MaintenanceLogsPanel() {
           <Modal.Body className="space-y-3">
             {selected ? <>
               <div className="flex flex-wrap items-center gap-2"><Chip size="sm" variant="soft" color={dailyStatusColor(selected.status)}>{t(`dailyStatus_${selected.status}`)}</Chip><span className="text-xs text-muted">{t(`maintenanceKind_${selected.kind}`)} · {t(`dailyTrigger_${selected.trigger}`)} · {formatTime(selected.created_at)}</span></div>
-              <p className="break-words text-sm">{selected.summary || '—'}</p>
-              <div className="divide-y divide-separator">{selected.steps?.map((step, index) => <div key={`${step.step}-${index}`} className="py-2"><div className="flex items-center justify-between gap-3 text-xs"><span>{dailyStepLabel(step.step, t)}</span><Chip size="sm" variant="soft" color={dailyStatusColor(step.status)}>{t(`dailyStatus_${step.status}`)}</Chip></div>{step.reused ? <p className="mt-1 text-xs text-muted">{t('maintenanceStepReused')}</p> : null}{step.message ? <p className="mt-1 break-words text-xs text-muted">{step.message}</p> : null}</div>)}</div>
+              <p className="break-words text-sm">{(selected.kind === 'checkin' ? formatCheckinMessage(selected.summary, t) : selected.summary) || '—'}</p>
+              <div className="divide-y divide-separator">{selected.steps?.map((step, index) => <div key={`${step.step}-${index}`} className="py-2"><div className="flex items-center justify-between gap-3 text-xs"><span>{dailyStepLabel(step.step, t)}</span><Chip size="sm" variant="soft" color={dailyStatusColor(step.status)}>{t(`dailyStatus_${step.status}`)}</Chip></div>{step.reused ? <p className="mt-1 text-xs text-muted">{t('maintenanceStepReused')}</p> : null}{step.message ? <p className="mt-1 break-words text-xs text-muted">{selected.kind === 'checkin' ? formatCheckinMessage(step.message, t) : step.message}</p> : null}</div>)}</div>
               {selected.next_retry_at ? <p className="text-xs text-muted">{t('dailyTasksRetryAt')}: {formatTime(selected.next_retry_at)}</p> : null}
               <dl className="grid gap-2 text-xs text-muted sm:grid-cols-2"><div><dt>{t('maintenanceFinishedAt')}</dt><dd className="mono">{formatTime(selected.finished_at)}</dd></div><div><dt>{t('maintenanceAttempt')}</dt><dd className="mono">{selected.attempt}</dd></div></dl>
             </> : null}
@@ -181,7 +182,7 @@ function MaintenanceLogList({ items, loading, onSelect, formatTime }: { items: M
             <Table.Cell><span className="whitespace-nowrap text-xs">{t(`maintenanceKind_${item.kind}`)}</span></Table.Cell>
             <Table.Cell><span className="whitespace-nowrap text-xs text-muted">{t(`dailyTrigger_${item.trigger}`)}</span></Table.Cell>
             <Table.Cell><Chip size="sm" variant="soft" color={dailyStatusColor(item.status)}>{t(`dailyStatus_${item.status}`)}</Chip></Table.Cell>
-            <Table.Cell><p className="line-clamp-2 min-w-36 max-w-lg break-words text-xs text-muted">{item.summary || '—'}</p></Table.Cell>
+            <Table.Cell><p className="line-clamp-2 min-w-36 max-w-lg break-words text-xs text-muted">{(item.kind === 'checkin' ? formatCheckinMessage(item.summary, t) : item.summary) || '—'}</p></Table.Cell>
             <Table.Cell><Button size="sm" variant="ghost" onPress={() => onSelect(item)}>{t('maintenanceDetail')}</Button></Table.Cell>
           </Table.Row>
         ))}</Table.Body>

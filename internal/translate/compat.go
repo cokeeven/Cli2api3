@@ -700,15 +700,13 @@ func responseReasoningEffort(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(fmt.Sprintf("%q", effort))
 	}
 	var source map[string]json.RawMessage
-	if json.Unmarshal(raw, &source) != nil {
-		return nil
+	if json.Unmarshal(raw, &source) != nil || source == nil {
+		return append(json.RawMessage(nil), raw...)
 	}
-	effort := rawMapString(source, "effort")
-	if effort == "" {
-		return nil
+	if effort, ok := source["effort"]; ok {
+		return append(json.RawMessage(nil), effort...)
 	}
-	encoded, _ := json.Marshal(effort)
-	return encoded
+	return nil
 }
 
 func anthropicReasoningEffort(raw json.RawMessage) json.RawMessage {
@@ -716,15 +714,13 @@ func anthropicReasoningEffort(raw json.RawMessage) json.RawMessage {
 		return nil
 	}
 	var source map[string]json.RawMessage
-	if json.Unmarshal(raw, &source) != nil {
-		return nil
+	if json.Unmarshal(raw, &source) != nil || source == nil {
+		return append(json.RawMessage(nil), raw...)
 	}
-	effort := rawMapString(source, "effort")
-	if effort == "" {
-		return nil
+	if effort, ok := source["effort"]; ok {
+		return append(json.RawMessage(nil), effort...)
 	}
-	encoded, _ := json.Marshal(effort)
-	return encoded
+	return nil
 }
 
 func anthropicParallelToolCalls(raw json.RawMessage) *bool {

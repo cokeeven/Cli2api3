@@ -2,6 +2,7 @@ package console
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -184,6 +185,38 @@ func (h *Handler) HandleAccountByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if action == "credential-refresh" {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+			return
+		}
+		if _, err := h.Control.Accounts.GetStored(r.Context(), accountID); err != nil {
+			writeErr(w, http.StatusNotFound, "account_not_found", "account not found")
+			return
+		}
+		err := h.Control.Accounts.ForceCredentialAccount(r.Context(), accountID)
+		status := "success"
+		relogin := false
+		if err != nil {
+			var upstream *providers.Error
+			switch {
+			case errors.Is(err, providers.ErrCredentialMissing), errors.Is(err, accounts.ErrAccountNotFound):
+				status, relogin = "missing", true
+			case errors.Is(err, providers.ErrCredentialSuperseded):
+				status = "superseded"
+			case errors.Is(err, accounts.ErrDailyTasksBusy):
+				status = "busy"
+			case errors.Is(err, providers.ErrUnsupported):
+				status = "unsupported"
+			case errors.As(err, &upstream) && upstream.Kind == accounts.KindAuth:
+				status, relogin = "rejected", true
+			default:
+				status = "unavailable"
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": status, "relogin_required": relogin})
 		return
 	}
 	required := map[string]string{

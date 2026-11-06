@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -111,13 +113,28 @@ func ClassifyError(err error) Classified {
 	}
 	var providerErr *providers.Error
 	if !errors.As(err, &providerErr) || providerErr == nil {
+		// A typed transport error carries no upstream HTTP response. Its URL,
+		// address, or port may contain auth-like words or numbers; those must
+		// not be interpreted as a credential rejection. Explicit provider and
+		// execution errors above remain authoritative.
+		var networkErr net.Error
+		if errors.As(err, &networkErr) {
+			classified := Classify(0, err.Error(), "", accounts.KindUnavailable, "")
+			classified.EvidenceSource = "transport_error"
+			return classified
+		}
 		return Classify(0, err.Error(), "", "", "")
 	}
 	message := strings.TrimSpace(providerErr.Message)
 	if message == "" {
 		message = providerErr.Error()
 	}
-	classified := Classify(providerErr.Status, message, "", providerErr.Kind, "")
+	kindHint := providerErr.Kind
+	var networkErr net.Error
+	if kindHint == "" && providerErr.HTTPStatus == nil && providerErr.Status != http.StatusUnauthorized && providerErr.Status != http.StatusForbidden && errors.As(err, &networkErr) {
+		kindHint = accounts.KindUnavailable
+	}
+	classified := Classify(providerErr.Status, message, "", kindHint, "")
 	classified.Scope = providerErr.Scope
 	classified.RetrySafe = providerErr.RetrySafe
 	if classified.Kind == accounts.KindQuota && providerErr.RetrySafe {
@@ -169,6 +186,10 @@ func ClassifyError(err error) Classified {
 		} else if providerErr.RetryAfter > 0 {
 			classified.Cooldown = providerErr.RetryAfter
 		}
+	}
+	if providerErr.Code == "11102" && classified.Kind == accounts.KindUnavailable && classified.Scope == "model" && classified.RetrySafe && providerErr.RetryAfterHeader == "" && providerErr.RetryAfter <= 0 {
+		// Local backoff only: no upstream reset time was observed.
+		classified.Cooldown = 2 * time.Minute
 	}
 	classified.RetryAfter = classified.Cooldown
 	return classified

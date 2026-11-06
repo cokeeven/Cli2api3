@@ -3,6 +3,8 @@ import { readStoredApiKey } from '@/hooks/useApiKey'
 export class ApiError extends Error {
   status: number
   code?: string
+  requestId?: string
+  accountId?: string
 
   constructor(message: string, status: number, code?: string) {
     super(message)
@@ -19,6 +21,10 @@ export function isUnauthorized(err: unknown) {
 }
 
 export async function api<T = any>(path: string, opts: RequestInit = {}, keyOverride?: string): Promise<T> {
+  return (await apiWithMetadata<T>(path, opts, keyOverride)).data
+}
+
+export async function apiWithMetadata<T = any>(path: string, opts: RequestInit = {}, keyOverride?: string): Promise<{ data: T; requestId: string; accountId: string }> {
   const headers = new Headers(opts.headers || {})
   if (opts.body && !(opts.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
@@ -28,6 +34,8 @@ export async function api<T = any>(path: string, opts: RequestInit = {}, keyOver
     headers.set('Authorization', `Bearer ${key}`)
   }
   const res = await fetch(path, { ...opts, headers })
+  const requestId = res.headers.get('X-Request-Id') || ''
+  const accountId = res.headers.get('X-CLI2API-Account') || res.headers.get('X-Qoder-Account') || ''
   const text = await res.text()
   let data: any
   try {
@@ -39,7 +47,10 @@ export async function api<T = any>(path: string, opts: RequestInit = {}, keyOver
     const raw = typeof data === 'string' ? data : text
     const looksHTML = /<!doctype html|<html[\s>]/i.test(raw)
     const msg = data?.error?.message || data?.message || (looksHTML ? `${res.status} ${res.statusText}` : (raw || res.statusText))
-    throw new ApiError(msg, res.status, data?.error?.code)
+    const error = new ApiError(msg, res.status, data?.error?.code)
+    error.requestId = requestId
+    error.accountId = accountId
+    throw error
   }
-  return data as T
+  return { data: data as T, requestId, accountId }
 }

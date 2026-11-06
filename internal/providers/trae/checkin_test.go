@@ -69,8 +69,8 @@ func TestCheckinClaimFlow(t *testing.T) {
 	if result.Status != "success" {
 		t.Fatalf("result=%+v", result)
 	}
-	if result.RewardCredits != 200 {
-		t.Fatalf("reward=%v", result.RewardCredits)
+	if result.RewardCredits != nil {
+		t.Fatalf("status rule is not confirmed credited reward: %v", result.RewardCredits)
 	}
 	if len(paths) != 3 || paths[0] != pathCheckinStatus || paths[1] != pathCheckinClaim || paths[2] != pathCheckinStatus {
 		t.Fatalf("paths=%v", paths)
@@ -91,7 +91,7 @@ func TestCheckinAlreadyClaimedUpstream(t *testing.T) {
 	if result.Status != "already" {
 		t.Fatalf("result=%+v", result)
 	}
-	if result.RewardCredits != 0 {
+	if result.RewardCredits != nil {
 		t.Fatalf("already must not report a new reward: %+v", result)
 	}
 }
@@ -134,7 +134,7 @@ func TestCheckinClaimAlreadyRace(t *testing.T) {
 	if result.Status != "already" {
 		t.Fatalf("result=%+v", result)
 	}
-	if statusCalls != 2 || result.RewardCredits != 0 {
+	if statusCalls != 2 || result.RewardCredits != nil {
 		t.Fatalf("race must confirm state without new reward: calls=%d result=%+v", statusCalls, result)
 	}
 }
@@ -282,7 +282,7 @@ func TestCheckinAlreadyStateDoesNotPostClaim(t *testing.T) {
 	}))
 	seedCheckinCredential(t, store)
 	result, err := client.Checkin(context.Background(), "acc1")
-	if err != nil || result.Status != "already" || result.RewardCredits != 0 {
+	if err != nil || result.Status != "already" || result.RewardCredits != nil {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
@@ -296,7 +296,7 @@ func TestCheckinDeviceAlreadyUsedDoesNotClaimForAccount(t *testing.T) {
 	}))
 	seedCheckinCredential(t, store)
 	result, err := client.Checkin(context.Background(), "acc1")
-	if err != nil || result.Status != "skipped" || result.RewardCredits != 0 || !strings.Contains(result.Message, "device") {
+	if err != nil || result.Status != "skipped" || result.RewardCredits != nil || !strings.Contains(result.Message, "device") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }

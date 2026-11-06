@@ -2,16 +2,21 @@ package executor
 
 import (
 	"log"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
 type Item struct {
+	// modelProbe is an attempt-local lease marker; it is never persisted.
+	modelProbe        bool
 	ModelOutputLimits map[string]int
+	FallbackModels    map[string]providers.FallbackCapabilities
 	ID                string
 	URL               string
 	Provider          string
@@ -93,6 +98,8 @@ type Item struct {
 	// snapshot that arrives after a newer one for the same account. Not
 	// persisted: it only orders in-memory snapshots.
 	StateVersion uint64
+	// AuthVersion orders account-wide auth events against token refreshes.
+	AuthVersion uint64
 }
 
 // RouteQuery selects candidates for one public model request. Empty fields are
@@ -322,8 +329,9 @@ func routeHintMatches(item Item, q RouteQuery) bool {
 }
 
 type Pool struct {
-	mu    sync.Mutex
-	items []Item
+	authCoordinator *accounts.AuthCoordinator
+	mu              sync.Mutex
+	items           []Item
 	// lastPicked tracks the rotation cursor per route, keyed by
 	// provider|region|model, as the *ID* of the previous pick.
 	//
@@ -351,6 +359,7 @@ type Pool struct {
 	observer        PoolObserver
 	keyPlatformLive map[string]int
 	accountLive     map[string]int
+	modelProbes     map[string]bool
 	platformCursor  map[string]string
 	capacityWait    *capacityWaitQueue
 }
@@ -359,6 +368,79 @@ type Pool struct {
 // (MarkClassified / MarkOK). The callback is data-only: Pool never
 // accepts *Store, and the Manager persist goroutine is the writer.
 type PoolObserver func(Item)
+
+// SetAuthCoordinator is called during assembly before provider traffic starts.
+func (p *Pool) SetAuthCoordinator(coordinator *accounts.AuthCoordinator) {
+	if p != nil {
+		p.authCoordinator = coordinator
+	}
+}
+
+// SyncAuthVersion invalidates older persistence snapshots after a credential
+// write or a direct auth observation. The owning operation persists its own
+// account status, so this does not enqueue a second account-state write.
+func (p *Pool) SyncAuthVersion(id string, version uint64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.items {
+		if p.items[i].ID == id {
+			p.items[i].AuthVersion = version
+			p.stateCounter++
+			p.items[i].StateVersion = p.stateCounter
+			return
+		}
+	}
+}
+
+// RecoverAuthentication is called while the account's auth guard is held,
+// after a successful upstream exchange and its generation CAS. It removes
+// only an account-wide auth restriction; model and quota restrictions remain.
+func (p *Pool) RecoverAuthentication(id string, version uint64, wasAuth bool) {
+	if p == nil {
+		return
+	}
+	var changed *Item
+	p.mu.Lock()
+	for i := range p.items {
+		item := &p.items[i]
+		if item.ID != id {
+			continue
+		}
+		wasPoolAuth := item.LastKind == KindAuth
+		recovered := wasPoolAuth
+		if wasPoolAuth {
+			item.LastKind, item.LastError = "", ""
+			item.DownUntil = time.Time{}
+			item.BackoffLevel = 0
+			delete(item.CooldownEvidence, "")
+		}
+		if item.RuntimeState == "auth_failed" && (wasPoolAuth || (wasAuth && item.LastKind == "")) {
+			ready := true
+			item.Ready, item.Hot = &ready, &ready
+			item.RuntimeState = "ready"
+			if item.LastKind == "" {
+				item.LastError = ""
+			}
+			recovered = true
+		}
+		item.AuthVersion = version
+		p.stateCounter++
+		item.StateVersion = p.stateCounter
+		if recovered || wasAuth {
+			snapshot := item.clone()
+			changed = &snapshot
+		}
+		break
+	}
+	observer := p.observer
+	p.mu.Unlock()
+	if changed != nil && observer != nil {
+		observer(*changed)
+	}
+}
 
 // rotationLimit bounds the cursor map so long-tailed model IDs cannot grow it
 // without bound. Hitting the limit resets every route's cursor, which costs
@@ -519,7 +601,7 @@ func (p *Pool) pickRouteLocked(q RouteQuery) (Item, bool) {
 					return Item{}, false
 				}
 				if routeMatches(*pinned, q) && !itemDown(*pinned, now) &&
-					!itemModelDown(*pinned, q, now) && !itemSaturated(*pinned) {
+					!itemModelDown(*pinned, q, now) && !p.modelProbeBusyLocked(*pinned, q) && !itemSaturated(*pinned) {
 					return *pinned, true
 				}
 			}
@@ -533,7 +615,7 @@ func (p *Pool) pickRouteLocked(q RouteQuery) (Item, bool) {
 	available := make([]Item, 0, len(eligible))
 	for _, i := range eligible {
 		item := p.items[i]
-		if !itemDown(item, now) && !itemModelDown(item, q, now) && !itemSaturated(item) {
+		if !itemDown(item, now) && !itemModelDown(item, q, now) && !p.modelProbeBusyLocked(item, q) && !itemSaturated(item) {
 			available = append(available, item)
 		}
 	}
@@ -632,6 +714,14 @@ func pickFillFirst(available []Item) Item {
 		}
 	}
 	return picked
+}
+
+// A recovering model has one probe lease per account/model, independent of
+// other models on the same account and of accounts serving the same model.
+func modelProbeKey(accountID, model string) string { return accountID + "\x00" + routeModel(model) }
+func (p *Pool) modelProbeBusyLocked(item Item, q RouteQuery) bool {
+	model := routeModel(q.PublicModel)
+	return model != "" && p.modelProbes[modelProbeKey(item.ID, model)]
 }
 
 // pickWeighted runs smooth weighted round-robin when candidates have differing
@@ -834,8 +924,26 @@ func (p *Pool) MarkDown(id string, d time.Duration, err string) {
 }
 
 func (p *Pool) MarkClassified(id string, c Classified) {
+	p.markClassified(id, c, nil)
+}
+
+// MarkClassifiedAuthVersion drops an auth failure from an attempt that began
+// before a newer auth event or credential replacement.
+func (p *Pool) MarkClassifiedAuthVersion(id string, c Classified, version uint64) bool {
+	return p.markClassified(id, c, &version)
+}
+
+func (p *Pool) markClassified(id string, c Classified, expected *uint64) bool {
 	if p == nil || id == "" || c.Kind == KindModelNotAvailable || c.Kind == KindConcurrencyCapacity {
-		return
+		return false
+	}
+	var guard *accounts.AuthGuard
+	if classifiedCooldownModel(c) == "" && c.Scope != "model" && c.Kind != KindInvalidRequest {
+		guard = p.authCoordinator.Lock(id)
+		defer guard.Unlock()
+		if expected != nil && (guard == nil || guard.Version() != *expected) {
+			return false
+		}
 	}
 	var changed *Item
 	p.mu.Lock()
@@ -843,11 +951,19 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 		if p.items[i].ID != id {
 			continue
 		}
+		if guard != nil {
+			p.items[i].AuthVersion = guard.AdvancePool()
+		}
 		model := classifiedCooldownModel(c)
 		if c.Scope == "model" && model == "" {
 			// An explicit model scope without a usable model identifier cannot
 			// safely be widened into an account-wide restriction.
 			break
+		}
+		// A pool without an auth coordinator still needs to distinguish a
+		// newer account-auth failure from unrelated model mutations.
+		if guard == nil && model == "" && c.Kind == KindAuth {
+			p.items[i].AuthVersion++
 		}
 		if model == "" {
 			p.items[i].LastError = c.Message
@@ -907,7 +1023,7 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 			// tracked per model when the cooldown is model-scoped, so one
 			// model's repeat failures don't inflate another model's ladder.
 			level := 0
-			if prevKind == c.Kind && c.Kind != KindInvalidRequest {
+			if (prevKind == c.Kind || (prevKind == KindQuota && c.Kind == KindRateLimit && c.Code == "6004")) && c.Kind != KindInvalidRequest {
 				if model != "" {
 					if p.items[i].ModelBackoff == nil {
 						p.items[i].ModelBackoff = map[string]int{}
@@ -995,6 +1111,7 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 	if changed != nil && observer != nil {
 		observer(*changed)
 	}
+	return changed != nil
 }
 
 // MarkOK records a success. When model is non-empty, only that model's
@@ -1004,26 +1121,47 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 // model is empty the account is treated as fully healthy: account-wide
 // cooldown, backoff, and all model-scoped state are cleared.
 func (p *Pool) MarkOK(id, model string) {
-	p.markOK(id, model, nil)
+	p.markOK(id, model, nil, nil)
 }
 
 func (p *Pool) MarkOKVersion(id, model string, version uint64) {
-	p.markOK(id, model, &version)
+	p.markOK(id, model, &version, nil)
 }
 
-func (p *Pool) markOK(id, model string, version *uint64) {
+// MarkProbeOK compares the admitted model snapshot, allowing unrelated model
+// events while preserving any newer rejection on the probed model.
+func (p *Pool) MarkProbeOK(item Item, model string) {
+	p.markOK(item.ID, model, &item.StateVersion, &item)
+}
+func sameProbedModel(current, admitted Item, model string) bool {
+	key := routeModel(model)
+	return key != "" && !admitted.ModelDownUntil[key].IsZero() &&
+		current.ModelDownUntil[key].Equal(admitted.ModelDownUntil[key]) &&
+		current.ModelBackoff[key] == admitted.ModelBackoff[key] && current.ModelLastKind[key] == admitted.ModelLastKind[key] &&
+		reflect.DeepEqual(current.CooldownEvidence[key], admitted.CooldownEvidence[key])
+}
+func (p *Pool) markOK(id, model string, version *uint64, probe *Item) {
 	if p == nil || id == "" {
 		return
 	}
 	var changed *Item
+	// Keep the account auth guard through the pool mutation. Credential writes
+	// and auth failures use the same guard, including before their pool hook.
+	var authGuard *accounts.AuthGuard
+	if probe != nil {
+		authGuard = p.authCoordinator.Lock(id)
+	}
 	p.mu.Lock()
 	for i := range p.items {
 		if p.items[i].ID != id {
 			continue
 		}
+		if probe != nil && (p.items[i].AuthVersion != probe.AuthVersion || (authGuard != nil && authGuard.Version() != probe.AuthVersion)) {
+			break
+		}
 		// A late successful request must not clear a rejection learned from
 		// another request after this attempt was admitted.
-		if version != nil && p.items[i].StateVersion > *version {
+		if version != nil && p.items[i].StateVersion > *version && (probe == nil || !sameProbedModel(p.items[i], *probe, model)) {
 			rememberProvenModel(&p.items[i], model)
 			p.stateCounter++
 			p.items[i].StateVersion = p.stateCounter
@@ -1068,7 +1206,8 @@ func (p *Pool) markOK(id, model string, version *uint64) {
 			if wasCooling {
 				log.Printf("pool cooldown cleared account=%s model=%s", id, scoped)
 			}
-			if p.items[i].DownUntil.IsZero() && len(p.items[i].ModelDownUntil) == 0 {
+			preserveAuth := p.authCoordinator != nil && p.items[i].LastKind == KindAuth && (itemProvider(p.items[i]) == "workbuddy" || itemProvider(p.items[i]) == "trae")
+			if p.items[i].DownUntil.IsZero() && len(p.items[i].ModelDownUntil) == 0 && !preserveAuth {
 				p.items[i].LastError = ""
 				p.items[i].LastKind = ""
 				p.items[i].BackoffLevel = 0
@@ -1093,6 +1232,7 @@ func (p *Pool) markOK(id, model string, version *uint64) {
 	}
 	observer := p.observer
 	p.mu.Unlock()
+	authGuard.Unlock()
 	if changed != nil && observer != nil {
 		observer(*changed)
 	}
@@ -1402,6 +1542,13 @@ func (item Item) clone() Item {
 			out.NativeModels[model] = native
 		}
 	}
+	if item.FallbackModels != nil {
+		out.FallbackModels = make(map[string]providers.FallbackCapabilities, len(item.FallbackModels))
+		for model, cap := range item.FallbackModels {
+			cap.ReasoningOptions = append([]string(nil), cap.ReasoningOptions...)
+			out.FallbackModels[model] = cap
+		}
+	}
 	if item.ModelOutputLimits != nil {
 		out.ModelOutputLimits = map[string]int{}
 		for model, limit := range item.ModelOutputLimits {
@@ -1542,11 +1689,21 @@ func (p *Pool) Upsert(item Item) {
 	}
 	item.Provider = NormalizeProviderFamily(item.Provider)
 	item.Region = NormalizeRegion(item.Region)
+	guard := p.authCoordinator.Lock(item.ID)
+	defer guard.Unlock()
+	if guard != nil {
+		item.AuthVersion = guard.Version()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	item.LiveInFlight = p.accountLive[item.ID]
 	for i := range p.items {
 		if p.items[i].ID == item.ID {
+			// A standalone pool has no coordinator hook to restore this
+			// process-local fence; stale refresh snapshots must not roll it back.
+			if guard == nil && item.AuthVersion < p.items[i].AuthVersion {
+				item.AuthVersion = p.items[i].AuthVersion
+			}
 			// Carry runtime state forward, but only when the caller did not
 			// supply a value. Restoring persisted cooldowns needs to write
 			// these fields; the old unconditional copy silently discarded
@@ -1623,6 +1780,9 @@ func (p *Pool) Upsert(item Item) {
 			}
 			if item.ProvenModels == nil {
 				item.ProvenModels = p.items[i].ProvenModels
+			}
+			if item.FallbackModels == nil {
+				item.FallbackModels = p.items[i].FallbackModels
 			}
 			if item.ModelOutputLimits == nil {
 				item.ModelOutputLimits = p.items[i].ModelOutputLimits

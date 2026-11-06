@@ -125,6 +125,9 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, r *http.Request, 
 	defer upstream.Response.Body.Close()
 	h.finishCompatibility(execution, upstream.AccountID, upstream.Provider, upstream.Routing, accounts.RequestStatusStreaming, upstream.TTFBMs, nil, nil, upstream.AttemptCount, upstream.ReasoningLevel)
 	setCompatibilityStreamHeaders(w, upstream.AccountID, firstNonEmpty(upstream.Provider, execution.ProviderFilter))
+	if upstream.ModelFallback {
+		setModelFallbackHeaders(w, upstream.ActualModel, upstream.Region)
+	}
 	w.WriteHeader(http.StatusOK)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -137,9 +140,12 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, r *http.Request, 
 		// observe the terminal event for usage/finish accounting.
 		stats, relayErr = RelayNativeResponsesStream(writer, upstream.Response.Body, execution.ResponseToolNames)
 	} else {
-		stats, relayErr = RelayResponsesStream(writer, upstream.Response.Body, execution.RequestID, firstNonEmpty(execution.PublicModel, execution.Request.Model), execution.ResponseToolNames)
+		stats, relayErr = RelayResponsesStream(writer, upstream.Response.Body, execution.RequestID, firstNonEmpty(upstream.ActualModel, execution.PublicModel, execution.Request.Model), execution.ResponseToolNames)
 	}
 	completed := stats.SawDone || stats.FinishReason != ""
+	if upstream.ModelFallback {
+		stats.Model = upstream.ActualModel
+	}
 	status := streamLogStatus(relayErr, completed, r.Context().Err() != nil)
 	if relayErr == nil {
 		status = responsesRequestStatus(stats.FinishReason)

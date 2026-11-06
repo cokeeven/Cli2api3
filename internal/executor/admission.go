@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/providers"
 )
 
 type routingPolicyContext struct{}
@@ -125,6 +126,16 @@ func (p *Pool) acquireRoute(q RouteQuery, identity routingIdentity) (Item, func(
 	if resumeAt(item, q).After(time.Now()) || (item.Quota != nil && item.Quota.Exceeded && !itemModelFree(item, q.PublicModel)) {
 		return item, func() {}, true
 	}
+	probeKey := ""
+	model := routeModel(q.PublicModel)
+	if until := item.ModelDownUntil[model]; model != "" && !until.IsZero() && !time.Now().Before(until) {
+		probeKey = modelProbeKey(item.ID, model)
+		if p.modelProbes == nil {
+			p.modelProbes = map[string]bool{}
+		}
+		p.modelProbes[probeKey] = true
+		item.modelProbe = true
+	}
 	if p.keyPlatformLive == nil {
 		p.keyPlatformLive = map[string]int{}
 	}
@@ -144,6 +155,9 @@ func (p *Pool) acquireRoute(q RouteQuery, identity routingIdentity) (Item, func(
 	return item, func() {
 		once.Do(func() {
 			p.mu.Lock()
+			if probeKey != "" {
+				delete(p.modelProbes, probeKey)
+			}
 			if p.keyPlatformLive[key] > 1 {
 				p.keyPlatformLive[key]--
 			} else {
@@ -206,4 +220,29 @@ func (p *Pool) PlatformInFlight() map[string]int {
 		result[key] = value
 	}
 	return result
+}
+
+// MergeFallbackModels replaces, never unions, the last observed account catalog.
+func (p *Pool) MergeFallbackModels(id string, models []providers.ModelInfo) {
+	entries := make(map[string]providers.FallbackCapabilities)
+	for _, model := range models {
+		if model.FallbackEvidence == nil {
+			continue
+		}
+		cap := *model.FallbackEvidence
+		cap.ReasoningOptions = append([]string(nil), cap.ReasoningOptions...)
+		for _, name := range []string{model.NativeModel, model.PublicModel} {
+			if key := routeModel(name); key != "" {
+				entries[key] = cap
+			}
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.items {
+		if p.items[i].ID == id {
+			p.items[i].FallbackModels = entries
+			return
+		}
+	}
 }

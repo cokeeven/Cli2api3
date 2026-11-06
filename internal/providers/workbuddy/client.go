@@ -50,6 +50,8 @@ type Client struct {
 	mu                   sync.Mutex
 	loginStates          map[string]string
 	catalog              map[string]providers.ModelInfo
+	catalogByAccount     map[string]map[string]providers.ModelInfo
+	catalogGeneration    map[string]providers.AttemptCredentialEvidence
 	credentialLocks      map[string]*sync.Mutex
 	credentialRetryAfter map[string]time.Time
 }
@@ -201,6 +203,16 @@ func (c *Client) PollLogin(ctx context.Context, accountID string) (bool, string,
 	if state == "" {
 		return false, "", fmt.Errorf("login not started for account %s", accountID)
 	}
+	loginStore, fencedLogin := c.store.(providers.VerifiedLoginStore)
+	var loginGeneration int64
+	var loginVersion uint64
+	if fencedLogin {
+		var snapshotErr error
+		loginGeneration, loginVersion, _, snapshotErr = loginStore.AuthAttemptSnapshot(ctx, accountID)
+		if snapshotErr != nil {
+			return false, "", snapshotErr
+		}
+	}
 	base := ChatBaseCN
 	if account, err := c.store.Get(ctx, accountID); err == nil && account.ProviderRegion == "global" {
 		base = ChatBaseGlobal
@@ -265,10 +277,20 @@ func (c *Client) PollLogin(ctx context.Context, accountID string) (bool, string,
 	if err != nil {
 		return false, "", err
 	}
-	if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, payload); err != nil {
-		return false, "", err
+	if fencedLogin {
+		saved, err := loginStore.SaveVerifiedLoginFenced(ctx, accountID, CredentialFormat, payload, identity.UID, loginGeneration, loginVersion)
+		if err != nil {
+			return false, "", err
+		}
+		if !saved {
+			return false, "", providers.ErrCredentialSuperseded
+		}
+	} else {
+		if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, payload); err != nil {
+			return false, "", err
+		}
+		_ = c.store.Observe(ctx, accountID, identity.UID, "ready", "", "")
 	}
-	_ = c.store.Observe(ctx, accountID, identity.UID, "ready", "", "")
 	c.mu.Lock()
 	delete(c.loginStates, accountID)
 	c.mu.Unlock()
@@ -279,7 +301,7 @@ func (c *Client) PollLogin(ctx context.Context, accountID string) (bool, string,
 // Refreshes are serialized per account and saved with a compare-and-swap so a
 // late refresh cannot replace a newer login.
 func (c *Client) credential(ctx context.Context, accountID string) (Credential, error) {
-	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	format, payload, err := providers.LoadCredentialPayloadWithEvidence(ctx, c.store, accountID)
 	if err != nil {
 		return Credential{}, c.credentialReadError(ctx, accountID, err, "workbuddy_credential_store")
 	}
@@ -304,6 +326,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if c.credentialRefreshCoolingDown(accountID, now) {
 		return c.useWorkBuddyCredentialFallback(credential, now, fmt.Errorf("credential refresh is cooling down"))
 	}
+	authVersion, fenced := providers.CredentialAuthVersion(c.store, accountID)
 	account, err := c.store.Get(ctx, accountID)
 	if err != nil {
 		return Credential{}, fmt.Errorf("load WorkBuddy account before credential refresh: %w", err)
@@ -317,7 +340,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration, authVersion, fenced)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -333,7 +356,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 }
 
 func (c *Client) loadCredential(ctx context.Context, accountID string) (string, []byte, Credential, error) {
-	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	format, payload, err := providers.LoadCredentialPayloadWithEvidence(ctx, c.store, accountID)
 	if err != nil {
 		return "", nil, Credential{}, c.credentialReadError(ctx, accountID, err, "workbuddy_credential_store")
 	}
@@ -437,6 +460,7 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 		return Credential{}, err
 	}
 	credential = current
+	authVersion, fenced := providers.CredentialAuthVersion(c.store, accountID)
 	account, err := c.store.Get(ctx, accountID)
 	if err != nil {
 		return Credential{}, fmt.Errorf("load WorkBuddy account before credential refresh: %w", err)
@@ -450,7 +474,7 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration, authVersion, fenced)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -465,7 +489,14 @@ func (c *Client) Refresh(ctx context.Context, accountID string, credential Crede
 	return refreshed, nil
 }
 
-func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64) (bool, error) {
+func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64, authVersion uint64, fenced bool) (bool, error) {
+	if fenced {
+		store, ok := c.store.(providers.FencedCredentialRefreshCASStore)
+		if !ok {
+			return false, fmt.Errorf("workbuddy credential store lacks auth event fencing")
+		}
+		return store.SaveCredentialPayloadAfterRefreshFenced(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload, credentialGeneration, authVersion)
+	}
 	store, ok := c.store.(providers.CredentialRefreshCASStore)
 	if !ok {
 		return false, fmt.Errorf("workbuddy credential store does not support atomic refresh compare-and-swap")
@@ -482,9 +513,6 @@ func (c *Client) refreshRemote(ctx context.Context, accountID string, credential
 	}
 	classified := Classify(status, string(body))
 	if classified.Kind == accounts.KindAuth {
-		if credential.ExpiresAt <= time.Now().Unix() {
-			_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "session dead; re-login required", accounts.KindAuth)
-		}
 		return credential, classifiedErrorWithEvidence(status, &status, body, "refresh", "workbuddy_refresh_response")
 	}
 	if status >= 300 || classified.Kind != "" {
@@ -518,6 +546,61 @@ func (c *Client) refreshRemote(ctx context.Context, accountID string, credential
 	return credential, nil
 }
 
+// ForceCredentialRefresh exchanges the currently stored token even if its
+// local expiry is in the future. A competing login or auth failure makes the
+// CAS fail; returning that conflict is essential because a newer credential
+// is not evidence that this exchange was committed.
+func (c *Client) ForceCredentialRefresh(ctx context.Context, accountID string) error {
+	lock := c.credentialLock(accountID)
+	for !lock.TryLock() {
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	defer lock.Unlock()
+	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	if errors.Is(err, accounts.ErrAccountNotFound) {
+		return providers.ErrCredentialMissing
+	}
+	if err != nil {
+		return err
+	}
+	credential, err := DecodeCredential(payload)
+	if err != nil {
+		return providers.ErrCredentialMissing
+	}
+	if strings.TrimSpace(credential.RefreshToken) == "" {
+		return providers.ErrCredentialMissing
+	}
+	authVersion, fenced := providers.CredentialAuthVersion(c.store, accountID)
+	account, err := c.store.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	refreshed, err := c.refreshRemote(ctx, accountID, credential)
+	if err != nil {
+		c.recordCredentialRefreshFailure(accountID, err)
+		return err
+	}
+	encoded, err := refreshed.Encode()
+	if err != nil {
+		return err
+	}
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration, authVersion, fenced)
+	if err != nil {
+		return err
+	}
+	if !saved {
+		return providers.ErrCredentialSuperseded
+	}
+	c.clearCredentialRefreshFailure(accountID)
+	return nil
+}
+
 func workBuddyRefreshAfter(expiresAt int64, now time.Time) int64 {
 	if expiresAt <= 0 {
 		return now.Add(5 * time.Minute).Unix()
@@ -538,6 +621,7 @@ func workBuddyRefreshAfter(expiresAt int64, now time.Time) int64 {
 // mirrors the WorkBuddy desktop dropdown source rather than
 // /v2/enterprises/personal/models, which can omit IDE-visible ids.
 func (c *Client) Models(ctx context.Context, accountID string) ([]providers.ModelInfo, error) {
+	ctx = providers.WithCredentialEvidence(ctx, accountID)
 	credential, err := c.resolvedCredential(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -600,15 +684,16 @@ func (c *Client) Models(ctx context.Context, accountID string) ([]providers.Mode
 	if len(out) == 0 {
 		return nil, fmt.Errorf("workbuddy product config returned no models")
 	}
-	c.rememberCatalog(out)
+	c.rememberCatalogForEvidence(accountID, out, providers.CredentialEvidence(ctx, accountID))
 	return out, nil
 }
 
 func (c *Client) chatRequest(ctx context.Context, accountID string, credential Credential, req translate.ChatRequest) (*http.Request, providers.ResolvedChat, error) {
 	if err := translate.ValidateChatToolHistory(req); err != nil {
-		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Message: err.Error()}
+		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Phase: "request_prepare", Source: "workbuddy_tool_history_validation", Message: "source=local_validator; protocol=normalized_chat; stage=preflight; " + err.Error()}
 	}
-	caps := c.capsFor(req.Model)
+	info, hasCatalog := c.accountCatalogModel(ctx, accountID, req.Model)
+	caps := info.Capabilities
 	storedLevel := ""
 	if setter, ok := c.store.(ModelSettingReader); ok {
 		// CanonicalModelID must match control.ModelContextKey
@@ -620,19 +705,29 @@ func (c *Client) chatRequest(ctx context.Context, accountID string, credential C
 	// Warm the live catalog before resolving the upstream model id and
 	// reasoning caps. Catalog entries are authoritative; we do not invent
 	// aliases when a requested id is missing.
-	if (!c.hasCatalogEntry(req.Model) || len(caps.ReasoningOptions) == 0) && accountID != "" {
+	if (!hasCatalog || len(caps.ReasoningOptions) == 0) && accountID != "" {
 		_, _ = c.Models(ctx, accountID)
-		caps = c.capsFor(req.Model)
+		info, hasCatalog = c.accountCatalogModel(ctx, accountID, req.Model)
+		caps = info.Capabilities
+	}
+	if !hasExplicitReasoning(req) && storedLevel != "" && providers.MatchReasoningLevel(storedLevel, caps) == "" {
+		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "configured reasoning default cannot be matched to the account model catalog"}
+	}
+	if providers.FallbackValidationRequested(ctx) && (!hasCatalog || !providers.FallbackCompatible(req, info.FallbackEvidence)) {
+		return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "fallback_capability_unknown", Message: "alternative model capability is unconfirmed or incompatible"}
 	}
 	if err := validateCallerReasoning(req, caps); err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
 	body := map[string]any{
-		"model":       c.upstreamModelID(req.Model),
+		"model":       req.Model,
 		"messages":    req.Messages,
 		"temperature": req.Temperature,
 		"tools":       req.Tools,
 		"tool_choice": req.ToolChoice,
+	}
+	if hasCatalog && strings.TrimSpace(info.NativeModel) != "" {
+		body["model"] = info.NativeModel
 	}
 	outputLimit, outputSource, err := providers.ResolveOutputLimit(req, caps, false)
 	if err != nil {
@@ -645,6 +740,7 @@ func (c *Client) chatRequest(ctx context.Context, accountID string, credential C
 		ReasoningLevel: applyChatReasoning(body, req, storedLevel, caps),
 		OutputLimit:    outputLimit, OutputLimitSource: outputSource,
 	}
+	providers.LogReasoningDecision(ctx, "workbuddy", accountID, req.Model, requestedReasoningLevel(req), storedLevel, resolved.ReasoningLevel)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
@@ -659,10 +755,13 @@ func (c *Client) chatRequest(ctx context.Context, accountID string, credential C
 }
 
 func (c *Client) ChatNonStream(ctx context.Context, accountID string, req translate.ChatRequest) (providers.ChatOutcome, error) {
-	credential, err := c.resolvedCredential(ctx, accountID)
+	ctx = providers.EnsureCredentialEvidence(ctx, accountID)
+	credential, err := c.credential(ctx, accountID)
+	providers.FreezeCredentialEvidence(ctx, accountID)
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
+	credential = c.overlayRegion(ctx, accountID, credential)
 	httpReq, resolved, err := c.chatRequest(ctx, accountID, credential, req)
 	if err != nil {
 		return providers.ChatOutcome{}, err
@@ -699,10 +798,13 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 }
 
 func (c *Client) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, providers.ResolvedChat, error) {
-	credential, err := c.resolvedCredential(ctx, accountID)
+	ctx = providers.EnsureCredentialEvidence(ctx, accountID)
+	credential, err := c.credential(ctx, accountID)
+	providers.FreezeCredentialEvidence(ctx, accountID)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
+	credential = c.overlayRegion(ctx, accountID, credential)
 	httpReq, resolved, err := c.chatRequest(ctx, accountID, credential, req)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
@@ -969,14 +1071,21 @@ func Classify(status int, body string) providers.ClassifiedError {
 }
 
 func classifyWorkBuddy(status int, body string) providers.ClassifiedError {
+	if status == http.StatusUnauthorized || (status == http.StatusForbidden && isSessionDeadResponse(status, body)) {
+		return providers.ClassifiedError{Kind: accounts.KindAuth, Status: status, Scope: "account", Message: "WorkBuddy 会话已被上游拒绝，请检查登录状态并在需要时重新登录。"}
+	}
 	text := strings.ToLower(body)
 	if accounts.IsPromptLimitText(body) {
 		return providers.ClassifiedError{Kind: accounts.KindInvalidRequest, Status: 400, Message: strings.TrimSpace(body)}
 	}
-	var limit envelope
-	_ = json.Unmarshal([]byte(body), &limit)
+	code, message, structured := workBuddyErrorFieldsDetailed(body)
+	// The same business code can describe different upstream errors. Only the
+	// structured model-service-not-found response supports this narrow scope.
+	if status != http.StatusUnauthorized && status != http.StatusForbidden && structured && code == "11102" && strings.Contains(strings.ToLower(message), "model") && strings.Contains(strings.ToLower(message), "service info not found") {
+		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: http.StatusServiceUnavailable, Code: "11102", Scope: "model", RetrySafe: true, Message: "upstream model service unavailable"}
+	}
 	switch {
-	case limit.Code == rateLimitCode:
+	case structured && code == strconv.Itoa(rateLimitCode):
 		return providers.ClassifiedError{Kind: accounts.KindRateLimit, Status: 429, Message: strings.TrimSpace(body), Code: strconv.Itoa(rateLimitCode), Scope: "model", RetrySafe: true}
 	case strings.Contains(text, "insufficient credit") || strings.Contains(text, "insufficient balance") || strings.Contains(text, "积分不足") || strings.Contains(text, "余额不足"):
 		return providers.ClassifiedError{Kind: accounts.KindQuota, Status: 402, Scope: "account", RetrySafe: true, Code: "insufficient_credits", Message: strings.TrimSpace(body)}
@@ -998,7 +1107,7 @@ func classifyWorkBuddy(status int, body string) providers.ClassifiedError {
 	case status >= 500:
 		return providers.ClassifiedError{Kind: accounts.KindUnavailable, Status: status, Message: strings.TrimSpace(body)}
 	}
-	code, message := workBuddyErrorFields(body)
+	code, message = workBuddyErrorFields(body)
 	if code != "" && code != "0" {
 		codeNumber, _ := strconv.Atoi(code)
 		if codeNumber == sessionDeadCode || strings.Contains(strings.ToLower(message), sessionDeadText) {
@@ -1226,9 +1335,13 @@ func (c *Client) DailyCheckin(ctx context.Context, accountID string) (string, er
 	for attempt := 0; ; attempt++ {
 		body, status, err = c.do(ctx, accountID, http.MethodPost, credential.BillingBase()+pathDailyCheckin, []byte("{}"),
 			func(h http.Header) { SetBillingHeaders(h, credential) })
+		providers.RecordCheckinResponse(ctx, "claim", status, body, err)
 		if !retryDailyCheckin(ctx, err, status, body, attempt) {
 			break
 		}
+	}
+	if err != nil {
+		return "", err
 	}
 	text := strings.TrimSpace(string(body))
 	classified := Classify(status, text)
@@ -1239,45 +1352,43 @@ func (c *Client) DailyCheckin(ctx context.Context, accountID string) (string, er
 		return msg, AlreadyCheckedInError{Msg: msg}
 	}
 	if status >= 300 {
-		return "", fmt.Errorf("checkin status=%d: %s", status, text)
+		return "", fmt.Errorf("checkin status=%d; reward not confirmed", status)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil || len(fields["code"]) == 0 || string(fields["code"]) == "null" {
+		return "", fmt.Errorf("checkin response missing business code; reward not confirmed")
 	}
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		return "", fmt.Errorf("checkin parse: %w", err)
 	}
-	msg := strings.TrimSpace(env.Msg)
 	if env.Code != 0 {
-		if msg == "" {
-			msg = fmt.Sprintf("checkin code=%d", env.Code)
-		}
-		return msg, fmt.Errorf("checkin code=%d msg=%s", env.Code, msg)
+		return "", fmt.Errorf("checkin rejected code=%d; reward not confirmed", env.Code)
 	}
-	if msg == "" {
-		msg = "ok"
-	}
-	return msg, nil
+	return "checkin accepted; reward not confirmed", nil
 }
 
 func alreadyCheckedInMessage(status int, body []byte) (string, bool) {
+	if status != http.StatusOK && status != http.StatusBadRequest {
+		return "", false
+	}
 	var env envelope
-	msg := ""
-	if json.Unmarshal(body, &env) == nil {
-		msg = strings.TrimSpace(env.Msg)
-		if env.Code == 0 && status < 300 {
-			return "", false
-		}
+	if json.Unmarshal(body, &env) != nil || env.Code == 0 || env.Code == 9074 {
+		return "", false
 	}
-	if msg == "" {
-		msg = strings.TrimSpace(string(body))
-	}
+	msg := strings.TrimSpace(env.Msg)
 	lower := strings.ToLower(msg)
 	if strings.Contains(msg, "已签到") || (strings.Contains(lower, "already") && strings.Contains(lower, "check")) {
-		return msg, true
+		return "already checked in; no new reward claimed", true
 	}
 	return "", false
 }
 
 func retryDailyCheckin(ctx context.Context, err error, status int, body []byte, attempt int) bool {
+	var response envelope
+	if json.Unmarshal(body, &response) == nil && response.Code == 9074 {
+		return false
+	}
 	requestProcessing := status == http.StatusTooManyRequests && checkinRequestProcessing(body)
 	delays := dailyCheckinRetryDelays
 	if requestProcessing {

@@ -85,7 +85,11 @@ export type MaintenanceSchedule = {
   daily_time: string
 }
 
+export type ModelAlternativeRule = { provider: string; region: string; requested_model: string; alternative_model: string }
+export type ModelAlternativePolicy = { enabled: boolean; rules: ModelAlternativeRule[] }
+
 export type SystemSettings = {
+  model_alternatives?: ModelAlternativePolicy
   maintenance_schedule: MaintenanceSchedule
   automation_maintenance_enabled: boolean
   cross_provider_model_pool: boolean
@@ -128,7 +132,7 @@ export function fetchSystemSettings() {
   return api<SystemSettings>('/api/system/settings')
 }
 
-export function updateSystemSettings(input: { maintenance_schedule?: MaintenanceSchedule; automation_maintenance_enabled?: boolean; cross_provider_model_pool?: boolean; checkin_disabled_accounts?: boolean; routing_strategy?: SystemSettings['routing_strategy']; proxy_url?: string; workbuddy_checkin_time?: string; quota_refresh_interval_minutes?: number; checkin_times?: Record<string, string> }) {
+export function updateSystemSettings(input: { model_alternatives?: ModelAlternativePolicy; maintenance_schedule?: MaintenanceSchedule; automation_maintenance_enabled?: boolean; cross_provider_model_pool?: boolean; checkin_disabled_accounts?: boolean; routing_strategy?: SystemSettings['routing_strategy']; proxy_url?: string; workbuddy_checkin_time?: string; quota_refresh_interval_minutes?: number; checkin_times?: Record<string, string> }) {
   return api<SystemSettings>('/api/system/settings', {
     method: 'PATCH',
     body: JSON.stringify(input),

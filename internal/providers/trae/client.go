@@ -77,6 +77,8 @@ type Client struct {
 	pendingTraces        map[string]*loginPending
 	listener             net.Listener
 	catalog              map[string]providers.ModelInfo
+	catalogByAccount     map[string]map[string]providers.ModelInfo
+	catalogGeneration    map[string]providers.AttemptCredentialEvidence
 	credentialLocks      map[string]*sync.Mutex
 	credentialRetryAfter map[string]time.Time
 }
@@ -316,6 +318,17 @@ func (c *Client) CompleteLogin(ctx context.Context, accountID, callbackURL strin
 }
 
 func (c *Client) finishCredential(ctx context.Context, accountID string, credential Credential, authCode, codeVerifier string) error {
+	loginStore, fencedLogin := c.store.(providers.VerifiedLoginStore)
+	var loginGeneration int64
+	var loginVersion uint64
+	if fencedLogin {
+		var snapshotErr error
+		loginGeneration, loginVersion, _, snapshotErr = loginStore.AuthAttemptSnapshot(ctx, accountID)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+	}
+	verified := false
 	switch {
 	case strings.TrimSpace(authCode) != "":
 		// Exchange the callback's authorization code with the PKCE verifier.
@@ -324,16 +337,19 @@ func (c *Client) finishCredential(ctx context.Context, accountID string, credent
 			return err
 		}
 		credential = refreshed
+		verified = true
 	case strings.TrimSpace(credential.RefreshToken) != "":
 		refreshed, err := c.ExchangeToken(ctx, accountID, credential)
 		if err != nil {
 			return err
 		}
 		credential = refreshed
+		verified = true
 	}
-	if strings.TrimSpace(credential.UID) == "" && strings.TrimSpace(credential.AccessToken) != "" {
+	if (!verified || strings.TrimSpace(credential.UID) == "") && strings.TrimSpace(credential.AccessToken) != "" {
 		info, err := c.GetUserInfo(ctx, accountID, credential)
 		if err == nil {
+			verified = true
 			credential.UID = info.UID
 			if info.Nickname != "" {
 				credential.Nickname = info.Nickname
@@ -341,7 +357,12 @@ func (c *Client) finishCredential(ctx context.Context, accountID string, credent
 			if info.EnterpriseID != "" {
 				credential.EnterpriseID = info.EnterpriseID
 			}
+		} else if fencedLogin && !verified {
+			return fmt.Errorf("unable to verify login credential")
 		}
+	}
+	if fencedLogin && !verified {
+		return fmt.Errorf("login did not provide verified credentials")
 	}
 	credential = EnsureDevice(credential)
 	credential = EnsureDeviceKey(credential)
@@ -349,10 +370,22 @@ func (c *Client) finishCredential(ctx context.Context, accountID string, credent
 	if err != nil {
 		return err
 	}
-	if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, payload); err != nil {
-		return err
+	if fencedLogin && verified {
+		saved, err := loginStore.SaveVerifiedLoginFenced(ctx, accountID, CredentialFormat, payload, credential.UID, loginGeneration, loginVersion)
+		if err != nil {
+			return err
+		}
+		if !saved {
+			return providers.ErrCredentialSuperseded
+		}
+	} else {
+		if err := c.store.SaveCredentialPayload(ctx, accountID, CredentialFormat, payload); err != nil {
+			return err
+		}
+		if !fencedLogin {
+			_ = c.store.Observe(ctx, accountID, credential.UID, "ready", "", "")
+		}
 	}
-	_ = c.store.Observe(ctx, accountID, credential.UID, "ready", "", "")
 	return nil
 }
 
@@ -803,6 +836,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if !credential.needsRefresh(now) {
 		return credential, nil
 	}
+	authVersion, fenced := providers.CredentialAuthVersion(c.store, accountID)
 	account, err := c.store.Get(ctx, accountID)
 	if err != nil {
 		return Credential{}, fmt.Errorf("load Trae account before credential refresh: %w", err)
@@ -819,7 +853,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 	if err != nil {
 		return Credential{}, err
 	}
-	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration)
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration, authVersion, fenced)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -835,7 +869,7 @@ func (c *Client) credential(ctx context.Context, accountID string) (Credential, 
 }
 
 func (c *Client) loadCredential(ctx context.Context, accountID string) (string, []byte, Credential, error) {
-	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	format, payload, err := providers.LoadCredentialPayloadWithEvidence(ctx, c.store, accountID)
 	if err != nil {
 		return "", nil, Credential{}, err
 	}
@@ -888,7 +922,14 @@ func (c *Client) clearCredentialRefreshFailure(accountID string) {
 	c.mu.Unlock()
 }
 
-func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64) (bool, error) {
+func (c *Client) saveCredentialAfterRefreshIfCurrent(ctx context.Context, accountID, expectedFormat string, expectedPayload, payload []byte, credentialGeneration int64, authVersion uint64, fenced bool) (bool, error) {
+	if fenced {
+		store, ok := c.store.(providers.FencedCredentialRefreshCASStore)
+		if !ok {
+			return false, fmt.Errorf("trae credential store lacks auth event fencing")
+		}
+		return store.SaveCredentialPayloadAfterRefreshFenced(ctx, accountID, expectedFormat, expectedPayload, CredentialFormat, payload, credentialGeneration, authVersion)
+	}
 	store, ok := c.store.(providers.CredentialRefreshCASStore)
 	if !ok {
 		return false, fmt.Errorf("trae credential store does not support atomic refresh compare-and-swap")
@@ -901,7 +942,6 @@ func (c *Client) useTraeCredentialFallback(ctx context.Context, accountID string
 		return credential, nil
 	}
 	if authFailure {
-		_ = c.store.Observe(ctx, accountID, credential.UID, "login_required", "credential expired; re-login required", accounts.KindAuth)
 		return Credential{}, &providers.Error{Kind: accounts.KindAuth, Status: http.StatusUnauthorized, Message: "trae credential expired; re-login required"}
 	}
 	var classified *providers.Error
@@ -918,6 +958,7 @@ func isCredentialAuthError(err error) bool {
 }
 
 func (c *Client) Models(ctx context.Context, accountID string) ([]providers.ModelInfo, error) {
+	ctx = providers.WithCredentialEvidence(ctx, accountID)
 	credential, err := c.credential(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -939,7 +980,7 @@ func (c *Client) Models(ctx context.Context, accountID string) ([]providers.Mode
 			out = mergeCatalogModels(out, extra)
 		}
 	}
-	c.rememberCatalog(out)
+	c.rememberCatalogForEvidence(accountID, out, providers.CredentialEvidence(ctx, accountID))
 	return out, nil
 }
 
@@ -981,6 +1022,60 @@ func (c *Client) rememberCatalog(models []providers.ModelInfo) {
 		c.catalog[model.NativeModel] = model
 		c.catalog[strings.ToLower(model.NativeModel)] = model
 	}
+}
+
+// Account-scoped catalog evidence prevents one account or region from
+// supplying capabilities for another account's chat attempt.
+func (c *Client) rememberCatalogFor(accountID string, models []providers.ModelInfo) {
+	c.rememberCatalogForEvidence(accountID, models, providers.AttemptCredentialEvidence{})
+}
+
+func (c *Client) rememberCatalogForEvidence(accountID string, models []providers.ModelInfo, evidence providers.AttemptCredentialEvidence) {
+	c.rememberCatalog(models)
+	entries := make(map[string]providers.ModelInfo, len(models)*2)
+	for _, info := range models {
+		for _, id := range []string{info.NativeModel, info.PublicModel} {
+			if strings.TrimSpace(id) != "" {
+				entries[id] = info
+				entries[accounts.CanonicalModelID(id)] = info
+			}
+		}
+	}
+	c.mu.Lock()
+	if c.catalogByAccount == nil {
+		c.catalogByAccount = make(map[string]map[string]providers.ModelInfo)
+	}
+	c.catalogByAccount[accountID] = entries
+	if c.catalogGeneration == nil {
+		c.catalogGeneration = make(map[string]providers.AttemptCredentialEvidence)
+	}
+	c.catalogGeneration[accountID] = evidence
+	c.mu.Unlock()
+}
+
+func (c *Client) accountCatalogModel(ctx context.Context, accountID, model string) (providers.ModelInfo, bool) {
+	if accountID == "" {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		info, ok := c.catalog[model]
+		if !ok {
+			info, ok = c.catalog[accounts.CanonicalModelID(model)]
+		}
+		return info, ok
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	requestEvidence := providers.CredentialEvidence(ctx, accountID)
+	catalogEvidence := c.catalogGeneration[accountID]
+	if requestEvidence.Valid && (!catalogEvidence.Valid || requestEvidence.Generation != catalogEvidence.Generation) {
+		return providers.ModelInfo{}, false
+	}
+	entries := c.catalogByAccount[accountID]
+	info, ok := entries[model]
+	if !ok {
+		info, ok = entries[accounts.CanonicalModelID(model)]
+	}
+	return info, ok
 }
 
 func (c *Client) capsFor(model string) providers.ModelCapabilities {
@@ -1028,8 +1123,8 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 	}
 	if err := translate.ValidateChatToolHistory(req); err != nil {
 		return nil, providers.ResolvedChat{}, &providers.Error{
-			Kind: "invalid_request", Status: 400, Code: "invalid_tool_history",
-			Message: "Trae 工具历史无效：" + err.Error() + "；网关不会自动补全参数或执行不完整调用。",
+			Kind: "invalid_request", Status: 400, Code: "invalid_tool_history", Phase: "request_prepare", Source: "trae_tool_history_validation",
+			Message: "source=local_validator; protocol=normalized_chat; stage=preflight; Trae 工具历史无效：" + err.Error() + "；网关不会自动补全参数或执行不完整调用。",
 		}
 	}
 	payload, err := json.Marshal(map[string]any{
@@ -1042,7 +1137,17 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
-	scene := c.sceneFor(req.Model)
+	info, hasCatalog := c.accountCatalogModel(ctx, accountID, req.Model)
+	catalogFetched := false
+	if !hasCatalog && accountID != "" {
+		catalogFetched = true
+		_, _ = c.Models(ctx, accountID)
+		info, hasCatalog = c.accountCatalogModel(ctx, accountID, req.Model)
+	}
+	scene := PrimaryScene
+	if hasCatalog && info.Scene != "" {
+		scene = info.Scene
+	}
 	rewritten := PrepareBody(payload, scene)
 	resolved := providers.ResolvedChat{}
 	var obj map[string]any
@@ -1052,7 +1157,7 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 		if req.IsMaxMode != nil {
 			maxMode = *req.IsMaxMode
 		}
-		caps := c.capsFor(req.Model)
+		caps := info.Capabilities
 		if setter, ok := c.store.(ModelSettingReader); ok {
 			if stored, err := setter.GetProviderModelSetting(ctx, "trae", settingModelKey(req.Model)); err == nil {
 				if req.IsMaxMode == nil {
@@ -1070,11 +1175,18 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 		// Caps may be empty because the catalog has not been fetched (fresh
 		// process, first request) or the model is unknown. Only the unknown
 		// case is unrecoverable; refresh once before deciding.
-		if len(caps.ReasoningOptions) == 0 && !caps.MaxMode && accountID != "" {
+		if len(caps.ReasoningOptions) == 0 && !caps.MaxMode && accountID != "" && !catalogFetched {
 			_, _ = c.Models(ctx, accountID)
-			caps = c.capsFor(req.Model)
+			info, hasCatalog = c.accountCatalogModel(ctx, accountID, req.Model)
+			caps = info.Capabilities
 		}
 		resolved.OutputBudgetEvidence = outputBudgetEvidence(req.Model, scene, caps.MaxOutput)
+		if !hasExplicitReasoning(req) && storedLevel != "" && providers.MatchReasoningLevel(storedLevel, caps) == "" {
+			return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "unsupported_reasoning_effort", Message: "configured reasoning default cannot be matched to the account model catalog"}
+		}
+		if providers.FallbackValidationRequested(ctx) && (!hasCatalog || !providers.FallbackCompatible(req, info.FallbackEvidence)) {
+			return nil, providers.ResolvedChat{}, &providers.Error{Kind: "invalid_request", Status: 400, Code: "fallback_capability_unknown", Message: "alternative model capability is unconfirmed or incompatible"}
+		}
 		if err := validateCallerReasoning(req, caps); err != nil {
 			return nil, providers.ResolvedChat{}, err
 		}
@@ -1094,6 +1206,7 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 		resolved.OutputLimitSource = outputSource
 		applySoloChatFields(obj, req, maxMode, storedLevel, caps)
 		resolved.ReasoningLevel = resolvedReasoningLevel(req, storedLevel, caps)
+		providers.LogReasoningDecision(ctx, "trae", accountID, req.Model, requestedReasoningLevel(req), storedLevel, resolved.ReasoningLevel)
 		if encoded, err := json.Marshal(obj); err == nil {
 			rewritten = encoded
 		}
@@ -1108,10 +1221,12 @@ func (c *Client) chatRequest(ctx context.Context, credential Credential, req tra
 }
 
 func (c *Client) ChatNonStream(ctx context.Context, accountID string, req translate.ChatRequest) (providers.ChatOutcome, error) {
+	ctx = providers.EnsureCredentialEvidence(ctx, accountID)
 	if err := validateCallerResponseFormat(req); err != nil {
 		return providers.ChatOutcome{}, err
 	}
 	credential, err := c.credential(ctx, accountID)
+	providers.FreezeCredentialEvidence(ctx, accountID)
 	if err != nil {
 		return providers.ChatOutcome{}, err
 	}
@@ -1149,10 +1264,12 @@ func (c *Client) ChatNonStream(ctx context.Context, accountID string, req transl
 }
 
 func (c *Client) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, providers.ResolvedChat, error) {
+	ctx = providers.EnsureCredentialEvidence(ctx, accountID)
 	if err := validateCallerResponseFormat(req); err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
 	credential, err := c.credential(ctx, accountID)
+	providers.FreezeCredentialEvidence(ctx, accountID)
 	if err != nil {
 		return nil, providers.ResolvedChat{}, err
 	}
@@ -1539,6 +1656,7 @@ func int64FromAny(value any) int64 {
 func (c *Client) CheckinStatus(ctx context.Context, accountID string, credential Credential) ([]byte, error) {
 	body, status, err := c.do(ctx, accountID, http.MethodPost, credential.BillingBase()+pathCheckinStatus, []byte(`{"req_source":1}`),
 		func(h http.Header) { SetUgHeaders(h, credential) })
+	providers.RecordCheckinResponse(ctx, "status", status, body, err)
 	if err != nil {
 		return nil, err
 	}
@@ -1551,6 +1669,7 @@ func (c *Client) CheckinStatus(ctx context.Context, accountID string, credential
 func (c *Client) CheckinClaim(ctx context.Context, accountID string, credential Credential) ([]byte, error) {
 	body, status, err := c.do(ctx, accountID, http.MethodPost, credential.BillingBase()+pathCheckinClaim, []byte(`{"req_source":1}`),
 		func(h http.Header) { SetUgHeaders(h, credential) })
+	providers.RecordCheckinResponse(ctx, "claim", status, body, err)
 	if err != nil {
 		return nil, err
 	}
@@ -1579,6 +1698,59 @@ func (c *Client) Adapter() providers.Adapter {
 func (c *Client) Keepalive(ctx context.Context, accountID string) error {
 	_, err := c.credential(ctx, accountID)
 	return err
+}
+
+// ForceCredentialRefresh performs an explicit exchange and commits only if
+// the credential payload and authentication generation are still current.
+func (c *Client) ForceCredentialRefresh(ctx context.Context, accountID string) error {
+	lock := c.credentialLock(accountID)
+	for !lock.TryLock() {
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	defer lock.Unlock()
+	format, payload, err := c.store.LoadCredentialPayload(ctx, accountID)
+	if errors.Is(err, accounts.ErrAccountNotFound) {
+		return providers.ErrCredentialMissing
+	}
+	if err != nil {
+		return err
+	}
+	credential, err := DecodeCredential(payload)
+	if err != nil {
+		return providers.ErrCredentialMissing
+	}
+	if strings.TrimSpace(credential.RefreshToken) == "" || credential.refreshExpired(time.Now()) {
+		return providers.ErrCredentialMissing
+	}
+	authVersion, fenced := providers.CredentialAuthVersion(c.store, accountID)
+	account, err := c.store.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	refreshed, err := c.ExchangeToken(ctx, accountID, credential)
+	if err != nil {
+		c.recordCredentialRefreshFailure(accountID, err)
+		return err
+	}
+	encoded, err := refreshed.Encode()
+	if err != nil {
+		return err
+	}
+	saved, err := c.saveCredentialAfterRefreshIfCurrent(ctx, accountID, format, payload, encoded, account.CredentialGeneration, authVersion, fenced)
+	if err != nil {
+		return err
+	}
+	if !saved {
+		return providers.ErrCredentialSuperseded
+	}
+	c.clearCredentialRefreshFailure(accountID)
+	return nil
 }
 
 type credentialCodec struct{}

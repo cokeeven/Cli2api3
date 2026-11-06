@@ -16,6 +16,19 @@ export function checkinFeedback(result?: Pick<AccountRow, 'last_checkin_status' 
   return { status: 'warning' as const, titleKey: 'checkinOutcomeUnconfirmed', message }
 }
 
+// Legacy records are shown unchanged; only bounded diagnostics are decoded.
+export function formatCheckinMessage(message: string | undefined, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (!message) return ''
+  const outcome = message.match(/(?:^|;\s*)outcome=([a-z0-9_]+)/)?.[1]
+  const valid = ['success', 'already', 'skipped', 'upstream_rejected_9074', 'upstream_rejected', 'credential_missing', 'network_error', 'unconfirmed']
+  if (!outcome || !valid.includes(outcome)) return message
+  const phase = message.match(/(?:^|;\s*)phase=(credential|status|claim)/)?.[1]
+  const http = message.match(/(?:^|;\s*)http=(\d+)/)?.[1]
+  const code = message.match(/(?:^|;\s*)code=(-?\d+)/)?.[1]
+  const attempts = message.match(/(?:^|;\s*)attempts=(\d+)/)?.[1]
+  return [t(`checkinDetail_${outcome}`), phase ? t(`checkinPhase_${phase}`) : '', http ? `HTTP ${http}` : '', code ? `${t('checkinBusinessCode')} ${code}` : '', attempts ? t('checkinAttempts', { count: attempts }) : '', t('checkinRewardUnconfirmed')].filter(Boolean).join(' · ')
+}
+
 export function cooldownLabel(until?: string | null) {
   if (!until) return ''
   const milliseconds = Date.parse(until) - Date.now()

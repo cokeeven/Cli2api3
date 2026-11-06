@@ -14,6 +14,7 @@ import {
 import { useI18n } from '@/hooks/useI18n'
 import { useOverview } from '@/hooks/useOverview'
 import { fetchAccounts, fetchModels, testChat } from '@/api/overview'
+import { ApiError } from '@/api/client'
 import type { ModelInfo, Overview } from '@/api/types'
 import { absUrl } from '@/lib/url'
 import { modelCreditsText, modelIsFree } from '@/lib/format'
@@ -182,11 +183,11 @@ export function AccessPage() {
     setElapsedMs(null)
     setOutput('')
     try {
-      const data = await testChat(payload.model, payload.messages[0].content, selectedAccount || undefined)
-      setOutput(JSON.stringify(data, null, 2))
-      setRequestState('success')
+      const result = await testChat(payload.model, payload.messages[0].content, selectedAccount || undefined)
+      setOutput(JSON.stringify({ request_id: result.requestId || null, actual_account_id: result.accountId || null, response: result.data }, null, 2))
+      setRequestState(!result.requestId || (selectedAccount && result.accountId !== selectedAccount) ? 'error' : 'success')
     } catch (error) {
-      setOutput(error instanceof Error ? error.message : String(error))
+      setOutput(JSON.stringify({ request_id: error instanceof ApiError ? error.requestId || null : null, actual_account_id: error instanceof ApiError ? error.accountId || null : null, error: error instanceof Error ? error.message : String(error) }, null, 2))
       setRequestState('error')
     } finally {
       setElapsedMs(Math.round(performance.now() - startedAt))

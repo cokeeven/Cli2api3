@@ -3,6 +3,38 @@
 Published user-facing notes for GitHub Releases and the console update page.
 Write upcoming notes as bilingual files in `changelog/unreleased/`.
 
+## 0.1.16 - 2026-11-06
+
+### English
+
+- Restrict console quick tests to the selected account and display the request and actual account identifiers.
+- Avoid interpreting network port numbers as authentication status codes.
+- Label the existing account operation as a status and quota check.
+- Add an explicit upstream credential refresh with account-scoped concurrency protection and clear outcomes.
+- Track the credential used by each chat attempt so authentication failures after an automatic refresh are recorded safely.
+- Preserve pending model recovery when a newer authentication failure or credential change occurs during an older model probe.
+- Limit recovery from an expired per-account, per-model cooldown to one probe, preserving pending model probes across restarts and clearing only the successful model.
+- Recognize narrowly evidenced WorkBuddy model-service failures and preserve account authentication scope, reported reset evidence and bounded local backoff.
+- Add explicitly configured, disabled-by-default same-provider and same-region model alternatives. Require the selected account's catalog to establish request capabilities, stop after one alternative and record the actual model and attempt route.
+- Match WorkBuddy and Trae reasoning effort against the selected account's model catalog, retain caller intent, and show the requested and resolved levels in request history. Unsupported or unknown reasoning settings remain explicit errors.
+- Distinguish check-in outcomes with bounded, redacted status evidence. A Trae 9074 rejection does not imply chat authentication failure or trigger an automatic same-day retry; status rule amounts are not reported as confirmed rewards.
+- Add safe local tool-history validation diagnostics without recording messages, tool arguments, or call identifiers.
+
+### 中文
+
+- 控制台快速测试严格使用所选账号，并显示请求和实际账号标识。
+- 避免将网络端口数字误判为认证状态码。
+- 将现有账号操作标明为状态和额度检查。
+- 增加明确的上游凭据刷新，并按账号保护并发操作、显示刷新结果。
+- 跟踪每次聊天实际使用的凭据，安全记录自动刷新后的认证失败。
+- 模型探测期间若发生更新的认证失败或凭据变更，保留待恢复状态，避免旧探测成功覆盖新认证事件。
+- 每个账号的模型冷却到期后仅放行一次探测；重启后保留待探测状态，成功只清除对应模型的限制。
+- 根据明确证据识别 WorkBuddy 模型服务错误，区分账号认证范围，并保留真实重置证据和有界本地退避。
+- 新增默认关闭、需显式配置的同平台同地区替代模型规则。仅在所选账号目录明确支持请求能力时最多尝试一次，并记录实际模型和尝试路径。
+- 根据实际账号的 WorkBuddy、Trae 模型目录匹配思考档位，在请求记录中展示请求与实际档位；无法确认的模型能力或未知设置明确报错。
+- 区分签到结果，记录有限且脱敏的阶段、状态和业务码；Trae 9074 不代表聊天认证失败，也不会触发当天自动补跑；状态接口中的规则金额不会被当作已到账奖励。
+- 为本地工具历史校验补充安全诊断，不记录消息正文、工具参数或调用标识。
+
 ## 0.1.15 - 2026-10-24
 
 ### English
